@@ -1,4 +1,4 @@
-# TRỢ LÝ GIỌNG NÓI THÔNG MINH TRÊN NỀN THREAD MESH TỰ XÂY DỰNG
+# THIẾT BỊ ĐIỀU KHIỂN GIỌNG NÓI THÔNG MINH TRÊN NỀN THREAD MESH
 ## Đặc tả tính năng sản phẩm
 
 > Đồ án tốt nghiệp — nhóm 2 người, thời gian thực hiện 4-5 tháng.
