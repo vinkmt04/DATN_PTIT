@@ -1,4 +1,4 @@
-# THIẾT BỊ ĐIỀU KHIỂN GIỌNG NÓI THÔNG MINH TRÊN NỀN THREAD MESH
+# HỆ THỐNG IOT DỰA TRÊN MẠNG THREAD MESH, TÍCH HỢP BỘ ĐIỀU KHIỂN TRUNG TÂM BẰNG GIỌNG NÓI ỨNG DỤNG AI TẠI BIÊN VÀ ĐÁM MÂY
 ## Đặc tả tính năng sản phẩm
 
 > Đồ án tốt nghiệp — nhóm 2 người, thời gian thực hiện 4-5 tháng.
