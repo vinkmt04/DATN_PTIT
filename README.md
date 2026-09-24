@@ -1,16 +1,14 @@
 # HỆ THỐNG IOT DỰA TRÊN MẠNG THREAD MESH, TÍCH HỢP BỘ ĐIỀU KHIỂN TRUNG TÂM BẰNG GIỌNG NÓI ỨNG DỤNG AI TẠI BIÊN VÀ ĐÁM MÂY
 ## Đặc tả tính năng sản phẩm
 
-> Đồ án tốt nghiệp — nhóm 2 người, thời gian thực hiện 4-5 tháng.
-> Định vị sản phẩm: một trợ lý giọng nói kiểu Google Home/Alexa, nhưng mạng thiết bị phía sau (điều khiển đèn, rèm, ổ cắm, cảm biến) do nhóm tự thiết kế từ giao thức tầng thấp (Thread Mesh, OpenThread), không dùng nền tảng Matter/Zigbee có sẵn — đây là điểm khác biệt kỹ thuật (USP) so với sản phẩm thương mại.
-
+> Đồ án tốt nghiệp — nhóm 2 người, thời gian thực hiện 2 tháng.
 ---
 
 ## PHẦN 1: TỔNG QUAN SẢN PHẨM
 
-Một trợ lý giọng nói thông minh gồm:
-- **1 Thiết bị trung tâm (hình thức giống loa thông minh)**: màn hình cảm ứng, mic/loa, xử lý giọng nói, đồng thời đóng vai trò Border Router cầu nối Thread Mesh ↔ WiFi/Cloud.
-- **Nhiều node thiết bị không dây** (đèn, ổ cắm, rèm, cảm biến môi trường) giao tiếp qua Thread Mesh do nhóm tự xây dựng.
+Một hệ thống IOT gồm:
+- **1 Thiết bị trung tâm (gateway)**: màn hình cảm ứng, mic/loa, xử lý giọng nói, đồng thời đóng vai trò cầu nối điều khiển mạng Thread Mesh.
+- **Nhiều node thiết bị không dây** (đèn, ổ cắm, rèm, cảm biến môi trường) giao tiếp qua Thread Mesh.
 - **AI 2 lớp, xử lý theo nguyên tắc "cục bộ trước" (local-first)**: mọi lệnh đều thử xử lý tại chỗ trước bằng mô hình tự huấn luyện; chỉ đẩy lên Cloud LLM khi lệnh không khớp mẫu cục bộ — vừa nhanh, vừa tiết kiệm, vừa không phụ thuộc mạng cho việc thường ngày.
 - **Giám sát/điều khiển từ xa** qua MQTT + ThingsBoard.
 
