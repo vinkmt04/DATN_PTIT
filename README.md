@@ -1,158 +1,101 @@
-# HỆ THỐNG IOT DỰA TRÊN MẠNG THREAD MESH, TÍCH HỢP BỘ ĐIỀU KHIỂN TRUNG TÂM BẰNG GIỌNG NÓI ỨNG DỤNG AI TẠI BIÊN VÀ ĐÁM MÂY
-## Đặc tả tính năng sản phẩm
+# HỆ THỐNG IOT NHÀ THÔNG MINH DỰA TRÊN MẠNG THREAD MESH, TÍCH HỢP BỘ ĐIỀU KHIỂN TRUNG TÂM BẰNG GIỌNG NÓI ỨNG DỤNG AI PHÂN TÁN (EDGE - CLOUD)
 
-> Đồ án tốt nghiệp — nhóm 2 người, thời gian thực hiện 2 tháng.
+## Đặc tả tính năng sản phẩm
+> **Đồ án tốt nghiệp** — Nhóm 2 sinh viên.
+> **Thời gian thực hiện dự kiến:** 2 tháng.
+
 ---
 
 ## PHẦN 1: TỔNG QUAN SẢN PHẨM
 
-Một hệ thống IOT gồm:
-- **1 Thiết bị trung tâm (gateway)**: màn hình cảm ứng, mic/loa, xử lý giọng nói, đồng thời đóng vai trò cầu nối điều khiển mạng Thread Mesh.
-- **Nhiều node thiết bị không dây** (đèn, ổ cắm, rèm, cảm biến môi trường) giao tiếp qua Thread Mesh.
-- **AI 2 lớp, xử lý theo nguyên tắc "cục bộ trước" (local-first)**: mọi lệnh đều thử xử lý tại chỗ trước bằng mô hình tự huấn luyện; chỉ đẩy lên Cloud LLM khi lệnh không khớp mẫu cục bộ — vừa nhanh, vừa tiết kiệm, vừa không phụ thuộc mạng cho việc thường ngày.
-- **Giám sát/điều khiển từ xa** qua MQTT + ThingsBoard.
+Một hệ thống vạn vật kết nối (IoT) khép kín bao gồm:
+- **01 Thiết bị trung tâm (Voice Gateway):** Tích hợp màn hình cảm ứng, Micro/Loa xử lý giọng nói. Đóng vai trò là Bộ định tuyến biên (OpenThread Border Router) điều phối toàn mạng lưới.
+- **Nhiều Node thiết bị không dây (End-Devices):** Các module công tắc, đèn, cảm biến môi trường giao tiếp nội bộ qua chuẩn mạng Thread Mesh (IPv6).
+- **Trí tuệ nhân tạo (AI) 2 lớp - "Local-First, Cloud-Fallback":** Mọi câu lệnh đều ưu tiên phân tích và xử lý tức thời tại biên (Edge AI). Chỉ khi câu lệnh mang ngữ nghĩa phức tạp mới được đẩy lên Đám mây (Cloud LLM) để suy luận. Giúp hệ thống phản hồi siêu tốc và hoạt động ổn định kể cả khi mất Internet.
+- **Giám sát & Quản lý:** Đồng bộ trạng thái toàn cục theo thời gian thực qua giao thức MQTT trên nền tảng ThingsBoard.
 
 ---
 
-## PHẦN 2: TÍNH NĂNG THIẾT BỊ TRUNG TÂM
+## PHẦN 2: CHI TIẾT TÍNH NĂNG THIẾT BỊ TRUNG TÂM (VOICE GATEWAY)
 
 ### 2.1. Phần cứng
-- **ESP32-S3 DevKit** (8MB PSRAM) — chip chủ (Host): xử lý audio, AI, giao diện, Thread Border Router, MQTT client. Dùng bản DevKit (không phải SuperMini) để tận dụng 2 cổng USB-C (UART debug + USB-JTAG tích hợp), cần thiết cho việc debug pipeline audio+Thread+AI phức tạp.
-- **ESP32-H2 DevKit** — RCP (Radio Co-Processor): xử lý tầng radio 802.15.4 cho Thread, nối UART với ESP32-S3.
-- **Màn hình TFT cảm ứng**: trạng thái phòng/thiết bị, đồng hồ, thông tin môi trường, thao tác chạm điều khiển trực tiếp.
-- **Mic I2S (INMP441) + loa/amp I2S (MAX98357A)**.
-- **RTC (DS3231)**: đồng bộ giờ cho toàn hệ thống automation theo thời gian.
+- **ESP32-S3 DevKit (8MB PSRAM) — Chip Chủ (Host):** Đảm nhiệm các tác vụ nặng: Thu/phát Audio I2S, chạy mô hình Edge AI, vẽ giao diện đồ họa, điều phối OpenThread Border Router (OTBR) và kết nối Wi-Fi/MQTT.
+- **ESP32-C6 (hoặc H2) DevKit — Radio Co-Processor (RCP):** Cắm vào ESP32-S3 qua giao tiếp UART/SPI. Chuyên trách xử lý tín hiệu sóng vô tuyến 802.15.4 cho mạng Thread.
+- **Màn hình TFT cảm ứng:** Hiển thị trực quan trạng thái các phòng, thông số môi trường, đồng hồ và cung cấp giao diện chạm để điều khiển trực tiếp.
+- **Micro & Loa:** Micro I2S (INMP441) đa hướng + Amply I2S (MAX98357A) ra Loa.
+- *(Lưu ý kiến trúc: Để tối đa hóa tài nguyên cho mô hình AI và OTBR, tính năng cập nhật từ xa OTA trên thiết bị trung tâm đã được loại bỏ để dành trọn bộ nhớ Flash).*
 
-### 2.2. Điều khiển bằng giọng nói — pipeline xử lý "Local-First, Cloud Fallback"
+### 2.2. Luồng xử lý giọng nói "Local-First, Cloud Fallback"
+**Nguyên tắc cốt lõi:** Tối ưu độ trễ và sự phụ thuộc vào mạng Internet.
 
-**Nguyên tắc cốt lõi:** luôn thử xử lý cục bộ trước, bất kể có mạng hay không — chỉ gọi Cloud khi thật sự cần, để tối ưu độ trễ, chi phí, và giảm phụ thuộc mạng cho các lệnh thường ngày.
+1. **Wake-word (Luôn thức):** Chạy cục bộ trên ESP32-S3 (Huấn luyện qua Edge Impulse).
+2. **Multi-Keyword Spotting (Lệnh cơ bản):** Khi nghe lệnh (VD: *"Bật đèn", "Tắt quạt"*), hệ thống đối chiếu với mô hình học máy cục bộ. Nếu độ tin cậy cao -> **Thực thi ngay lập tức**, không cần Internet.
+3. **Cloud LLM (Lệnh phức tạp/Trò chuyện):** Nếu âm thanh không khớp mẫu cục bộ, Gateway gửi luồng Audio lên Cloud qua WebSocket (Sử dụng **Gemini Live API**). LLM tự bóc tách ngữ nghĩa:
+   - Nếu là lệnh tự do (VD: *"Phòng nóng quá, bật giúp cái quạt"*): LLM trả về mã lệnh JSON để Gateway thực thi.
+   - Nếu là câu hỏi thông tin: LLM trả về text, Gateway dùng TTS đọc ra Loa.
+4. **Graceful Degradation (Kịch bản rớt mạng):** Nếu mất Internet, hệ thống báo lỗi với lệnh phức tạp, nhưng các lệnh cơ bản cục bộ vẫn hoạt động bình thường.
 
-```
-Wake-word kích hoạt (edge, luôn chạy, tự train qua Edge Impulse)
-    → Thu audio câu lệnh
-    → Chạy Multi-keyword-spotting cục bộ (tự train qua Edge Impulse, chạy trên ESP32-S3)
-        ├── [Khớp, độ tin cậy cao] → Thực thi NGAY tại chỗ, KHÔNG gọi Cloud
-        │     (độ trễ thấp, không phụ thuộc mạng, không tốn chi phí API)
-        │
-        └── [Không khớp / độ tin cậy thấp]
-                ├── [Có mạng] → Gửi audio lên Cloud LLM API qua function calling
-                │      LLM tự quyết định:
-                │        - Khớp 1 hàm điều khiển đã định nghĩa → trả JSON, hệ thống thực thi
-                │          (dieu_khien_thiet_bi, dat_hen_gio, tao_scene...)
-                │        - Không khớp hàm nào → LLM tự trả lời tự do (hỏi đáp thông tin,
-                │          trò chuyện) → đọc thẳng qua TTS
-                │
-                └── [Mất mạng] → Báo "không hiểu lệnh, vui lòng nói theo mẫu có sẵn"
-                       (giới hạn Graceful Degradation, cần nêu rõ trong báo cáo)
-```
-
-**Tập lệnh xử lý cục bộ (multi-keyword-spotting):** "bật đèn", "tắt đèn", "mở rèm", "đóng rèm", "bật quạt", "tắt quạt"... — các lệnh đơn giản, tần suất dùng cao nhất, không cần điều kiện phức tạp.
-
-**Lệnh cần Cloud LLM:** câu điều kiện phức tạp ("bật điều hòa nếu phòng lạnh"), hẹn giờ tùy biến, tạo/sửa scene bằng giọng nói, hỏi đáp thông tin chung.
-
-**Giới hạn kỹ thuật cần nêu trong báo cáo:** keyword-spotting khớp khá "cứng" với đúng cụm từ đã huấn luyện và vài biến thể gần giống — nếu người dùng diễn đạt khác đi nhiều (ví dụ "làm ơn bật giúp tôi cái đèn"), nhiều khả năng không khớp và rơi xuống Cloud dù bản chất vẫn là lệnh đơn giản. Đây là giới hạn tự nhiên của keyword-spotting so với NLU đầy đủ, không phải lỗi thiết kế.
-
-### 2.3. Command Dispatcher & phản hồi
-- Với lệnh điều khiển thiết bị (dù xử lý cục bộ hay qua Cloud): tra bảng node theo phòng/loại thiết bị, đóng gói CoAP, gửi qua ESP32-H2 xuống Thread Mesh.
-- Phản hồi: TTS qua loa + hiển thị trên màn hình.
-
-### 2.4. Giao diện màn hình cảm ứng
-- Trang tổng quan trạng thái node theo phòng.
-- Điều khiển chạm trực tiếp (không cần giọng nói).
-- Tạo/quản lý Scene và lịch hẹn giờ bằng tay.
-- Cảnh báo node mất kết nối/pin yếu.
-
-### 2.5. Scene tự động gợi ý bằng AI — tính năng MỞ RỘNG
-> Làm sau khi hoàn thành phần lõi. Ghi log lịch sử lệnh, dùng association rule mining (Apriori/FP-Growth) phát hiện pattern lặp lại, đề xuất gộp scene.
-
-### 2.6. Kết nối MQTT & ThingsBoard
-- Publish trạng thái toàn bộ node lên ThingsBoard theo thời gian thực.
-- Subscribe lệnh điều khiển từ xa, dùng chung luồng Dispatcher.
-- Dashboard: biểu đồ môi trường, lịch sử thiết bị, cảnh báo, công suất tiêu thụ.
-
-### 2.7. Phân tích môi trường & bản tin cá nhân hóa — tính năng phụ
-- Phân tích chất lượng môi trường phòng (nhiệt/ẩm/CO2) theo thời gian.
-- Đọc bản tin buổi sáng khi tới giờ hẹn (tận dụng `dat_hen_gio`, không cần logic riêng).
+### 2.3. Command Dispatcher & Giao diện
+- **Dispatcher:** Mọi lệnh (từ AI, Màn hình, hay Cloud) đều được tập hợp, tra bảng địa chỉ IPv6 và đóng gói thành bản tin CoAP gửi xuống Thread Mesh.
+- **Màn hình cảm ứng:** Hỗ trợ điều khiển thủ công, cảnh báo rớt mạng Node, hiển thị trạng thái động.
 
 ---
 
-## PHẦN 3: TÍNH NĂNG NODE THIẾT BỊ (Thread Mesh, wireless, độc lập)
+## PHẦN 3: TÍNH NĂNG CÁC THIẾT BỊ CHẤP HÀNH (THREAD NODES)
 
-| Node | Chip đề xuất | Vai trò Thread | Chức năng |
+| Chức năng Node | Chip đề xuất | Vai trò Thread | Mô tả kỹ thuật |
 |---|---|---|---|
-| Ổ cắm/relay thông minh | ESP32-H2 (DevKit khi phát triển) | FTD (cắm điện) | Bật/tắt thiết bị cắm vào, đo dòng điện tiêu thụ (ACS712/INA219) |
-| Đèn dimming | ESP32-H2 (DevKit khi phát triển) | FTD | Điều chỉnh độ sáng qua PWM |
-| Cảm biến môi trường phòng | ESP32-H2 (DevKit khi phát triển) | **MTD** (sleepy end device, chạy pin) | Nhiệt/ẩm (DHT22/SHT31) + ánh sáng (BH1750), gửi định kỳ rồi ngủ |
-| Rèm/mành tự động | ESP32-H2 (hoặc C6 nếu cần vai Router mạnh) | FTD | Motor kéo rèm, phản hồi vị trí qua limit switch/encoder |
+| **Công tắc thông minh** | ESP32-C6 / H2 | FTD (Router) | Điều khiển Relay, đo dòng điện tiêu thụ (ACS712/INA219) |
+| **Đèn Dimming** | ESP32-C6 / H2 | FTD (Router) | Băm xung PWM điều chỉnh cường độ sáng |
+| **Cảm biến môi trường**| ESP32-C6 / H2 | MTD (Sleepy Node) | Chạy pin. Đo nhiệt/ẩm (DHT22) + Ánh sáng (BH1750). Cập nhật định kỳ rồi ngủ sâu |
 
-**Ghi chú phần cứng:** giai đoạn phát triển/debug dùng bản DevKit cho mọi node (giảm rủi ro không chắc chắn khi còn làm quen với Thread, có jumper đo dòng chính xác cho thí nghiệm pin). Giai đoạn hoàn thiện sản phẩm cuối có thể cân nhắc chuyển sang SuperMini (từ nhà bán uy tín, đã sửa lỗi LDO/RGB) hoặc DevKitM-1 để gọn nhẹ hơn khi đóng hộp thật.
-
-**Tự động hóa phân tán (không qua thiết bị trung tâm):** với cặp node phù hợp, thiết lập logic tự động cục bộ trực tiếp trong mesh — minh chứng khả năng hoạt động độc lập ngay cả khi thiết bị trung tâm gặp sự cố.
+*Các thiết bị FTD (Full Thread Device) cắm điện lưới sẽ tự động trở thành các Router, giúp mở rộng độ phủ sóng mạng Mesh nội bộ và tự động định tuyến lại (self-healing) khi có một Node bị hỏng.*
 
 ---
 
-## PHẦN 4: TỔNG HỢP THÀNH PHẦN AI
+## PHẦN 4: BẢN ĐỒ CÔNG NGHỆ TRÍ TUỆ NHÂN TẠO
 
-| Thành phần | Tự train hay dùng dịch vụ | Công cụ/nguồn | Ghi chú |
+| Thành phần AI | Nền tảng huấn luyện / Dịch vụ | Môi trường thực thi | Ghi chú |
 |---|---|---|---|
-| Wake-word | **Tự train** | Edge Impulse | Chạy trên ESP32-S3, luôn hoạt động |
-| Multi-keyword-spotting | **Tự train** | Edge Impulse | Luôn thử trước, bất kể có mạng hay không (local-first) |
-| ASR + NLU + hỏi đáp tự do | Dùng dịch vụ | Cloud LLM API (Gemini Flash-Lite / GPT-4.1 mini), function calling | Chỉ gọi khi local không khớp và có mạng |
-| Scene tự động gợi ý *(mở rộng)* | Tự viết thuật toán | Association rule mining | Làm sau phần lõi |
+| **Từ khóa đánh thức (Wake-word)** | Tự thu thập & Train qua **Edge Impulse** | Chạy Offline trên ESP32-S3 | Đòi hỏi phản hồi < 0.5s |
+| **Nhận diện lệnh (Keyword-Spotting)** | Tự thu thập & Train qua **Edge Impulse** | Chạy Offline trên ESP32-S3 | Lệnh cơ bản (Bật/tắt) |
+| **Phân tích ngữ nghĩa tự nhiên (NLU)** | Sử dụng API dịch vụ Cloud | **Gemini Live API** (LLM) | Dùng WebSocket streaming |
 
 ---
 
-## PHẦN 5: ĐỘ TIN CẬY HỆ THỐNG
+## PHẦN 5: KẾ HOẠCH THỰC HIỆN & CHỈ SỐ ĐÁNH GIÁ (2 THÁNG)
 
-- **Watchdog**: ESP32-S3 giám sát kết nối RCP (H2) qua UART, tự reset nếu mất phản hồi. Mỗi node có FreeRTOS task watchdog riêng.
-- **Graceful Degradation**: mất Internet → mất hỏi đáp tự do + lệnh điều kiện phức tạp, còn multi-keyword-spotting cho lệnh cơ bản (không đổi hành vi so với khi có mạng, vì vốn dĩ đã ưu tiên xử lý cục bộ trước); thiết bị trung tâm hỏng hoàn toàn → node vẫn giữ trạng thái, tự động hóa cục bộ (nếu cấu hình) vẫn chạy; 1 node mất kết nối → relay qua node lân cận nhờ tự định tuyến Thread.
-- **OTA**: thiết bị trung tâm qua WiFi trực tiếp; node thiết bị qua Thread Mesh (có xác thực/CRC).
+**Lộ trình triển khai (8 Tuần):**
+* **Tuần 1 - 2 (Core & Networking):** Xây dựng bộ khung Gateway ESP32-S3. Thiết lập OTBR kết hợp RCP. Kết nối thử nghiệm Node Thread đầu tiên (CoAP/UDP).
+* **Tuần 3 - 4 (Edge AI):** Thu âm tạo Dataset. Huấn luyện mô hình Wake-word và Keyword-Spotting trên Edge Impulse, biên dịch sang C++ và nhúng vào S3.
+* **Tuần 5 (Cloud AI & UI):** Tích hợp WebSockets kết nối Gemini API. Thiết kế giao diện LVGL cho màn hình cảm ứng.
+* **Tuần 6 - 7 (Integration & Cloud):** Mở rộng toàn bộ các loại Node (Cảm biến, Relay). Tích hợp MQTT và thiết kế Dashboard trên ThingsBoard.
+* **Tuần 8 (Testing & Report):** Chạy thực nghiệm, đo đạc chỉ số và hoàn thiện báo cáo Đồ án.
 
----
-
-## PHẦN 6: LỘ TRÌNH THỰC HIỆN (4-5 THÁNG)
-
-| Giai đoạn | Thời gian | Nội dung |
-|---|---|---|
-| 1. Proof of concept | Tuần 1-2 | Border Router (S3+H2 DevKit) + 1 node đơn giản (bật/tắt LED qua CoAP) |
-| 2. Node thiết bị | Tuần 3-6 | Hoàn thiện 4 loại node, thử nghiệm mesh multi-hop, tối ưu năng lượng MTD |
-| 3. Voice pipeline | Tuần 7-10 | Wake-word + multi-keyword-spotting, pipeline local-first/cloud-fallback, tích hợp Cloud LLM function calling, TTS |
-| 4. Giao diện & kết nối | Tuần 11-13 | Màn hình TFT cảm ứng, MQTT/ThingsBoard, tạo scene/hẹn giờ thủ công |
-| 5. Reliability & OTA | Tuần 14-15 | Watchdog, graceful degradation, OTA qua mesh |
-| 6. Mở rộng (nếu còn thời gian) | Tuần 16-17 | Scene tự động gợi ý (association rule mining) |
-| 7. Thực nghiệm & viết báo cáo | Tuần 18-20 | Đo độ trễ/độ tin cậy mesh, độ chính xác wake-word/keyword-spotting, thời lượng pin, **tỷ lệ xử lý cục bộ thành công (local-hit rate)**, so sánh độ trễ local vs Cloud, hoàn thiện báo cáo |
-
-### Chỉ số thực nghiệm đề xuất cho pipeline giọng nói (chương 4)
-- **Local-hit rate**: % lệnh được xử lý thành công hoàn toàn cục bộ trên tổng số lệnh thử nghiệm (test với nhiều người nói, nhiều cách diễn đạt).
-- **Độ trễ trung bình**: so sánh xử lý cục bộ vs qua Cloud API (đo từ lúc kết thúc câu nói tới lúc thiết bị phản hồi).
-- **Độ chính xác wake-word/keyword-spotting**: tỷ lệ nhận đúng, tỷ lệ báo nhầm (false positive) trong điều kiện có tiếng ồn nền.
+**Các chỉ số thực nghiệm cần đo đạc (KPIs):**
+1. **Local-hit Rate:** Tỷ lệ % các câu lệnh cơ bản được xử lý thành công hoàn toàn tại biên (không cần Cloud).
+2. **Độ trễ toàn trình (Latency):** So sánh thời gian từ lúc kết thúc câu lệnh đến lúc đèn sáng giữa xử lý Edge AI và Cloud AI.
+3. **Độ tin cậy của mạng Thread:** Thời gian mạng tự phục hồi (Self-healing) khi ngắt nguồn 1 Node Router ở giữa.
 
 ---
 
-## PHẦN 7: PHÂN CÔNG NHÓM 2 NGƯỜI
+## PHẦN 6: PHÂN CÔNG NHÓM 2 NGƯỜI
 
-- **Người 1 — Mesh & Firmware thiết bị**: mạng Thread, commissioning, firmware 4 loại node, tối ưu năng lượng MTD, đo thực nghiệm mesh.
-- **Người 2 — Thiết bị trung tâm & AI**: firmware ESP32-S3 (audio pipeline local-first/cloud-fallback, giao diện TFT, Border Router, Dispatcher), huấn luyện wake-word + multi-keyword-spotting, tích hợp Cloud LLM function calling, MQTT/ThingsBoard.
+- **Người 1 — Mesh & Firmware Node thiết bị:** Quản lý mạng Thread, thiết lập Commissioning, code Firmware cho 3 loại Node, tối ưu năng lượng Node pin (MTD), và đo thực nghiệm mạng Mesh.
+- **Người 2 — Thiết bị trung tâm & AI:** Lập trình phần mềm ESP32-S3 (Audio pipeline Local-first/Cloud-fallback, Giao diện cảm ứng TFT, OTBR, Dispatcher). Phụ trách thu âm và huấn luyện Wake-word + Keyword-spotting, cấu hình API Gemini và MQTT/ThingsBoard.
 
 ---
 
-## PHẦN 8: BOM THAM KHẢO
+## PHẦN 7: DANH SÁCH LINH KIỆN (BOM THAM KHẢO)
 
-| Thành phần | Gợi ý | Số lượng |
+| Thành phần | Gợi ý linh kiện | Số lượng |
 |---|---|---|
 | Host trung tâm | ESP32-S3 DevKit (8MB PSRAM) | 1 |
-| RCP | ESP32-H2 DevKit | 1 |
-| Màn hình | TFT cảm ứng SPI (ILI9341/ST7789 có touch) | 1 |
-| Audio | Mic I2S INMP441, loa + amp I2S MAX98357A | 1 bộ |
-| RTC | DS3231 | 1 |
-| Node thiết bị (phát triển) | ESP32-H2 DevKit | 4-6 |
-| Node thiết bị (hoàn thiện, tùy chọn) | ESP32-H2 SuperMini (nhà bán uy tín) hoặc DevKitM-1 | Theo số node đóng hộp cuối |
-| Relay/đo dòng | Relay module/SSR + ACS712 hoặc INA219 | Theo node ổ cắm |
-| Dimming đèn | Driver PWM/dimmer AC phù hợp | Theo node đèn |
-| Cảm biến môi trường | DHT22 hoặc SHT31 + BH1750 | Theo node cảm biến |
-| Motor rèm | Động cơ DC/servo nhỏ + driver + limit switch | Theo node rèm |
-| Pin node MTD | Pin Li-Po/AA + mạch quản lý sạc/xả | Theo node cảm biến pin |
-
----
-
-*Bản cập nhật pipeline giọng nói theo nguyên tắc Local-First/Cloud-Fallback (luôn thử keyword-spotting cục bộ trước, chỉ gọi Cloud khi không khớp), bổ sung chỉ số thực nghiệm local-hit rate và so sánh độ trễ cho chương đánh giá.*
+| RCP Module | ESP32-C6 / H2 DevKit | 1 |
+| Màn hình | TFT cảm ứng SPI (ILI9341/ST7789) | 1 |
+| Module Audio | Mic I2S INMP441, Loa + Amp I2S MAX98357A | 1 bộ |
+| RTC | DS3231 (Đồng bộ thời gian chuẩn) | 1 |
+| Node thiết bị (Phát triển) | ESP32-C6 / H2 DevKit | 4-6 |
+| Relay / Đo dòng | Relay 5V hoặc SSR + ACS712 / INA219 | Theo số Node ổ cắm |
+| Cảm biến môi trường | DHT22 (Nhiệt/ẩm) + BH1750 (Ánh sáng) | Theo số Node cảm biến |
+| Nguồn cấp Node MTD | Pin Li-Po + Mạch sạc xả | Tùy chọn |
