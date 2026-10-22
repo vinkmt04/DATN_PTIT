@@ -65,24 +65,25 @@ Một hệ thống vạn vật kết nối (IoT) khép kín bao gồm:
 
 ## PHẦN 5: KẾ HOẠCH THỰC HIỆN & CHỈ SỐ ĐÁNH GIÁ (2 THÁNG)
 
-**Lộ trình triển khai (8 Tuần):**
-* **Tuần 1 - 2 (Core & Networking):** Xây dựng bộ khung Gateway ESP32-S3. Thiết lập OTBR kết hợp RCP. Kết nối thử nghiệm Node Thread đầu tiên (CoAP/UDP).
-* **Tuần 3 - 4 (Edge AI):** Thu âm tạo Dataset. Huấn luyện mô hình Wake-word và Keyword-Spotting trên Edge Impulse, biên dịch sang C++ và nhúng vào S3.
-* **Tuần 5 (Cloud AI & UI):** Tích hợp WebSockets kết nối Gemini API. Thiết kế giao diện LVGL cho màn hình cảm ứng.
-* **Tuần 6 - 7 (Integration & Cloud):** Mở rộng toàn bộ các loại Node (Cảm biến, Relay). Tích hợp MQTT và thiết kế Dashboard trên ThingsBoard.
-* **Tuần 8 (Testing & Report):** Chạy thực nghiệm, đo đạc chỉ số và hoàn thiện báo cáo Đồ án.
+**Lộ trình triển khai (8 Tuần) - *Đã cập nhật tiến độ thực tế*:**
+- **Tuần 1 - 2 (Core & Networking) [Đã hoàn thành]:** Xây dựng bộ khung Gateway ESP32-S3. Thiết lập mạng Thread Mesh sử dụng Host (ESP32-C6/S3) kết hợp RCP (ESP32-H2). Kết nối và kiểm thử thành công các Node Thread (Relay, Dimmer) qua giao thức CoAP/UDP với khả năng tự phục hồi từ NVS.
+- **Tuần 3 - 4 (Edge AI & Wake-word) [Đã hoàn thành]:** Thu âm dataset đa dạng (6 người), huấn luyện và tối ưu hóa mô hình Wake-word `hey_cherry` trên Edge Impulse đạt độ chính xác 96.3%[cite: 11] (tích hợp Machine Learning inference chạy liên tục 7ms[cite: 10] trên ESP32-S3). Xây dựng thành công Máy trạng thái 4 pha và tích hợp luồng pre-warm WebSocket Gemini Live API.
+- **Tuần 5 (Command Engine & Cloud AI):** Huấn luyện mô hình nhận diện lệnh cục bộ (Command Spotting - Tầng 2) cho 6 câu lệnh điều khiển thiết bị cốt lõi. Hoàn thiện tích hợp WebSockets kết nối Gemini Live API cho các truy vấn linh hoạt (Cloud Fallback).
+- **Tuần 6 (UI & Peripheral Expansion):** Thiết kế giao diện LVGL cho màn hình TFT (ST7789V). Mở rộng thêm các Node cảm biến môi trường (nhiệt độ, độ ẩm) hoạt động ở chế độ Sleepy End Device.
+- **Tuần 7 (Cloud IoT & Full Integration):** Chuyển đổi bộ thu phát RCP sang trực tiếp Gateway ESP32-S3 qua UART. Tích hợp giao thức MQTT và thiết kế Dashboard giám sát/điều khiển trên ThingsBoard.
+- **Tuần 8 (Testing & Report):** Chạy thực nghiệm toàn hệ thống (Edge - Cloud - Thread Mesh), đo đạc các chỉ số KPI thực tế và hoàn thiện báo cáo Đồ án tốt nghiệp.
 
 **Các chỉ số thực nghiệm cần đo đạc (KPIs):**
-1. **Local-hit Rate:** Tỷ lệ % các câu lệnh cơ bản được xử lý thành công hoàn toàn tại biên (không cần Cloud).
-2. **Độ trễ toàn trình (Latency):** So sánh thời gian từ lúc kết thúc câu lệnh đến lúc đèn sáng giữa xử lý Edge AI và Cloud AI.
-3. **Độ tin cậy của mạng Thread:** Thời gian mạng tự phục hồi (Self-healing) khi ngắt nguồn 1 Node Router ở giữa.
+1. **Local-hit Rate:** Tỷ lệ % các câu lệnh cơ bản (`bật/tắt đèn, quạt, công tắc`) được xử lý thành công hoàn toàn tại biên (Edge AI) mà không cần gọi Cloud.
+2. **Độ trễ toàn trình (Latency):** So sánh thời gian từ lúc người dùng kết thúc câu lệnh đến lúc thiết bị phản hồi thực tế giữa xử lý Offline (Edge AI + CoAP) và Online (Gemini Live API).
+3. **Độ tin cậy của mạng Thread:** Thời gian mạng tự phục hồi (Self-healing) và định tuyến lại đường đi khi ngắt nguồn một Node Router trung gian trong mạng nhiều chặng (Multi-hop).
 
 ---
 
 ## PHẦN 6: PHÂN CÔNG NHÓM 2 NGƯỜI
 
-- **Người 1 — Mesh & Firmware Node thiết bị:** Quản lý mạng Thread, thiết lập Commissioning, code Firmware cho 3 loại Node, tối ưu năng lượng Node pin (MTD), và đo thực nghiệm mạng Mesh.
-- **Người 2 — Thiết bị trung tâm & AI:** Lập trình phần mềm ESP32-S3 (Audio pipeline Local-first/Cloud-fallback, Giao diện cảm ứng TFT, OTBR, Dispatcher). Phụ trách thu âm và huấn luyện Wake-word + Keyword-spotting, cấu hình API Gemini và MQTT/ThingsBoard.
+- **Trần Văn Phúc — Mesh & Firmware Node thiết bị:** Quản lý mạng Thread, thiết lập Commissioning, code Firmware cho 3 loại Node, tối ưu năng lượng Node pin (MTD), và đo thực nghiệm mạng Mesh.
+- **Nguyễn Đức Quang Vinh — Thiết bị trung tâm & AI:** Lập trình phần mềm ESP32-S3 (Audio pipeline Local-first/Cloud-fallback, Giao diện cảm ứng TFT, OTBR, Dispatcher). Phụ trách thu âm và huấn luyện Wake-word + Keyword-spotting, cấu hình API Gemini và MQTT/ThingsBoard.
 
 ---
 
