@@ -95,8 +95,7 @@ Một hệ thống vạn vật kết nối (IoT) khép kín bao gồm:
 | RCP Module | ESP32-C6 / H2 DevKit | 1 |
 | Màn hình | TFT cảm ứng SPI (ILI9341/ST7789) | 1 |
 | Module Audio | Mic I2S INMP441, Loa + Amp I2S MAX98357A | 1 bộ |
-| RTC | DS3231 (Đồng bộ thời gian chuẩn) | 1 |
-| Node thiết bị (Phát triển) | ESP32-C6 / H2 DevKit | 4-6 |
-| Relay / Đo dòng | Relay 5V hoặc SSR + ACS712 / INA219 | Theo số Node ổ cắm |
+| Node thiết bị (Phát triển) | ESP32-C6 / H2 DevKit | 3 |
+| Relay | Relay 5V hoặc SSR + ACS712 / INA219 | Theo số Node ổ cắm |
 | Cảm biến môi trường | DHT22 (Nhiệt/ẩm) + BH1750 (Ánh sáng) | Theo số Node cảm biến |
 | Nguồn cấp Node MTD | Pin Li-Po + Mạch sạc xả | Tùy chọn |
