@@ -7,9 +7,9 @@ extern "C" {
 #endif
 
 typedef enum {
-    AI_EDGE_STATE_IDLE_WAKEWORD = 0, // 1. Lắng nghe 'Hey Cherry' ngầm (lát cắt 250ms)
-    AI_EDGE_STATE_WAIT_SPEECH,       // 2. Chờ người dùng mở lời sau tiếng Ding (No-Speech Guard 2.0s)
-    AI_EDGE_STATE_STREAMING_SPEECH,  // 3. Đang nói câu lệnh & streaming 60ms lên Cloud Live API
+    AI_EDGE_STATE_IDLE_WAKEWORD = 0, // 1. Lắng nghe 'Hey Cherry' ngầm 24/7 (lát cắt 250ms)
+    AI_EDGE_STATE_COMMAND_LISTENING, // 2. Lắng nghe câu lệnh Model 2 (Sliding Window 400ms / Cửa sổ 1.2s, tối đa 4.0s)
+    AI_EDGE_STATE_STREAMING_SPEECH,  // 3. Streaming âm thanh câu hỏi lên Google Gemini Live API
     AI_EDGE_STATE_AI_RESPONDING      // 4. Gemini đang xử lý & loa đang phát phản hồi TTS
 } ai_edge_state_t;
 

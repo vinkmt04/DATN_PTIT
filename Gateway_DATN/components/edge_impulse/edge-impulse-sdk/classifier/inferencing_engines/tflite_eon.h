@@ -138,7 +138,7 @@ static EI_IMPULSE_ERROR inference_tflite_run(
  *
  * @return     The ei impulse error.
  */
-EI_IMPULSE_ERROR run_nn_inference_from_dsp(
+inline EI_IMPULSE_ERROR run_nn_inference_from_dsp(
     ei_learning_block_config_tflite_graph_t *block_config,
     signal_t *signal,
     matrix_t *output_matrix)
@@ -196,7 +196,7 @@ EI_IMPULSE_ERROR run_nn_inference_from_dsp(
  *
  * @return     The ei impulse error.
  */
-EI_IMPULSE_ERROR run_nn_inference(
+inline EI_IMPULSE_ERROR run_nn_inference(
     const ei_impulse_t *impulse,
     ei_feature_t *fmatrix,
     uint32_t learn_block_index,
@@ -310,7 +310,7 @@ EI_IMPULSE_ERROR run_nn_inference(
  * that allocates a lot less memory by quantizing in place. This only works if 'can_run_classifier_image_quantized'
  * returns EI_IMPULSE_OK.
  */
-EI_IMPULSE_ERROR run_nn_inference_image_quantized(
+inline EI_IMPULSE_ERROR run_nn_inference_image_quantized(
     const ei_impulse_t *impulse,
     signal_t *signal,
     uint32_t learn_block_index,
@@ -441,7 +441,7 @@ EI_IMPULSE_ERROR run_nn_inference_image_quantized(
 }
 #endif // EI_CLASSIFIER_QUANTIZATION_ENABLED == 1
 
-__attribute__((unused)) int extract_tflite_eon_features(signal_t *signal, matrix_t *output_matrix, void *config_ptr, const float frequency) {
+__attribute__((unused)) inline int extract_tflite_eon_features(signal_t *signal, matrix_t *output_matrix, void *config_ptr, const float frequency) {
     ei_dsp_config_tflite_eon_t *dsp_config = (ei_dsp_config_tflite_eon_t*)config_ptr;
 
     ei_config_tflite_eon_graph_t ei_config_tflite_graph_0 = {

@@ -54,7 +54,7 @@
 #include "edge-impulse-sdk/tensorflow/lite/schema/schema_generated.h"
 #endif // EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_TFLITE
 
-EI_IMPULSE_ERROR fill_input_tensor_from_matrix(
+inline EI_IMPULSE_ERROR fill_input_tensor_from_matrix(
     ei_feature_t *fmatrix,
     ei_feature_t *omatrix,
     TfLiteTensor *input,
@@ -121,7 +121,7 @@ EI_IMPULSE_ERROR fill_input_tensor_from_matrix(
     return EI_IMPULSE_OK;
 }
 
-EI_IMPULSE_ERROR fill_input_tensor_from_signal(
+inline EI_IMPULSE_ERROR fill_input_tensor_from_signal(
     signal_t *signal,
     TfLiteTensor *input
 ) {
@@ -244,7 +244,7 @@ EI_IMPULSE_ERROR fill_input_tensor_from_signal(
     return EI_IMPULSE_OK;
 }
 
-EI_IMPULSE_ERROR fill_output_matrix_from_tensor(
+inline EI_IMPULSE_ERROR fill_output_matrix_from_tensor(
     TfLiteTensor *output,
     matrix_t *output_matrix
 ) {

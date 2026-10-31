@@ -322,7 +322,7 @@ namespace processing {
      * @param sampling_freq Sampling frequency
      * @returns 0 if OK
      */
-    int spectral_power_edges(
+    inline int spectral_power_edges(
         matrix_t *fft_matrix,
         matrix_t *freq_matrix,
         matrix_t *edges_matrix,
@@ -385,7 +385,7 @@ namespace processing {
      * @param n_fft Number of FFT buckets
      * @returns 0 if OK
      */
-    int periodogram(matrix_t *input_matrix, matrix_t *out_fft_matrix, matrix_t *out_freq_matrix, float sampling_freq, uint16_t n_fft)
+    inline int periodogram(matrix_t *input_matrix, matrix_t *out_fft_matrix, matrix_t *out_freq_matrix, float sampling_freq, uint16_t n_fft)
     {
         if (input_matrix->rows != 1) {
             EIDSP_ERR(EIDSP_MATRIX_SIZE_MISMATCH);

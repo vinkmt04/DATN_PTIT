@@ -45,14 +45,12 @@
 #endif
 
 // Whether ei_result_t classification field is statically allocated on the result struct or not
-#if defined(EI_DSP_RESULT_OVERRIDE)
+// In multi-model architectures (Shared SDK + Hybrid Routing), models have different label counts.
+// Dynamic allocation (0) ensures ei_impulse_result_t struct layout and member offsets remain
+// 100% constant and invariant across all models, preventing fatal ODR struct layout mismatches.
+#ifndef EI_IMPULSE_RESULT_CLASSIFICATION_IS_STATICALLY_ALLOCATED
 #define EI_IMPULSE_RESULT_CLASSIFICATION_IS_STATICALLY_ALLOCATED    0
-#elif defined(EI_CLASSIFIER_LABEL_COUNT)
-// statically allocate
-#define EI_IMPULSE_RESULT_CLASSIFICATION_IS_STATICALLY_ALLOCATED    1
-#else
-#define EI_IMPULSE_RESULT_CLASSIFICATION_IS_STATICALLY_ALLOCATED    0
-#endif // EI_CLASSIFIER_LABEL_COUNT && EI_CLASSIFIER_LABEL_COUNT > 0
+#endif
 
 /**
  * @defgroup ei_structs Structs

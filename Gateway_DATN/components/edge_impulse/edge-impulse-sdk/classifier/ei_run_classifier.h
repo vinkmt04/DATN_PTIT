@@ -96,7 +96,9 @@
 #endif
 
 // This file has an implicit dependency on ei_run_dsp.h, so must come after that include!
+#if !defined(_EI_CLASSIFIER_MODEL_VARIABLES_WAKEWORD_H_) && !defined(_EI_CLASSIFIER_MODEL_VARIABLES_COMMAND_H_)
 #include "model-parameters/model_variables.h"
+#endif
 
 #ifdef __cplusplus
 namespace {
@@ -143,7 +145,7 @@ __attribute__((unused)) void display_results(ei_impulse_handle_t *handle, ei_imp
  *
  * @return     The ei impulse error.
  */
-extern "C" EI_IMPULSE_ERROR run_inference(
+extern "C" inline EI_IMPULSE_ERROR run_inference(
     ei_impulse_handle_t *handle,
     ei_feature_t *fmatrix,
     ei_impulse_result_t *result,
@@ -232,7 +234,7 @@ static void ei_print_features(ei_feature_t *features, uint32_t block_num) {
  *
  * @return     The ei impulse error.
  */
-extern "C" EI_IMPULSE_ERROR process_impulse(ei_impulse_handle_t *handle,
+extern "C" inline EI_IMPULSE_ERROR process_impulse(ei_impulse_handle_t *handle,
                                             signal_t *signal,
                                             ei_impulse_result_t *result,
                                             bool debug = false)
@@ -456,7 +458,7 @@ extern "C" EI_IMPULSE_ERROR process_impulse(ei_impulse_handle_t *handle,
  *
  * @return     A pointer to the impulse handle, or nullptr if memory allocation failed.
  */
-extern "C" EI_IMPULSE_ERROR init_impulse(ei_impulse_handle_t *handle) {
+extern "C" inline EI_IMPULSE_ERROR init_impulse(ei_impulse_handle_t *handle) {
     if (!handle) {
         return EI_IMPULSE_OUT_OF_MEMORY;
     }
@@ -474,7 +476,7 @@ extern "C" EI_IMPULSE_ERROR init_impulse(ei_impulse_handle_t *handle) {
  *
  * @return     The ei impulse error.
  */
-extern "C" EI_IMPULSE_ERROR process_impulse_continuous(ei_impulse_handle_t *handle,
+extern "C" inline EI_IMPULSE_ERROR process_impulse_continuous(ei_impulse_handle_t *handle,
                                                        signal_t *signal,
                                                        ei_impulse_result_t *result,
                                                        bool debug = false)
@@ -726,7 +728,7 @@ __attribute__((unused)) static EI_IMPULSE_ERROR can_run_classifier_image_quantiz
  * that allocates a lot less memory by quantizing in place. This only works if 'can_run_classifier_image_quantized'
  * returns EI_IMPULSE_OK.
  */
-extern "C" EI_IMPULSE_ERROR run_classifier_image_quantized(
+extern "C" inline EI_IMPULSE_ERROR run_classifier_image_quantized(
     const ei_impulse_t *impulse,
     signal_t *signal,
     ei_impulse_result_t *result,
@@ -883,7 +885,7 @@ will be documented by Doxygen. */
  *
  * **Example**: [nano_ble33_sense_microphone_continuous.ino](https://github.com/edgeimpulse/example-lacuna-ls200/blob/main/nano_ble33_sense_microphone_continous/nano_ble33_sense_microphone_continuous.ino)
  */
-extern "C" void run_classifier_init(void)
+extern "C" inline void run_classifier_init(void)
 {
 
     classifier_continuous_features_written = 0;
@@ -909,7 +911,7 @@ extern "C" void run_classifier_init(void)
  *
  * @param[in]   handle struct with information about model and DSP
  */
-__attribute__((unused)) void run_classifier_init(ei_impulse_handle_t *handle)
+__attribute__((unused)) inline void run_classifier_init(ei_impulse_handle_t *handle)
 {
     classifier_continuous_features_written = 0;
     ei_dsp_clear_continuous_audio_state();
@@ -931,12 +933,12 @@ __attribute__((unused)) void run_classifier_init(ei_impulse_handle_t *handle)
  *
  * **Example**: [ei_run_audio_impulse.cpp](https://github.com/edgeimpulse/firmware-nordic-thingy53/blob/main/src/inference/ei_run_audio_impulse.cpp)
  */
-extern "C" void run_classifier_deinit(void)
+extern "C" inline void run_classifier_deinit(void)
 {
     deinit_postprocessing(&ei_default_impulse);
 }
 
-__attribute__((unused)) void run_classifier_deinit(ei_impulse_handle_t *handle)
+__attribute__((unused)) inline void run_classifier_deinit(ei_impulse_handle_t *handle)
 {
     deinit_postprocessing(handle);
 #if EI_CLASSIFIER_HAS_DATA_NORMALIZATION
@@ -993,7 +995,7 @@ __attribute__((unused)) void run_classifier_deinit(ei_impulse_handle_t *handle)
  * @return Error code as defined by `EI_IMPULSE_ERROR` enum. Will be `EI_IMPULSE_OK` if inference
  *  completed successfully.
  */
-extern "C" EI_IMPULSE_ERROR run_classifier_continuous(
+extern "C" inline EI_IMPULSE_ERROR run_classifier_continuous(
     signal_t *signal,
     ei_impulse_result_t *result,
     bool debug = false,
@@ -1081,7 +1083,7 @@ __attribute__((unused)) EI_IMPULSE_ERROR run_classifier_continuous(
  * @return Error code as defined by `EI_IMPULSE_ERROR` enum. Will be `EI_IMPULSE_OK` if inference
  *  completed successfully.
  */
-extern "C" EI_IMPULSE_ERROR run_classifier(
+extern "C" inline EI_IMPULSE_ERROR run_classifier(
     signal_t *signal,
     ei_impulse_result_t *result,
     bool debug = false)

@@ -50,7 +50,7 @@ static void ei_print_timing(ei_impulse_result_t *result_ptr);
  * @param      impulse_handle  Pointer to impulse handle (e.g. &ei_default_impulse)
  * @param      result_ptr  Pointer to result struct.
  */
-void ei_print_results(ei_impulse_handle_t *impulse_handle, ei_impulse_result_t *result_ptr) {
+inline void ei_print_results(ei_impulse_handle_t *impulse_handle, ei_impulse_result_t *result_ptr) {
     ei_print_timing(result_ptr);
 
     const ei_impulse_t *impulse = impulse_handle->impulse;

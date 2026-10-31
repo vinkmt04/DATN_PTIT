@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
-file(GLOB_RECURSE MODEL_SRCS "tflite-model/*.cpp")
-file(GLOB_RECURSE PARAMS_SRCS "model-parameters/*.cpp")
+file(GLOB_RECURSE WW_MODEL_SRCS "model_wakeword/tflite-model/*.cpp")
+file(GLOB_RECURSE CMD_MODEL_SRCS "model_command/tflite-model/*.cpp")
 file(GLOB_RECURSE EI_PORTING_SRCS "edge-impulse-sdk/porting/espressif/*.cpp")
 file(GLOB_RECURSE EI_DSP_SRCS "edge-impulse-sdk/dsp/*.cpp")
 file(GLOB_RECURSE EI_CLASSIFIER_SRCS "edge-impulse-sdk/classifier/*.cpp")
@@ -20,8 +20,10 @@ file(GLOB_RECURSE TFLITE_MICRO_SRCS
 file(GLOB_RECURSE CMSIS_DSP_SRCS "edge-impulse-sdk/CMSIS/DSP/Source/*/*.c")
 
 set(ALL_SRCS
-    ${MODEL_SRCS}
-    ${PARAMS_SRCS}
+    "ei_wakeword.cpp"
+    "ei_command.cpp"
+    ${WW_MODEL_SRCS}
+    ${CMD_MODEL_SRCS}
     ${EI_PORTING_SRCS}
     ${EI_DSP_SRCS}
     ${EI_CLASSIFIER_SRCS}
@@ -32,9 +34,14 @@ set(ALL_SRCS
 idf_component_register(
     SRCS ${ALL_SRCS}
     INCLUDE_DIRS 
+        "include"
         "."
-        "model-parameters"
-        "tflite-model"
+        "model_wakeword"
+        "model_wakeword/model-parameters"
+        "model_wakeword/tflite-model"
+        "model_command"
+        "model_command/model-parameters"
+        "model_command/tflite-model"
         "edge-impulse-sdk"
         "edge-impulse-sdk/classifier"
         "edge-impulse-sdk/porting"
@@ -50,10 +57,15 @@ idf_component_register(
         "edge-impulse-sdk/porting/espressif/esp-dsp/modules/fft/include"
     REQUIRES 
         esp_timer
+        log
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE 
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17 -fno-rtti>
     -w
 )
-target_compile_definitions(${COMPONENT_LIB} PUBLIC "-DEI_PORTING_ESPRESSIF=1" "-DEIDSP_USE_ESP_DSP=0")
+target_compile_definitions(${COMPONENT_LIB} PUBLIC 
+    "-DEI_PORTING_ESPRESSIF=1" 
+    "-DEIDSP_USE_ESP_DSP=0"
+    "-DEI_IMPULSE_RESULT_CLASSIFICATION_IS_STATICALLY_ALLOCATED=0"
+)

@@ -204,7 +204,7 @@ private:
     }
 };
 
-DspHandle* flatten_class::create(void* config_in, float _sampling_frequency) { // NOLINT def in header is OK at EI
+inline DspHandle* flatten_class::create(void* config_in, float _sampling_frequency) { // NOLINT def in header is OK at EI
     auto config = reinterpret_cast<ei_dsp_config_flatten_t*>(config_in);
     return new flatten_class(config->moving_avg_num_windows, config->axes);
 };

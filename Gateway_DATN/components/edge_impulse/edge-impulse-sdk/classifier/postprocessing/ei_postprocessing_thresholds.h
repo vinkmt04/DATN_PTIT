@@ -60,7 +60,7 @@
  * @param out_thresholds Vector of thresholds
  * @return EI_IMPULSE_OK
  */
-EI_IMPULSE_ERROR get_thresholds_postprocessing(const ei_postprocessing_block_t *pp_block, std::vector<ei_threshold_desc_t>& out_thresholds) {
+inline EI_IMPULSE_ERROR get_thresholds_postprocessing(const ei_postprocessing_block_t *pp_block, std::vector<ei_threshold_desc_t>& out_thresholds) {
 
     switch (pp_block->type) {
         case EI_CLASSIFIER_MODE_OBJECT_DETECTION: {
@@ -260,7 +260,7 @@ EI_IMPULSE_ERROR get_thresholds_postprocessing(const ei_postprocessing_block_t *
  * @return EI_IMPULSE_OK if threshold was set; EI_IMPULSE_POSTPROCESSING_THRESHOLD_KEY_NOT_FOUND
  *         if threshold key was not found for this block.
  */
-EI_IMPULSE_ERROR set_threshold_postprocessing(const ei_postprocessing_block_t *pp_block, std::string name, float value) {
+inline EI_IMPULSE_ERROR set_threshold_postprocessing(const ei_postprocessing_block_t *pp_block, std::string name, float value) {
     std::vector<ei_threshold_desc_t> thresholds;
     EI_IMPULSE_ERROR res = get_thresholds_postprocessing(pp_block, thresholds);
     if (res != EI_IMPULSE_OK) {

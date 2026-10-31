@@ -31,6 +31,9 @@ void audio_hal_play_wake_sound(void);
 // Kiểm tra tiếng chuông báo thức có đang phát hay không
 bool audio_hal_is_wake_sound_playing(void);
 
+// Kiểm tra đã đến thời điểm bắt đầu thu âm hay chưa (100ms trước khi chuông Ding kết thúc)
+bool audio_hal_is_wake_recording_ready(void);
+
 // Ép thoát trạng thái buffering nếu có sự cố
 void audio_hal_force_start_playing(void);
 
@@ -39,6 +42,15 @@ void audio_hal_play_error_sound(void);
 
 // Dừng phát âm thanh ngay lập tức và xả sạch bộ đệm (Dùng cho Barge-In ngắt lời)
 void audio_hal_stop_playback(void);
+
+// Xả sạch bộ đệm phát TX đồng bộ an toàn
+void audio_hal_flush_tx(void);
+
+// Xả sạch bộ đệm thu RX DMA để loại bỏ âm thanh cũ/tiếng dội tích tụ
+void audio_hal_flush_rx(void);
+
+// Reset trigger VAD chuẩn Espressif về trạng thái Silence
+void audio_vad_reset_trigger(void);
 
 // Kiểm tra loa có đang phát âm thanh hay không (Dùng cho Echo Guard chống loa dội vào mic)
 bool audio_hal_is_playing(void);
@@ -66,6 +78,9 @@ int audio_vad_get_noise_floor(void);
 // Tương thích ngược
 bool audio_vad_is_speech_adaptive(const int16_t *buffer, size_t num_samples, bool is_already_speaking);
 bool audio_vad_is_speech(const int16_t *buffer, size_t num_samples);
+
+// [DEBUG TEST] Phát lại âm thanh 16kHz ra loa 24kHz để người dùng kiểm tra chất lượng thu
+void audio_hal_debug_play_captured_audio(const int16_t *audio_16k, size_t num_samples);
 
 #ifdef __cplusplus
 }

@@ -14,6 +14,9 @@ void ai_cloud_init(void);
 // Đảm bảo kết nối WebSocket đã sẵn sàng ngầm (gọi khi phát hiện Wake Word hoặc khi có Wi-Fi)
 void ai_cloud_prewarm_session(void);
 
+// Đóng phiên WebSocket ngầm ngay lập tức (dùng khi nhận diện lệnh nội bộ thành công hoặc kết thúc lượt nói)
+void ai_cloud_stop_session(void);
+
 // Bắt đầu một phiên ghi âm người dùng (chuyển sang RECORDING, sẵn sàng stream âm thanh)
 bool ai_cloud_start_turn(void);
 
@@ -29,7 +32,7 @@ void ai_cloud_on_playback_idle(void);
 // Hủy phiên khẩn cấp khi có lỗi mạng (phát âm thanh lỗi và ngắt WebSocket)
 void ai_cloud_abort(void);
 
-// Hủy lượt êm ái khi người dùng không nói (không phát âm thanh lỗi, giữ nguyên WebSocket kết nối)
+// Hủy lượt khi không có lệnh hoặc đã khớp lệnh cục bộ (đóng WebSocket và trở về IDLE)
 void ai_cloud_cancel_turn(void);
 
 // Kiểm tra AI Cloud có đang bận xử lý lượt nói hoặc chờ phản hồi hay không

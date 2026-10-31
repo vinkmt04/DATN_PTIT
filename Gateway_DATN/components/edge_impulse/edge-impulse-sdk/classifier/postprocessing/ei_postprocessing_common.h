@@ -50,7 +50,7 @@
 #include <limits>
 #endif // EI_HAS_PADDLEOCR_DETECTOR
 
-int16_t get_block_number(ei_impulse_handle_t *handle, void *init_func)
+inline int16_t get_block_number(ei_impulse_handle_t *handle, void *init_func)
 {
     for (size_t i = 0; i < handle->impulse->postprocessing_blocks_size; i++) {
         if (handle->impulse->postprocessing_blocks[i].init_fn == init_func) {
@@ -190,7 +190,7 @@ __attribute__((unused)) static void process_cubes(ei_impulse_result_t *result, s
 /**
  * Fill the result structure from an unquantized output tensor
  */
-EI_IMPULSE_ERROR process_classification_f32(ei_impulse_handle_t *handle,
+inline EI_IMPULSE_ERROR process_classification_f32(ei_impulse_handle_t *handle,
                                             uint32_t block_index,
                                             uint32_t input_block_id,
                                             ei_impulse_result_t *result,

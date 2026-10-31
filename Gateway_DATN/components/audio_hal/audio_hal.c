@@ -34,6 +34,8 @@ extern void ai_cloud_on_playback_idle(void);
 
 static volatile bool s_speaker_active = false;
 static volatile bool s_is_wake_sound_playing = false;
+static TickType_t s_wake_sound_start_tick = 0;
+static bool s_idle_notified = false;
 
 static void audio_playback_task(void *arg) {
     size_t item_size;
@@ -73,6 +75,7 @@ static void audio_playback_task(void *arg) {
         uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(tx_ringbuf, &item_size, pdMS_TO_TICKS(20), 4096);
         if (item != NULL) {
             idle_time_ms = 0;
+            s_idle_notified = false;
             s_speaker_active = true;
             if (!is_i2s_enabled) {
                 esp_err_t err = i2s_channel_enable(tx_handle);
@@ -89,13 +92,8 @@ static void audio_playback_task(void *arg) {
             idle_time_ms += 20;
 
             if (is_turn_active) {
-                // ĐANG TRONG LƯỢT NÓI mà buffer tạm hết dữ liệu:
-                // Bơm Zero-Padding liên tục vào I2S DMA để giữ MAX98357A câm lặng tuyệt đối, triệt tiêu tiếng rè/dè!
-                if (is_i2s_enabled) {
-                    static const uint8_t s_silence_buf[512] = {0};
-                    size_t written = 0;
-                    i2s_channel_write(tx_handle, s_silence_buf, sizeof(s_silence_buf), &written, 0);
-                }
+                // ĐANG TRONG LƯỢT NÓI mà buffer tạm hết dữ liệu trong tích tắc:
+                // Để phần cứng DMA (200ms) tự điều tiết êm ái, TUYỆT ĐỐI KHÔNG chèn âm lặng làm rách sóng âm!
             } else {
                 // MODEL ĐÃ NÓI XONG HOẶC ÂM THANH CỤC BỘ (Chuông Ding, lỗi) ĐÃ PHÁT XONG:
                 // Bơm Zero-Padding liên tục vào I2S DMA để giữ MAX98357A câm lặng tuyệt đối (0V differential),
@@ -106,14 +104,15 @@ static void audio_playback_task(void *arg) {
                     i2s_channel_write(tx_handle, s_silence_buf, sizeof(s_silence_buf), &written, 0);
                 }
 
-                // Sau khi phát xong chuông Ding (~450ms): đệm 100ms âm lặng là xác nhận xong chuông Ding
-                if (s_is_wake_sound_playing && idle_time_ms >= 100) {
+                // Sau khi phát xong chuông Ding gọn (~240ms): đệm 30ms âm lặng là xác nhận xong chuông Ding
+                if (s_is_wake_sound_playing && idle_time_ms >= 30) {
                     s_is_wake_sound_playing = false; // Chuông Ding đã ngân xong hoàn toàn!
                 }
 
-                if (idle_time_ms >= 400) {
+                if (idle_time_ms >= 400 && !s_idle_notified) {
+                    s_idle_notified = true;
                     s_is_wake_sound_playing = false;
-                    ai_cloud_on_playback_idle(); // Báo cho ai_cloud biết âm thanh đã phát xong hoàn toàn
+                    ai_cloud_on_playback_idle(); // Báo cho ai_cloud biết âm thanh đã phát xong hoàn toàn (1 lần)
                 }
             }
         }
@@ -128,8 +127,8 @@ void audio_hal_init(void) {
 
     // --- FROM init_microphone() ---
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    rx_chan_cfg.dma_desc_num = 8;
-    rx_chan_cfg.dma_frame_num = 500; // 8 * 500 = 4000 samples = 250ms hardware DMA buffer chống tràn 100%!
+    rx_chan_cfg.dma_desc_num = 16;
+    rx_chan_cfg.dma_frame_num = 1000; // 16 * 1000 = 16000 samples = 1.0s hardware DMA buffer chống tràn khi chạy inference!
     ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_handle));
 
     i2s_std_config_t rx_std_cfg = {
@@ -155,6 +154,9 @@ void audio_hal_init(void) {
 
     // --- FROM init_speaker() ---
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    tx_chan_cfg.dma_desc_num = 10;
+    tx_chan_cfg.dma_frame_num = 480; // 10 * 480 = 4800 samples = 200ms hardware DMA buffer cushion
+    tx_chan_cfg.auto_clear = true;   // Tự động clear buffer xuất số 0 khi cạn dữ liệu, triệt tiêu 100% tiếng rè cơ học!
     esp_err_t err = i2s_new_channel(&tx_chan_cfg, &tx_handle, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create TX channel: %s", esp_err_to_name(err));
@@ -202,10 +204,11 @@ void audio_hal_init(void) {
     
     ESP_LOGI(TAG, "Speaker initialized with 1.5MB RingBuffer in PSRAM.");
 
-    // Khởi tạo Espressif WebRTC VAD (VAD_MODE_3: Very Aggressive - Chống ồn quạt & tạp âm tĩnh cực mạnh)
-    s_vad_inst = vad_create(VAD_MODE_3);
+    // Khởi tạo Espressif WebRTC VAD với Trigger tích hợp (Phương án A)
+    // Mode 3 (Very Aggressive), 16000Hz, frame 30ms, min_speech = 60ms (nhạy hơn, bắt âm sớm), min_noise = 600ms
+    s_vad_inst = vad_create_with_param(VAD_MODE_3, 16000, 30, 60, 600);
     if (s_vad_inst) {
-        ESP_LOGI(TAG, "Espressif Hardware VAD Engine initialized (Mode 3 - Very Aggressive Noise Suppression).");
+        ESP_LOGI(TAG, "Espressif Hardware VAD Engine initialized (Mode 3, Trigger: 60ms speech, 600ms noise).");
     } else {
         ESP_LOGE(TAG, "Failed to initialize Espressif VAD Engine!");
     }
@@ -342,7 +345,7 @@ int audio_vad_get_noise_floor(void) {
 bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms) {
     if (!buffer || num_samples == 0) return false;
 
-    // 1. Áp dụng bộ lọc Biquad High-Pass bậc 2 (~180Hz) để triệt tiêu DC bias và tiếng ù quạt/rung chấn
+    // 1. Áp dụng bộ lọc Biquad High-Pass bậc 2 (~90Hz) để triệt tiêu DC bias và tiếng ù quạt/rung chấn
     audio_hal_apply_dc_filter(buffer, num_samples);
 
     // 2. Tính RMS năng lượng âm thanh sạch sau lọc
@@ -355,13 +358,13 @@ bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms
         return (rms >= threshold);
     }
 
-    // 4. Phân tích qua Espressif WebRTC VAD Engine (Mode 3 - Very Aggressive Noise Suppression)
+    // 4. Phân tích qua Espressif WebRTC VAD Engine với Trigger tích hợp (Mode 3)
     // Chia chunk thành các khung 30ms (480 mẫu @ 16kHz)
     bool speech_detected = false;
     const size_t frame_len = 480; // 30ms
 
     for (size_t offset = 0; offset + frame_len <= num_samples; offset += frame_len) {
-        vad_state_t st = vad_process(s_vad_inst, buffer + offset, 16000, 30);
+        vad_state_t st = vad_process_with_trigger(s_vad_inst, buffer + offset);
         if (st == VAD_SPEECH) {
             speech_detected = true;
             break;
@@ -369,12 +372,18 @@ bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms
     }
 
     // 5. Điều kiện kết hợp:
-    // - WebRTC VAD Mode 3 xác nhận có phổ giọng nói người
+    // - VAD Trigger Mode 3 xác nhận có phổ giọng nói người liên tục >= 120ms
     // - Năng lượng RMS sạch vượt ngưỡng sàn ồn môi trường ít nhất +20 RMS (hoặc tối thiểu 45 RMS)
     int min_speech_rms = audio_dsp_get_ambient_noise() + 20;
     if (min_speech_rms < 45) min_speech_rms = 45;
 
     return (speech_detected && rms >= min_speech_rms);
+}
+
+void audio_vad_reset_trigger(void) {
+    if (s_vad_inst) {
+        vad_reset_trigger(s_vad_inst);
+    }
 }
 
 bool audio_vad_is_speech_adaptive(const int16_t *buffer, size_t num_samples, bool is_already_speaking) {
@@ -387,12 +396,32 @@ bool audio_vad_is_speech(const int16_t *buffer, size_t num_samples) {
 }
 
 void audio_hal_play_wake_sound(void) {
-    ESP_LOGI(TAG, "Playing wake sound (Non-blocking)...");
+    uint32_t total_ding_ms = (wake_sound_len * 1000) / (24000 * 2);
+    ESP_LOGI(TAG, "Playing wake sound (Full Ding-ding %lu ms)...", (unsigned long)total_ding_ms);
     is_turn_active = false;
     s_is_wake_sound_playing = true;
+    s_wake_sound_start_tick = xTaskGetTickCount();
     
-    // Đẩy âm thanh Ding vào RingBuffer để audio_playback_task phát ngầm ra I2S.
+    // Phát trọn vẹn toàn bộ chuông Ding-ding gốc (21.600 bytes ~ 450ms ở 24kHz)
     audio_hal_play_chunk(wake_sound_pcm, wake_sound_len);
+}
+
+bool audio_hal_is_wake_recording_ready(void) {
+    if (!s_is_wake_sound_playing) return true;
+    TickType_t elapsed_ticks = xTaskGetTickCount() - s_wake_sound_start_tick;
+    uint32_t elapsed_ms = (uint32_t)(elapsed_ticks * portTICK_PERIOD_MS);
+    uint32_t total_ding_ms = (wake_sound_len * 1000) / (24000 * sizeof(int16_t));
+    return (elapsed_ms >= total_ding_ms + 50); // Đợi dứt chuông 100% + 50ms tiêu âm phòng
+}
+
+void audio_hal_flush_rx(void) {
+    if (!rx_handle) return;
+    int16_t dummy[256];
+    size_t bytes_read = 0;
+    // Đọc xả sạch bộ đệm DMA RX cho đến khi rỗng hoàn toàn (timeout 0)
+    while (i2s_channel_read(rx_handle, dummy, sizeof(dummy), &bytes_read, 0) == ESP_OK && bytes_read > 0) {
+        // Xả sạch dữ liệu cũ
+    }
 }
 
 void audio_hal_start_buffering(void) {
@@ -411,11 +440,19 @@ void audio_hal_force_start_playing(void) {
     }
 }
 
+void audio_hal_flush_tx(void) {
+    s_flush_requested = true;
+    int timeout = 6; // Đợi tối đa 60ms để luồng audio_playback_task xả sạch đệm
+    while (s_flush_requested && timeout-- > 0) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void audio_hal_play_error_sound(void) {
     ESP_LOGI(TAG, "Playing error sound...");
     is_turn_active = false;
     is_buffering = false;
-    s_flush_requested = true;
+    audio_hal_flush_tx(); // Xả sạch âm thanh cũ đồng bộ trước khi phát tiếng báo lỗi
     
     audio_hal_play_chunk(error_sound_pcm, error_sound_len);
     vTaskDelay(pdMS_TO_TICKS(error_sound_len / 48 + 50));
@@ -423,7 +460,7 @@ void audio_hal_play_error_sound(void) {
 
 void audio_hal_stop_playback(void) {
     if (s_is_wake_sound_playing) {
-        // Bảo vệ tiếng chuông Ding-Ding không bị Barge-In ngắt sớm
+        // Bảo vệ tiếng chuông Ding-ding luôn được phát trọn vẹn, không bị ngắt giữa chừng
         return;
     }
     ESP_LOGI(TAG, "Stopping playback immediately & flushing ringbuffer (Barge-In).");
@@ -440,4 +477,60 @@ bool audio_hal_is_wake_sound_playing(void) {
 bool audio_hal_is_playing(void) {
     return is_turn_active || s_speaker_active || s_is_wake_sound_playing;
 }
+
+// [DEBUG TEST] Phát lại âm thanh Model 2 vừa thu ra loa (resample 16kHz -> 24kHz + Auto Boost Target ~26.000)
+void audio_hal_debug_play_captured_audio(const int16_t *audio_16k, size_t num_samples) {
+    if (!audio_16k || num_samples == 0 || tx_ringbuf == NULL) return;
+
+    // 1. Quét tìm đỉnh biên độ âm thanh thực tế
+    int16_t raw_peak = 0;
+    for (size_t i = 0; i < num_samples; i++) {
+        int16_t v = abs(audio_16k[i]);
+        if (v > raw_peak) raw_peak = v;
+    }
+
+    // 2. Tính hệ số khuếch đại (Target Peak ~26.000) để phát ra loa to rõ ràng ngang mức chuông Ding
+    float gain = 1.0f;
+    if (raw_peak > 50) {
+        gain = 26000.0f / (float)raw_peak;
+        if (gain > 15.0f) gain = 15.0f; // Max boost 15x (+23.5 dB)
+    }
+
+    ESP_LOGW(TAG, ">>> [DEBUG TEST] Phát lại %d mẫu (%.1fs @ 16kHz) -> Loa 24kHz | Peak: %d, Boost: %.2fx (Target ~26000) <<<",
+             (int)num_samples, (float)num_samples / 16000.0f, raw_peak, gain);
+
+    // 3. Resample 16kHz mono -> 24kHz mono (tỉ lệ 2:3) để khớp xung nhịp loa MAX98357A (24000Hz)
+    size_t out_samples = (num_samples * 3) / 2;
+    int16_t *resampled = (int16_t *)heap_caps_malloc(out_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!resampled) return;
+
+    for (size_t k = 0; k < out_samples; k++) {
+        size_t src_idx = (k * 2) / 3;
+        int frac = (k * 2) % 3;
+        int16_t s0 = audio_16k[src_idx];
+        int16_t s1 = (src_idx + 1 < num_samples) ? audio_16k[src_idx + 1] : s0;
+        int32_t val = s0 + ((int32_t)(s1 - s0) * frac) / 3;
+        val = (int32_t)(val * gain);
+        if (val > 30000) val = 30000;
+        else if (val < -30000) val = -30000;
+        resampled[k] = (int16_t)val;
+    }
+
+    // 4. Phát ra loa: Đánh dấu không phải cloud turn để luồng playback phát ngay lập tức
+    is_turn_active = false;
+    is_buffering = false;
+
+    // Đẩy từng khối nhỏ 4096 bytes vào RingBuffer để phát trơn tru
+    size_t bytes_to_send = out_samples * sizeof(int16_t);
+    const uint8_t *p = (const uint8_t *)resampled;
+    while (bytes_to_send > 0) {
+        size_t chunk = (bytes_to_send > 4096) ? 4096 : bytes_to_send;
+        audio_hal_play_chunk(p, chunk);
+        p += chunk;
+        bytes_to_send -= chunk;
+    }
+
+    free(resampled);
+}
+
 
