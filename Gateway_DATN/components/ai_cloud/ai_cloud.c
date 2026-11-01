@@ -19,18 +19,23 @@ extern void ai_edge_stop_recording(void);
 static const char *TAG = "ai_cloud";
 
 // Live API (WebSockets) Configuration
-#define GEMINI_API_KEY "AQ.Ab8RN6KNQ1b843NFqyLk4Vld15qwofwZ7LOFN5wEohnIMm7Wfw"
+#define GEMINI_API_KEY "...."
 #define GEMINI_WS_URL "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=" GEMINI_API_KEY
 
 // Kích thước tĩnh cho bộ đệm Base64 và JSON (cấp phát 1 lần trong PSRAM)
 #define TX_BASE64_BUF_SIZE 8192
 #define TX_JSON_BUF_SIZE   10240
+#define WS_RX_BUF_SIZE     262144  // 256KB: Nuốt trọn mọi frame từ Google (40KB - 80KB) không bao giờ tràn
+#define RX_PCM_BUF_SIZE    196608  // 192KB: Chứa tối đa ~4 giây âm thanh PCM 24kHz 16-bit giải mã từ Base64
 static unsigned char *s_tx_base64_buf = NULL;
 static char *s_tx_json_buf = NULL;
+static char *s_ws_rx_buf = NULL;
+static size_t s_ws_rx_len = 0;
+static unsigned char *s_rx_pcm_buf = NULL;
 
 // Timeouts
 #define RESPONSE_TIMEOUT_MS  8000   // Chờ phản hồi đầu tiên từ Gemini: 8s
-#define CHUNK_TIMEOUT_MS     4000   // Chờ chunk tiếp theo giữa chừng: 4s
+#define CHUNK_TIMEOUT_MS     5000   // Chờ chunk tiếp theo giữa chừng: 5s (phản ứng nhanh khi cloud ngừng cấp audio)
 #define WS_KEEP_ALIVE_TIMEOUT_MS 15000 // Giữ kết nối ngầm 15 giây (Keep-Alive Idle Pool)
 
 typedef enum {
@@ -55,6 +60,7 @@ static volatile bool s_setup_complete = false;
 static volatile bool s_need_send_activity_start = false;
 static volatile bool s_turn_ending = false;
 static volatile bool s_is_aborting = false;
+static volatile bool s_expect_follow_up = false;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (64KB trong PSRAM ~ 2 giây âm thanh)
 // Giúp luồng thu âm mic KHÔNG BAO GIỜ BỊ BLOCK bởi mạng!
@@ -62,28 +68,18 @@ static RingbufHandle_t s_tx_audio_ringbuf = NULL;
 static TaskHandle_t s_tx_task_handle = NULL;
 
 // Buffer gom các frame websocket bị phân mảnh
-static char *ws_rx_buffer = NULL;
-static size_t ws_rx_len = 0;
+
+
 
 static bool expecting_first_chunk = false;
 
-static void* cjson_spiram_malloc(size_t size) {
-    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-    if (!p) {
-        p = malloc(size);
-    }
-    return p;
-}
-static void cjson_spiram_free(void* ptr) {
-    if (ptr) {
-        heap_caps_free(ptr);
-    }
-}
+
 
 static void abort_task(void *arg) {
     ESP_LOGE(TAG, "Network Drop/Timeout Detected! Aborting turn immediately.");
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
+    s_expect_follow_up = false;
     s_need_send_activity_start = false;
     
     // 1. Dừng ngay tác vụ ghi âm ở tầng Edge
@@ -140,8 +136,10 @@ static void session_timer_cb(TimerHandle_t xTimer) {
         ai_cloud_abort();
         break;
     case AI_STATE_SPEAKING:
-        ESP_LOGE(TAG, "Chunk Timeout (%ds). Network dropped mid-sentence!", CHUNK_TIMEOUT_MS / 1000);
-        ai_cloud_abort();
+        ESP_LOGW(TAG, "Server stream idle (%ds) without turnComplete. Ending turn gracefully...", CHUNK_TIMEOUT_MS / 1000);
+        s_current_state = AI_STATE_IDLE;
+        audio_hal_force_start_playing();
+        audio_hal_set_turn_active(false);
         break;
     default:
         break;
@@ -149,135 +147,232 @@ static void session_timer_cb(TimerHandle_t xTimer) {
 }
 
 static void parse_server_message(const char *json_string) {
-    cJSON *root = cJSON_Parse(json_string);
-    if (!root) {
-        ESP_LOGE(TAG, "Failed to parse JSON: %s", json_string);
+    if (!json_string || json_string[0] == '\0') {
         return;
     }
 
     // 1. Kiểm tra xác nhận hoàn tất thiết lập từ Gemini Live API
-    cJSON *setupComplete = cJSON_GetObjectItem(root, "setupComplete");
-    if (setupComplete) {
+    if (strstr(json_string, "\"setupComplete\"")) {
         ESP_LOGI(TAG, ">>> [GEMINI LIVE] Setup Complete! Connection Ready for Realtime Audio. <<<");
         s_setup_complete = true;
-        cJSON_Delete(root);
         return;
     }
 
     // 2. Bắt lỗi từ máy chủ Google API
-    cJSON *error = cJSON_GetObjectItem(root, "error");
-    if (error) {
-        cJSON *msg = cJSON_GetObjectItem(error, "message");
-        ESP_LOGE(TAG, "Gemini API Server Error: %s", (msg && cJSON_IsString(msg)) ? msg->valuestring : "Unknown error");
+    if (strstr(json_string, "\"error\"")) {
+        ESP_LOGE(TAG, "Gemini API Server Error: %s", json_string);
         ai_cloud_abort();
-        cJSON_Delete(root);
         return;
     }
 
-    // 3. Xử lý nội dung máy chủ trả về
-    cJSON *serverContent = cJSON_GetObjectItem(root, "serverContent");
-    if (serverContent) {
-        // Nhận diện giọng nói của Người Dùng (STT)
-        cJSON *inputTranscription = cJSON_GetObjectItem(serverContent, "inputTranscription");
-        if (inputTranscription) {
-            cJSON *user_text = cJSON_GetObjectItem(inputTranscription, "text");
-            if (user_text && cJSON_IsString(user_text) && strlen(user_text->valuestring) > 0) {
-                ESP_LOGW(TAG, "User Said (STT): \"%s\"", user_text->valuestring);
+    // 3. Xử lý nhận diện giọng nói Người Dùng (STT) nếu có
+    const char *stt_tag = strstr(json_string, "\"inputTranscription\"");
+    if (stt_tag) {
+        const char *text_key = strstr(stt_tag, "\"text\"");
+        if (text_key) {
+            const char *val_start = strchr(text_key + 6, '\"');
+            if (val_start) {
+                val_start++;
+                const char *val_end = strchr(val_start, '\"');
+                while (val_end && *(val_end - 1) == '\\') {
+                    val_end = strchr(val_end + 1, '\"');
+                }
+                if (val_end && val_end > val_start) {
+                    char stt_buf[256];
+                    size_t len = val_end - val_start;
+                    if (len >= sizeof(stt_buf)) len = sizeof(stt_buf) - 1;
+                    memcpy(stt_buf, val_start, len);
+                    stt_buf[len] = '\0';
+                    ESP_LOGW(TAG, "User Said (STT): \"%s\"", stt_buf);
+                }
             }
         }
+    }
 
-        // Nội dung trả lời của Gemini (Model Turn)
-        cJSON *modelTurn = cJSON_GetObjectItem(serverContent, "modelTurn");
-        if (modelTurn) {
-            cJSON *parts = cJSON_GetObjectItem(modelTurn, "parts");
-            if (cJSON_IsArray(parts)) {
-                cJSON *part;
-                cJSON_ArrayForEach(part, parts) {
-                    cJSON *text = cJSON_GetObjectItem(part, "text");
-                    if (text && cJSON_IsString(text)) {
-                        ESP_LOGI(TAG, "Gemini Reply: %s", text->valuestring);
-                        if (strncmp(text->valuestring, "<CMD:", 5) == 0) {
-                            mesh_controller_send_command(text->valuestring);
-                        }
+    // 4. Trích xuất nội dung văn bản trả lời của Gemini (text) và lệnh Mesh
+    const char *model_turn = strstr(json_string, "\"modelTurn\"");
+    if (model_turn) {
+        const char *text_key = strstr(model_turn, "\"text\":");
+        if (text_key) {
+            const char *val_start = strchr(text_key + 7, '\"');
+            if (val_start) {
+                val_start++;
+                const char *val_end = strchr(val_start, '\"');
+                while (val_end && *(val_end - 1) == '\\') {
+                    val_end = strchr(val_end + 1, '\"');
+                }
+                if (val_end && val_end > val_start) {
+                    char reply_buf[256];
+                    size_t len = val_end - val_start;
+                    if (len >= sizeof(reply_buf)) len = sizeof(reply_buf) - 1;
+                    memcpy(reply_buf, val_start, len);
+                    reply_buf[len] = '\0';
+                    ESP_LOGI(TAG, "Gemini Reply: %s", reply_buf);
+                    if (strncmp(reply_buf, "<CMD:", 5) == 0) {
+                        mesh_controller_send_command(reply_buf);
                     }
-                    cJSON *inlineData = cJSON_GetObjectItem(part, "inlineData");
-                    if (inlineData) {
-                        cJSON *data = cJSON_GetObjectItem(inlineData, "data");
-                        if (data && cJSON_IsString(data)) {
-                            // Đây là audio PCM
-                            if (s_current_state == AI_STATE_WAITING_AI) {
-                                s_current_state = AI_STATE_SPEAKING;
-                                if (s_session_timer) {
-                                    xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
-                                    xTimerStart(s_session_timer, 0);
-                                }
-                            } else if (s_current_state == AI_STATE_SPEAKING) {
-                                if (s_session_timer) {
-                                    xTimerReset(s_session_timer, 0);
-                                }
-                            } else if (s_current_state == AI_STATE_RECORDING) {
-                                // SERVER VAD KÍCH HOẠT: Gemini đã nhận đủ ý & bắt đầu trả lời
-                                ESP_LOGI(TAG, ">>> [SERVER VAD] Gemini phát hiện dứt câu sớm & bắt đầu trả lời! Dừng thu âm.");
-                                s_current_state = AI_STATE_SPEAKING;
-                                ai_edge_stop_recording();
-                                if (s_session_timer) {
-                                    xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
-                                    xTimerStart(s_session_timer, 0);
-                                }
-                            } else {
-                                ESP_LOGD(TAG, "Dropping lingering audio chunk in state %d", s_current_state);
-                                continue;
-                            }
-
-                            if (expecting_first_chunk) {
-                                expecting_first_chunk = false;
-                                audio_hal_start_buffering(); // Kích hoạt đệm Jitter chống giật
-                                audio_hal_set_turn_active(true);
-                            }
-                            
-                            size_t pcm_len = 0;
-                            size_t b64_len = strlen(data->valuestring);
-                            unsigned char *pcm_data = (unsigned char *)heap_caps_malloc(b64_len, MALLOC_CAP_SPIRAM);
-                            if (!pcm_data) {
-                                pcm_data = (unsigned char *)malloc(b64_len);
-                            }
-                            if (pcm_data) {
-                                mbedtls_base64_decode(pcm_data, b64_len, &pcm_len, (const unsigned char*)data->valuestring, b64_len);
-                                ESP_LOGD(TAG, "Received Audio PCM: %d bytes", pcm_len);
-                                audio_hal_play_chunk(pcm_data, pcm_len);
-                                heap_caps_free(pcm_data);
-                            }
-                        }
+                    // Nhận diện câu hỏi tự nhiên qua dấu '?'
+                    if (strchr(reply_buf, '?')) {
+                        s_expect_follow_up = true;
+                        ESP_LOGW(TAG, ">>> [FOLLOW-UP DETECTED] Gemini đặt câu hỏi ('?')! Sẽ mở Mic sau khi phát xong câu hỏi. <<<");
+                    } else if (strchr(reply_buf, '.') || strchr(reply_buf, '!')) {
+                        // Nếu sau câu hỏi là câu trần thuật tiếp diễn (kể chuyện) thì hủy cờ follow-up
+                        s_expect_follow_up = false;
                     }
                 }
             }
         }
+    }
 
-        cJSON *turnComplete = cJSON_GetObjectItem(serverContent, "turnComplete");
-        cJSON *interrupted = cJSON_GetObjectItem(serverContent, "interrupted");
-        cJSON *generationComplete = cJSON_GetObjectItem(serverContent, "generationComplete");
-        bool is_turn_finished = (turnComplete && cJSON_IsTrue(turnComplete)) ||
-                                (interrupted && cJSON_IsTrue(interrupted)) ||
-                                (generationComplete && cJSON_IsTrue(generationComplete));
-        if (is_turn_finished && s_current_state != AI_STATE_IDLE) {
-            ESP_LOGI(TAG, "Model turn complete. Waiting for next user input...");
-            s_current_state = AI_STATE_IDLE;
+    // 5. Fast-Path: Trích xuất Audio PCM (Base64) từ inlineData - ZERO MALLOC & ZERO HEAP CONTENTION
+    const char *search_ptr = json_string;
+    const char *inline_tag = NULL;
+    while ((inline_tag = strstr(search_ptr, "\"inlineData\"")) != NULL) {
+        const char *data_key = strstr(inline_tag, "\"data\":");
+        if (!data_key) break;
+        const char *val_start = strchr(data_key + 7, '\"');
+        if (!val_start) break;
+        val_start++;
+        const char *val_end = strchr(val_start, '\"');
+        if (!val_end || val_end <= val_start) break;
+        size_t b64_len = val_end - val_start;
+        search_ptr = val_end + 1;
+
+        // Cập nhật trạng thái Gateway
+        if (s_current_state == AI_STATE_WAITING_AI) {
+            s_current_state = AI_STATE_SPEAKING;
             if (s_session_timer) {
-                xTimerStop(s_session_timer, 0);
+                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
+                xTimerStart(s_session_timer, 0);
             }
-            audio_hal_force_start_playing();
-            audio_hal_set_turn_active(false);
+        } else if (s_current_state == AI_STATE_SPEAKING) {
+            if (s_session_timer) {
+                xTimerReset(s_session_timer, 0);
+            }
+        } else if (s_current_state == AI_STATE_RECORDING) {
+            ESP_LOGI(TAG, ">>> [SERVER VAD] Gemini phát hiện dứt câu sớm & bắt đầu trả lời! Dừng thu âm.");
+            s_current_state = AI_STATE_SPEAKING;
+            ai_edge_stop_recording();
+            expecting_first_chunk = true;
+            if (s_session_timer) {
+                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
+                xTimerStart(s_session_timer, 0);
+            }
+        } else {
+            ESP_LOGD(TAG, "Dropping lingering audio chunk in state %d", s_current_state);
+            continue;
+        }
+
+        if (s_current_state == AI_STATE_SPEAKING) {
+            if (expecting_first_chunk) {
+                expecting_first_chunk = false;
+                audio_hal_start_buffering(); // Kích hoạt đệm trước 700ms (~33KB) chống giật
+                audio_hal_set_turn_active(true);
+            }
+
+            size_t req_pcm_size = (b64_len / 4) * 3 + 4;
+            if (s_rx_pcm_buf && req_pcm_size <= RX_PCM_BUF_SIZE) {
+                size_t pcm_len = 0;
+                int ret = mbedtls_base64_decode(s_rx_pcm_buf, RX_PCM_BUF_SIZE, &pcm_len,
+                                                (const unsigned char *)val_start, b64_len);
+                if (ret == 0 && pcm_len > 0) {
+                    pcm_len &= ~1;
+
+                    // Áp dụng Headroom 80% (-2 dBFS) chống méo tiếng / rè loa MAX98357A
+                    int16_t *samples = (int16_t *)s_rx_pcm_buf;
+                    size_t num_samples = pcm_len / 2;
+                    for (size_t i = 0; i < num_samples; i++) {
+                        samples[i] = (int16_t)(((int32_t)samples[i] * 80) / 100);
+                    }
+
+                    audio_hal_play_chunk(s_rx_pcm_buf, pcm_len);
+                }
+            } else {
+                ESP_LOGE(TAG, "Audio chunk too large for PCM buffer! req=%u, max=%u", (unsigned int)req_pcm_size, (unsigned int)RX_PCM_BUF_SIZE);
+            }
         }
     }
-    cJSON_Delete(root);
-}
 
+    // 6. Xử lý kết thúc lượt nói từ Model
+    bool is_turn_finished = false;
+
+    // 6.1 Kiểm tra finishReason (STOP, SAFETY, MAX_TOKENS, RECITATION, v.v.)
+    const char *finish_tag = strstr(json_string, "\"finishReason\"");
+    if (finish_tag) {
+        char reason_str[32] = {0};
+        const char *val_start = strchr(finish_tag + 14, '\"');
+        if (val_start) {
+            val_start++;
+            const char *val_end = strchr(val_start, '\"');
+            if (val_end && val_end > val_start) {
+                size_t rlen = val_end - val_start;
+                if (rlen >= sizeof(reason_str)) rlen = sizeof(reason_str) - 1;
+                memcpy(reason_str, val_start, rlen);
+                reason_str[rlen] = '\0';
+            }
+        }
+        ESP_LOGW(TAG, ">>> [FINISH REASON] Gemini ket thuc phan hoi do: %s <<<", reason_str[0] ? reason_str : "UNKNOWN");
+        is_turn_finished = true;
+    }
+
+    // 6.2 Kiểm tra turnComplete linh hoạt (miễn nhiễm mọi khoảng trắng / xuống dòng)
+    const char *tc_tag = strstr(json_string, "\"turnComplete\"");
+    if (tc_tag) {
+        const char *p = tc_tag + 14;
+        while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (strncmp(p, "true", 4) == 0) {
+            is_turn_finished = true;
+        }
+    }
+
+    // 6.3 Kiểm tra interrupted / generationComplete
+    const char *intr_tag = strstr(json_string, "\"interrupted\"");
+    if (intr_tag) {
+        const char *p = intr_tag + 13;
+        while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (strncmp(p, "true", 4) == 0) {
+            is_turn_finished = true;
+        }
+    }
+    const char *gc_tag = strstr(json_string, "\"generationComplete\"");
+    if (gc_tag) {
+        const char *p = gc_tag + 20;
+        while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (strncmp(p, "true", 4) == 0) {
+            is_turn_finished = true;
+        }
+    }
+
+    if (is_turn_finished && s_current_state != AI_STATE_IDLE) {
+        ESP_LOGI(TAG, "Model turn complete. Waiting for next user input...");
+        s_current_state = AI_STATE_IDLE;
+        if (s_session_timer) {
+            xTimerStop(s_session_timer, 0);
+        }
+        audio_hal_force_start_playing();
+        audio_hal_set_turn_active(false);
+    }
+
+    // 7. Log toan bo sieu du lieu (Metadata / Event) co y nghia tu Google (bo qua heartbeat rong {})
+    if (!inline_tag && !model_turn && !stt_tag && !strstr(json_string, "\"setupComplete\"")) {
+        if (strcmp(json_string, "{}") != 0 &&
+            !strstr(json_string, "\"serverContent\":{}") &&
+            !strstr(json_string, "\"serverContent\": {}")) {
+            char preview_buf[256];
+            size_t slen = strlen(json_string);
+            if (slen >= sizeof(preview_buf)) slen = sizeof(preview_buf) - 1;
+            memcpy(preview_buf, json_string, slen);
+            preview_buf[slen] = '\0';
+            ESP_LOGI(TAG, "Gemini Server Event: %s", preview_buf);
+        }
+    }
+}
 static void send_setup_frame(void) {
     if (ws_client && s_is_ws_connected) {
         s_setup_complete = false;
         // Bật disabled: true để Gemini Live trao quyền VAD hoàn toàn cho client (Espressif WebRTC Hardware VAD).
         // Khi đó, client quyết định chính xác thời điểm gửi activityStart và activityEnd!
-        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI assistant. Always respond in the same language that the user speaks. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, vui lòng thử lại' in Vietnamese and nothing else. Default language is Vietnamese.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
+        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. QUESTION & PUNCTUATION RULE: Whenever you ask the user a question or invite them to speak (such as asking if they want to listen further, or making a choice), end your response naturally with a question mark '?'. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
         esp_websocket_client_send_text(ws_client, setup_msg, strlen(setup_msg), pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "Sent Setup message (Client WebRTC VAD + Multi-language + STT). Waiting for setupComplete...");
     }
@@ -298,12 +393,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         s_is_ws_connected = false;
         s_is_ws_connecting = false;
         s_setup_complete = false;
-        if (ws_rx_buffer) {
-            heap_caps_free(ws_rx_buffer);
-            ws_rx_buffer = NULL;
-            ws_rx_len = 0;
-        }
-        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI) {
+        s_ws_rx_len = 0;
+        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
             ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
             ai_cloud_abort();
         }
@@ -314,8 +405,8 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         s_is_ws_connected = false;
         s_is_ws_connecting = false;
         s_setup_complete = false;
-        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI) {
-            ESP_LOGE(TAG, "WebSocket error mid-session! Aborting turn...");
+        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
+            ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
             ai_cloud_abort();
         }
         break;
@@ -337,6 +428,9 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             s_is_ws_connected = false;
             s_is_ws_connecting = false;
             s_setup_complete = false;
+            if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
+                ai_cloud_abort();
+            }
             break;
         }
 
@@ -346,31 +440,43 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         }
 
         if (data->data_ptr && data->data_len > 0) {
+            // Reset timer ngay khi nhan bat ky manh du lieu Wi-Fi nao tu Google (xac nhan mang dang truyen tai)
+            if (s_current_state == AI_STATE_SPEAKING && s_session_timer) {
+                xTimerReset(s_session_timer, 0);
+            }
             if (data->payload_offset == 0) {
-                if (ws_rx_buffer) heap_caps_free(ws_rx_buffer);
-                ws_rx_buffer = heap_caps_malloc(data->payload_len + 1, MALLOC_CAP_SPIRAM);
-                if (!ws_rx_buffer) {
-                    ws_rx_buffer = malloc(data->payload_len + 1);
+                s_ws_rx_len = 0;
+            } else if (data->payload_offset != s_ws_rx_len) {
+                static uint32_t s_last_offset_err_ms = 0;
+                uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                if (now_ms - s_last_offset_err_ms > 2000) {
+                    s_last_offset_err_ms = now_ms;
+                    ESP_LOGW(TAG, "WS payload offset mismatch! (Exp: %u, Got: %u) - Dropping frame",
+                             (unsigned int)s_ws_rx_len, (unsigned int)data->payload_offset);
                 }
-                ws_rx_len = 0;
-            } else if (ws_rx_buffer && data->payload_offset != ws_rx_len) {
-                ESP_LOGE(TAG, "WebSocket payload offset mismatch! Dropping broken packet.");
-                heap_caps_free(ws_rx_buffer);
-                ws_rx_buffer = NULL;
-                ws_rx_len = 0;
+                s_ws_rx_len = 0;
+                break;
             }
             
-            if (ws_rx_buffer && ws_rx_len + data->data_len <= data->payload_len) {
-                memcpy(ws_rx_buffer + ws_rx_len, data->data_ptr, data->data_len);
-                ws_rx_len += data->data_len;
+            if (s_ws_rx_buf && (s_ws_rx_len + data->data_len < WS_RX_BUF_SIZE)) {
+                memcpy(s_ws_rx_buf + s_ws_rx_len, data->data_ptr, data->data_len);
+                s_ws_rx_len += data->data_len;
+            } else {
+                static uint32_t s_last_overflow_err_ms = 0;
+                uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                if (now_ms - s_last_overflow_err_ms > 2000) {
+                    s_last_overflow_err_ms = now_ms;
+                    ESP_LOGE(TAG, "s_ws_rx_buf overflow! (len: %u + inc: %u > max: %u)",
+                             (unsigned int)s_ws_rx_len, (unsigned int)data->data_len, (unsigned int)WS_RX_BUF_SIZE);
+                }
+                s_ws_rx_len = 0;
+                break;
             }
             
-            if (ws_rx_len == data->payload_len && ws_rx_buffer) {
-                ws_rx_buffer[ws_rx_len] = '\0';
-                parse_server_message(ws_rx_buffer);
-                heap_caps_free(ws_rx_buffer);
-                ws_rx_buffer = NULL;
-                ws_rx_len = 0;
+            if (s_ws_rx_len == data->payload_len) {
+                s_ws_rx_buf[s_ws_rx_len] = '\0';
+                parse_server_message(s_ws_rx_buf);
+                s_ws_rx_len = 0;
             }
         }
         break;
@@ -494,6 +600,7 @@ static void cloud_tx_task(void *arg) {
             // RingBuffer đã rỗng hoàn toàn (toàn bộ âm thanh câu nói đã được gửi lên Google)
             if (s_turn_ending && s_current_state == AI_STATE_RECORDING) {
                 s_turn_ending = false;
+    s_expect_follow_up = false;
                 s_current_state = AI_STATE_WAITING_AI;
                 expecting_first_chunk = true;
 
@@ -538,8 +645,11 @@ void ai_cloud_prewarm_session(void) {
             esp_websocket_client_config_t websocket_cfg = {
                 .uri = GEMINI_WS_URL,
                 .crt_bundle_attach = esp_crt_bundle_attach,
-                .buffer_size = 8192,
+                .buffer_size = 32768, // 32KB: Nhận trọn vẹn frame lớn, giảm 75% số lần ngắt mạng
                 .task_stack = 8192,
+                .task_core_id_set = true,
+                .task_core_id = 0,    // Ghim luồng WebSocket cố định vào Core 0 (Nhân Mạng)
+                .task_prio = 5,
                 .network_timeout_ms = 10000,
                 .reconnect_timeout_ms = 0,
                 .disable_auto_reconnect = true,
@@ -560,17 +670,16 @@ void ai_cloud_prewarm_session(void) {
 }
 
 void ai_cloud_init(void) {
-    cJSON_Hooks hooks;
-    hooks.malloc_fn = cjson_spiram_malloc;
-    hooks.free_fn = cjson_spiram_free;
-    cJSON_InitHooks(&hooks);
+
 
     ws_mutex = xSemaphoreCreateMutex();
 
     s_tx_base64_buf = (unsigned char *)heap_caps_malloc(TX_BASE64_BUF_SIZE, MALLOC_CAP_SPIRAM);
     s_tx_json_buf = (char *)heap_caps_malloc(TX_JSON_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!s_tx_base64_buf || !s_tx_json_buf) {
-        ESP_LOGE(TAG, "Failed to allocate static PSRAM buffers for TX!");
+    s_ws_rx_buf = (char *)heap_caps_malloc(WS_RX_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    s_rx_pcm_buf = (unsigned char *)heap_caps_malloc(RX_PCM_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_tx_base64_buf || !s_tx_json_buf || !s_ws_rx_buf || !s_rx_pcm_buf) {
+        ESP_LOGE(TAG, "Failed to allocate static PSRAM buffers for TX/RX!");
     }
 
     // Khởi tạo TX Audio RingBuffer 256KB trong PSRAM (chứa được ~8 giây âm thanh PCM 16kHz không bao giờ tràn)
@@ -597,6 +706,7 @@ bool ai_cloud_start_turn(void) {
     }
 
     s_turn_ending = false;
+    s_expect_follow_up = false;
 
     // 2. Xóa sạch mọi dữ liệu ghi âm tồn đọng từ lượt trước trong RingBuffer TX
     if (s_tx_audio_ringbuf) {
@@ -649,6 +759,7 @@ void ai_cloud_end_turn(void) {
 void ai_cloud_stop_session(void) {
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
+    s_expect_follow_up = false;
     s_need_send_activity_start = false;
 
     if (s_session_timer) {
@@ -705,4 +816,12 @@ bool ai_cloud_is_busy(void) {
 
 bool ai_cloud_is_ready(void) {
     return (s_is_ws_connected && s_setup_complete);
+}
+
+bool ai_cloud_is_follow_up_expected(void) {
+    return s_expect_follow_up;
+}
+
+void ai_cloud_clear_follow_up(void) {
+    s_expect_follow_up = false;
 }

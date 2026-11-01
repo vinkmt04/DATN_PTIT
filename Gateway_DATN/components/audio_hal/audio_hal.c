@@ -19,7 +19,9 @@ static vad_handle_t s_vad_inst = NULL;
 static volatile bool s_flush_requested = false;
 volatile bool is_buffering = false;
 volatile uint32_t buffered_bytes = 0;
-static volatile uint32_t buffer_target_bytes = 28800; // 600ms mặc định lúc đầu
+#define JITTER_BUFFER_TARGET_BYTES 48000 // 1.0s Pre-buffer (24000Hz * 2 bytes * 1.0s = 48KB)
+
+static volatile uint32_t buffer_target_bytes = JITTER_BUFFER_TARGET_BYTES;
 static volatile bool is_turn_active = false;
 
 void audio_hal_set_turn_active(bool active) {
@@ -62,7 +64,7 @@ static void audio_playback_task(void *arg) {
                 size_t written = 0;
                 i2s_channel_write(tx_handle, s_silence_buf, sizeof(s_silence_buf), &written, 0);
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(10));
             // Thoát buffering nếu đủ target bytes HOẶC nếu câu trả lời ngắn đã kết thúc (!is_turn_active)
             if (buffered_bytes >= buffer_target_bytes || !is_turn_active) {
                 is_buffering = false;
@@ -154,8 +156,8 @@ void audio_hal_init(void) {
 
     // --- FROM init_speaker() ---
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    tx_chan_cfg.dma_desc_num = 10;
-    tx_chan_cfg.dma_frame_num = 480; // 10 * 480 = 4800 samples = 200ms hardware DMA buffer cushion
+    tx_chan_cfg.dma_desc_num = 16;
+    tx_chan_cfg.dma_frame_num = 480; // 16 * 480 = 7680 samples = 320ms hardware DMA buffer cushion
     tx_chan_cfg.auto_clear = true;   // Tự động clear buffer xuất số 0 khi cạn dữ liệu, triệt tiêu 100% tiếng rè cơ học!
     esp_err_t err = i2s_new_channel(&tx_chan_cfg, &tx_handle, NULL);
     if (err != ESP_OK) {
@@ -200,7 +202,7 @@ void audio_hal_init(void) {
         tx_ringbuf = xRingbufferCreateWithCaps(1024 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
         if (tx_ringbuf == NULL) return;
     }
-    xTaskCreate(audio_playback_task, "audio_play_task", 4096, NULL, 5, NULL);
+    xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 4096, NULL, 6, NULL, 1);
     
     ESP_LOGI(TAG, "Speaker initialized with 1.5MB RingBuffer in PSRAM.");
 
@@ -427,10 +429,10 @@ void audio_hal_flush_rx(void) {
 void audio_hal_start_buffering(void) {
     is_buffering = true;
     buffered_bytes = 0;
-    buffer_target_bytes = 28800; // 600ms High Watermark (24000Hz * 2 bytes * 0.6s)
+    buffer_target_bytes = JITTER_BUFFER_TARGET_BYTES; // 1.0s Pre-buffer (48KB)
     is_turn_active = true;
     s_flush_requested = false;
-    ESP_LOGI(TAG, "Started Jitter Buffering (600ms)...");
+    ESP_LOGI(TAG, "Started Jitter Buffering (1.0s / 48KB)...");
 }
 
 void audio_hal_force_start_playing(void) {

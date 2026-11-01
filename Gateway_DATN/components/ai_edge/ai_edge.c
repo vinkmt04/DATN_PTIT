@@ -16,7 +16,7 @@ static const char *TAG = "ai_edge";
 #define BOOT_BUTTON_GPIO         0
 #define STREAM_CHUNK_SAMPLES     960    // 60ms @ 16kHz
 #define CLOUD_PREBUFFER_SIZE     128000 // 4.0s @ 16kHz 16-bit mono = 64,000 samples = 128,000 bytes (PSRAM)
-#define STREAM_SILENCE_TARGET    25     // 25 * 60ms = 1500ms = đúng 1.5s im lặng để chốt lượt với Gemini Live
+#define STREAM_SILENCE_TARGET    17     // 17 * 60ms = 1020ms ~ 1.0s im lặng để chốt lượt với Gemini Live
 
 // =============================================================================
 // [CHẾ ĐỘ KIỂM THỬ MODEL 2 CÔ LẬP]
@@ -261,9 +261,9 @@ static void audio_recording_task(void *arg) {
                             }
                         } else {
                             audio_dsp_update_ambient_noise(rms);
-                            // Quá 3.0s không ai nói gì: No-Speech Guard (50 chunks * 60ms = 3.0s)
-                            if (command_total_chunks >= 50) {
-                                ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Không phát hiện tiếng nói sau 3.0s -> Hủy lượt & tiếp tục lắng nghe. <<<");
+                            // Quá 3.6s không ai nói gì: No-Speech Guard (60 chunks * 60ms = 3.6s)
+                            if (command_total_chunks >= 60) {
+                                ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Không phát hiện tiếng nói sau 3.6s -> Hủy lượt & tiếp tục lắng nghe. <<<");
                                 ai_cloud_stop_session();
                                 ei_wakeword_reset();
                                 s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
@@ -474,7 +474,7 @@ static void audio_recording_task(void *arg) {
 
                     streaming_counter++;
 
-                    // VAD Cutoff Window: Dừng sau ĐÚNG 1.5s im lặng (25 chunks * 60ms = 1500ms) theo yêu cầu!
+                    // VAD Cutoff Window: Dừng sau ĐÚNG 1.0s im lặng (17 chunks * 60ms = 1020ms) để phản xạ cực nhanh!
                     int silence_target = STREAM_SILENCE_TARGET;
 
                     if (streaming_counter % 8 == 0) {
@@ -486,7 +486,7 @@ static void audio_recording_task(void *arg) {
 
                     // DỨT CÂU NÓI HỢP LỆ (1.5s im lặng)
                     if (silence_counter >= silence_target) {
-                        ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói (1.5s im lặng) -> Chốt câu hỏi lên Gemini Live <<<");
+                        ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói (1.0s im lặng) -> Chốt câu hỏi lên Gemini Live <<<");
                         ei_wakeword_reset();
                         ai_cloud_end_turn();
                         s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
@@ -521,11 +521,28 @@ static void audio_recording_task(void *arg) {
 
                 // Kiểm tra khi cả Cloud đã trả lời xong VÀ loa đã xả hết âm thanh
                 if (!ai_cloud_is_busy() && !audio_hal_is_playing()) {
-                    ESP_LOGI(TAG, ">>> AI phản hồi hoàn tất & loa đã nghỉ -> Đóng WebSocket & quay lại lắng nghe 'Hey Cherry' <<<");
-                    ai_cloud_stop_session();
-                    ei_wakeword_reset();
-                    idle_slice_counter = 0;
-                    s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                    if (ai_cloud_is_follow_up_expected()) {
+                        ai_cloud_clear_follow_up();
+                        ESP_LOGI(TAG, ">>> [FOLLOW-UP ACTIVE] Gemini vừa hỏi xong -> Tự động mở Mic nhận phản hồi (3.6s) KHÔNG CẦN 'Hey Cherry' <<<");
+                        vTaskDelay(pdMS_TO_TICKS(400)); // Đệm 400ms tiêu âm phòng, triệt tiêu hoàn toàn tiếng vọng của loa
+                        audio_hal_flush_rx();
+                        audio_vad_reset_trigger();
+                        command_total_chunks = 0;
+                        command_speech_started = false;
+                        command_speech_chunks = 0;
+                        command_silence_chunks = 0;
+                        cloud_prebuffer_len = 0;
+                        preroll_count = 0;
+                        preroll_idx = 0;
+                        wake_dma_flushed = true;
+                        s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
+                    } else {
+                        ESP_LOGI(TAG, ">>> AI phản hồi hoàn tất & loa đã nghỉ -> Đóng WebSocket & quay lại lắng nghe 'Hey Cherry' <<<");
+                        ai_cloud_stop_session();
+                        ei_wakeword_reset();
+                        idle_slice_counter = 0;
+                        s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                    }
                 }
                 break;
             }

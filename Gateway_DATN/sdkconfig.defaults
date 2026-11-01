@@ -31,6 +31,7 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
 # LVGL and Display configs can be added later
 
-# lwIP TCP buffer tuning for audio streaming over TLS (10 * MSS = 14400 bytes)
+# lwIP TCP buffer tuning for audio streaming over TLS (40 * MSS = 57600 bytes)
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=14400
-CONFIG_LWIP_TCP_WND_DEFAULT=14400
+CONFIG_LWIP_TCP_WND_DEFAULT=57600
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
