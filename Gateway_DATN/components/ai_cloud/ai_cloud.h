@@ -41,11 +41,6 @@ bool ai_cloud_is_busy(void);
 // Kiểm tra kết nối Live API đã sẵn sàng hay chưa
 bool ai_cloud_is_ready(void);
 
-// Kiểm tra xem lượt phản hồi trước đó của Gemini có ra hiệu tag <ASK> hay không
-bool ai_cloud_is_follow_up_expected(void);
-
-// Xóa cờ Follow-Up sau khi đã bắt đầu xử lý lượt hội thoại tiếp theo
-void ai_cloud_clear_follow_up(void);
 
 #ifdef __cplusplus
 }

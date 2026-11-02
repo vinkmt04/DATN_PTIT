@@ -520,29 +520,21 @@ static void audio_recording_task(void *arg) {
                 }
 
                 // Kiểm tra khi cả Cloud đã trả lời xong VÀ loa đã xả hết âm thanh
+                // Chuẩn Continued Conversation (Google Nest / Alexa): Luôn mở Mic 3.6s chờ lệnh tiếp theo mà không cần "Hey Cherry"
                 if (!ai_cloud_is_busy() && !audio_hal_is_playing()) {
-                    if (ai_cloud_is_follow_up_expected()) {
-                        ai_cloud_clear_follow_up();
-                        ESP_LOGI(TAG, ">>> [FOLLOW-UP ACTIVE] Gemini vừa hỏi xong -> Tự động mở Mic nhận phản hồi (3.6s) KHÔNG CẦN 'Hey Cherry' <<<");
-                        vTaskDelay(pdMS_TO_TICKS(400)); // Đệm 400ms tiêu âm phòng, triệt tiêu hoàn toàn tiếng vọng của loa
-                        audio_hal_flush_rx();
-                        audio_vad_reset_trigger();
-                        command_total_chunks = 0;
-                        command_speech_started = false;
-                        command_speech_chunks = 0;
-                        command_silence_chunks = 0;
-                        cloud_prebuffer_len = 0;
-                        preroll_count = 0;
-                        preroll_idx = 0;
-                        wake_dma_flushed = true;
-                        s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
-                    } else {
-                        ESP_LOGI(TAG, ">>> AI phản hồi hoàn tất & loa đã nghỉ -> Đóng WebSocket & quay lại lắng nghe 'Hey Cherry' <<<");
-                        ai_cloud_stop_session();
-                        ei_wakeword_reset();
-                        idle_slice_counter = 0;
-                        s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
-                    }
+                    ESP_LOGI(TAG, ">>> [CONTINUED CONVERSATION] AI trả lời hoàn tất & loa đã nghỉ -> Tự động mở Mic (3.6s) KHÔNG CẦN 'Hey Cherry' <<<");
+                    vTaskDelay(pdMS_TO_TICKS(400)); // Đệm 400ms tiêu âm phòng, triệt tiêu hoàn toàn tiếng vọng của loa
+                    audio_hal_flush_rx();
+                    audio_vad_reset_trigger();
+                    command_total_chunks = 0;
+                    command_speech_started = false;
+                    command_speech_chunks = 0;
+                    command_silence_chunks = 0;
+                    cloud_prebuffer_len = 0;
+                    preroll_count = 0;
+                    preroll_idx = 0;
+                    wake_dma_flushed = true;
+                    s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
                 }
                 break;
             }

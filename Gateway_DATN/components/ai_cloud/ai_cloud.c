@@ -60,7 +60,6 @@ static volatile bool s_setup_complete = false;
 static volatile bool s_need_send_activity_start = false;
 static volatile bool s_turn_ending = false;
 static volatile bool s_is_aborting = false;
-static volatile bool s_expect_follow_up = false;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (64KB trong PSRAM ~ 2 giây âm thanh)
 // Giúp luồng thu âm mic KHÔNG BAO GIỜ BỊ BLOCK bởi mạng!
@@ -79,7 +78,6 @@ static void abort_task(void *arg) {
     ESP_LOGE(TAG, "Network Drop/Timeout Detected! Aborting turn immediately.");
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
-    s_expect_follow_up = false;
     s_need_send_activity_start = false;
     
     // 1. Dừng ngay tác vụ ghi âm ở tầng Edge
@@ -210,14 +208,6 @@ static void parse_server_message(const char *json_string) {
                     ESP_LOGI(TAG, "Gemini Reply: %s", reply_buf);
                     if (strncmp(reply_buf, "<CMD:", 5) == 0) {
                         mesh_controller_send_command(reply_buf);
-                    }
-                    // Nhận diện câu hỏi tự nhiên qua dấu '?'
-                    if (strchr(reply_buf, '?')) {
-                        s_expect_follow_up = true;
-                        ESP_LOGW(TAG, ">>> [FOLLOW-UP DETECTED] Gemini đặt câu hỏi ('?')! Sẽ mở Mic sau khi phát xong câu hỏi. <<<");
-                    } else if (strchr(reply_buf, '.') || strchr(reply_buf, '!')) {
-                        // Nếu sau câu hỏi là câu trần thuật tiếp diễn (kể chuyện) thì hủy cờ follow-up
-                        s_expect_follow_up = false;
                     }
                 }
             }
@@ -372,7 +362,7 @@ static void send_setup_frame(void) {
         s_setup_complete = false;
         // Bật disabled: true để Gemini Live trao quyền VAD hoàn toàn cho client (Espressif WebRTC Hardware VAD).
         // Khi đó, client quyết định chính xác thời điểm gửi activityStart và activityEnd!
-        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. QUESTION & PUNCTUATION RULE: Whenever you ask the user a question or invite them to speak (such as asking if they want to listen further, or making a choice), end your response naturally with a question mark '?'. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
+        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
         esp_websocket_client_send_text(ws_client, setup_msg, strlen(setup_msg), pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "Sent Setup message (Client WebRTC VAD + Multi-language + STT). Waiting for setupComplete...");
     }
@@ -600,7 +590,6 @@ static void cloud_tx_task(void *arg) {
             // RingBuffer đã rỗng hoàn toàn (toàn bộ âm thanh câu nói đã được gửi lên Google)
             if (s_turn_ending && s_current_state == AI_STATE_RECORDING) {
                 s_turn_ending = false;
-    s_expect_follow_up = false;
                 s_current_state = AI_STATE_WAITING_AI;
                 expecting_first_chunk = true;
 
@@ -706,7 +695,6 @@ bool ai_cloud_start_turn(void) {
     }
 
     s_turn_ending = false;
-    s_expect_follow_up = false;
 
     // 2. Xóa sạch mọi dữ liệu ghi âm tồn đọng từ lượt trước trong RingBuffer TX
     if (s_tx_audio_ringbuf) {
@@ -759,7 +747,6 @@ void ai_cloud_end_turn(void) {
 void ai_cloud_stop_session(void) {
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
-    s_expect_follow_up = false;
     s_need_send_activity_start = false;
 
     if (s_session_timer) {
@@ -818,10 +805,4 @@ bool ai_cloud_is_ready(void) {
     return (s_is_ws_connected && s_setup_complete);
 }
 
-bool ai_cloud_is_follow_up_expected(void) {
-    return s_expect_follow_up;
-}
 
-void ai_cloud_clear_follow_up(void) {
-    s_expect_follow_up = false;
-}
