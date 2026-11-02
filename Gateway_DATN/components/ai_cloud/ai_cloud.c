@@ -362,7 +362,7 @@ static void send_setup_frame(void) {
         s_setup_complete = false;
         // Bật disabled: true để Gemini Live trao quyền VAD hoàn toàn cho client (Espressif WebRTC Hardware VAD).
         // Khi đó, client quyết định chính xác thời điểm gửi activityStart và activityEnd!
-        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
+        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant on a smart speaker. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
         esp_websocket_client_send_text(ws_client, setup_msg, strlen(setup_msg), pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "Sent Setup message (Client WebRTC VAD + Multi-language + STT). Waiting for setupComplete...");
     }
@@ -499,12 +499,13 @@ static void cloud_tx_task(void *arg) {
                 }
             }
 
-            // Xả sạch bất kỳ byte rác nào còn sót lại trong RingBuffer
+            // Xả sạch triệt để TOÀN BỘ byte tồn dư nào còn sót lại trong RingBuffer TX
             size_t dummy_size = 0;
-            uint8_t *dummy_item = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_size, pdMS_TO_TICKS(50));
-            if (dummy_item) {
+            uint8_t *dummy_item = NULL;
+            while ((dummy_item = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_size, 0)) != NULL) {
                 vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_item);
             }
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
@@ -745,6 +746,7 @@ void ai_cloud_end_turn(void) {
 }
 
 void ai_cloud_stop_session(void) {
+    bool was_recording = (s_current_state == AI_STATE_RECORDING || s_turn_ending);
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
     s_need_send_activity_start = false;
@@ -762,21 +764,14 @@ void ai_cloud_stop_session(void) {
         }
     }
 
-    // Cơ chế Keep-Alive Idle Pool 15 giây:
-    // Nếu WebSocket đang kết nối sẵn: KHÔNG ngắt vội, mà bật timer giữ kết nối sống 15s.
-    // Nếu bạn nói tiếp hoặc gọi 'Hey Cherry' trong 15s đó -> socket dùng được ngay (0ms trễ TLS).
-    if (s_is_ws_connected && s_setup_complete) {
-        if (s_keep_alive_timer) {
-            xTimerStop(s_keep_alive_timer, 0);
-            xTimerStart(s_keep_alive_timer, 0);
-            ESP_LOGI(TAG, ">>> [KEEP-ALIVE POOL] Giữ WebSocket kết nối sống trong 15s sẵn sàng cho lượt tiếp theo... <<<");
-        }
-    } else {
-        // Chưa kết nối xong hoặc lỗi: dọn dẹp sạch
+    // NẾU LƯỢT NÓI BỊ HỦY GIỮA CHỪNG KHI ĐANG GHI ÂM (khớp lệnh local hoặc timeout):
+    // BẮT BUỘC đóng WebSocket ngay để máy chủ Google xóa sạch audio tồn dư dở dang,
+    // tránh 100% lỗi audio của lượt cũ bị ghép nối sang lượt sau!
+    if (was_recording) {
+        ESP_LOGI(TAG, ">>> Lượt nói bị hủy giữa chừng -> Đóng WebSocket để Google xóa sạch audio tồn đọng! <<<");
         if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (ws_client) {
                 if (s_is_ws_connected || s_is_ws_connecting) {
-                    ESP_LOGI(TAG, "Stopping WebSocket session on-demand...");
                     esp_websocket_client_stop(ws_client);
                 }
             }
@@ -784,6 +779,28 @@ void ai_cloud_stop_session(void) {
             s_is_ws_connecting = false;
             s_setup_complete = false;
             xSemaphoreGive(ws_mutex);
+        }
+    } else {
+        // Lượt nói đã hoàn tất trọn vẹn (Gemini đã trả lời xong): Giữ Keep-Alive 15s an toàn vì Google đã reset buffer
+        if (s_is_ws_connected && s_setup_complete) {
+            if (s_keep_alive_timer) {
+                xTimerStop(s_keep_alive_timer, 0);
+                xTimerStart(s_keep_alive_timer, 0);
+                ESP_LOGI(TAG, ">>> [KEEP-ALIVE POOL] Giữ WebSocket kết nối sống trong 15s sẵn sàng cho lượt tiếp theo... <<<");
+            }
+        } else {
+            // Chưa kết nối xong hoặc lỗi: dọn dẹp sạch
+            if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                if (ws_client) {
+                    if (s_is_ws_connected || s_is_ws_connecting) {
+                        esp_websocket_client_stop(ws_client);
+                    }
+                }
+                s_is_ws_connected = false;
+                s_is_ws_connecting = false;
+                s_setup_complete = false;
+                xSemaphoreGive(ws_mutex);
+            }
         }
     }
 }

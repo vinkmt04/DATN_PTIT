@@ -15,7 +15,6 @@ static const char *TAG = "ai_edge";
 
 #define BOOT_BUTTON_GPIO         0
 #define STREAM_CHUNK_SAMPLES     960    // 60ms @ 16kHz
-#define CLOUD_PREBUFFER_SIZE     128000 // 4.0s @ 16kHz 16-bit mono = 64,000 samples = 128,000 bytes (PSRAM)
 #define STREAM_SILENCE_TARGET    17     // 17 * 60ms = 1020ms ~ 1.0s im lặng để chốt lượt với Gemini Live
 
 // =============================================================================
@@ -78,8 +77,6 @@ static void audio_recording_task(void *arg) {
     if (!stride_buffer) stride_buffer = (int16_t *)malloc(EI_COMMAND_STRIDE_SAMPLES * sizeof(int16_t));
 
     // 5. Buffer đệm âm thanh dự phòng cho Cloud (PSRAM 128KB ~ 4.0 giây)
-    uint8_t *cloud_prebuffer = (uint8_t *)heap_caps_malloc(CLOUD_PREBUFFER_SIZE, MALLOC_CAP_SPIRAM);
-    if (!cloud_prebuffer) cloud_prebuffer = (uint8_t *)malloc(CLOUD_PREBUFFER_SIZE);
 
     // 6. Buffer kiểm thử 1.6s trọn vẹn (25.600 mẫu = 51.200 bytes trong PSRAM)
     int16_t *debug_1_6s_buffer = (int16_t *)heap_caps_malloc(FULL_1_6S_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
@@ -93,7 +90,6 @@ static void audio_recording_task(void *arg) {
     int preroll_count = 0;
     int preroll_idx = 0;
 
-    size_t cloud_prebuffer_len = 0;
     int cmd_inference_count = 0;
     size_t cmd_samples_from_speech = 0;
     size_t stride_samples_accum = 0;
@@ -160,7 +156,6 @@ static void audio_recording_task(void *arg) {
                         audio_hal_play_wake_sound();
 
                         // 3. Reset các bộ đệm và biến trạng thái câu lệnh
-                        cloud_prebuffer_len = 0;
                         cmd_inference_count = 0;
                         cmd_samples_from_speech = 0;
                         stride_samples_accum = 0;
@@ -172,6 +167,7 @@ static void audio_recording_task(void *arg) {
                         command_total_chunks = 0;
                         preroll_count = 0;
                         preroll_idx = 0;
+                        memset(s_preroll_buffer, 0, sizeof(s_preroll_buffer));
                         if (command_full_buffer) {
                             memset(command_full_buffer, 0, EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t));
                         }
@@ -217,6 +213,7 @@ static void audio_recording_task(void *arg) {
                         audio_vad_reset_trigger();
                         preroll_count = 0;
                         preroll_idx = 0;
+                        memset(s_preroll_buffer, 0, sizeof(s_preroll_buffer));
                         ESP_LOGI(TAG, ">>> [RECORDING OPEN] Chuông Ding đã dứt hoàn toàn -> Bắt đầu thu âm câu lệnh! <<<");
                         break;
                     }
@@ -224,11 +221,6 @@ static void audio_recording_task(void *arg) {
                     // 2. VAD phát hiện giọng nói người (Phương án A: WebRTC VAD Trigger Mode 3 + Sàn ồn)
                     bool has_voice = audio_vad_is_speech_chunk(stream_chunk_buffer, STREAM_CHUNK_SAMPLES, NULL);
 
-                    // 3. Luôn gom âm thanh vào cloud_prebuffer (đảm bảo 100% âm thanh từ sau Ding được giữ lại cho Cloud)
-                    if (cloud_prebuffer && (cloud_prebuffer_len + bytes_read <= CLOUD_PREBUFFER_SIZE)) {
-                        memcpy(cloud_prebuffer + cloud_prebuffer_len, stream_chunk_buffer, bytes_read);
-                        cloud_prebuffer_len += bytes_read;
-                    }
 
                     command_total_chunks++;
 
@@ -246,7 +238,12 @@ static void audio_recording_task(void *arg) {
                             ESP_LOGI(TAG, ">>> [VOICE START] Bắt đầu nói (RMS: %d, Sàn ồn: %d) -> Lùi %dms giữ trọn phụ âm đầu! <<<",
                                      rms, floor, preroll_count * 60);
 
-                            // Nạp các chunk Pre-roll (lùi tối đa 420ms) vào đầu command_full_buffer để không mất phụ âm đầu ("b...", "t...")
+                            // Kích hoạt Stream song song lên Cloud ngay lập tức (Speculative Streaming)
+                            if (sys_core_is_wifi_connected()) {
+                                ai_cloud_start_turn();
+                            }
+
+                            // Nạp các chunk Pre-roll (lùi tối đa 420ms) vào đầu command_full_buffer VÀ stream ngay lên Cloud
                             cmd_samples_from_speech = 0;
                             debug_1_6s_samples = 0;
                             int start_idx = (preroll_idx - preroll_count + PREROLL_CHUNKS) % PREROLL_CHUNKS;
@@ -258,6 +255,9 @@ static void audio_recording_task(void *arg) {
                                     debug_1_6s_samples += STREAM_CHUNK_SAMPLES;
                                 }
                                 cmd_samples_from_speech += STREAM_CHUNK_SAMPLES;
+                                if (sys_core_is_wifi_connected()) {
+                                    ai_cloud_send_audio_chunk((const uint8_t *)s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
+                                }
                             }
                         } else {
                             audio_dsp_update_ambient_noise(rms);
@@ -272,7 +272,11 @@ static void audio_recording_task(void *arg) {
                             break;
                         }
                     } else {
-                        // Đã bắt đầu nói
+                        // Đã bắt đầu nói: Stream song song từng chunk 60ms lên Cloud theo thời gian thực (Zero Lag)
+                        if (sys_core_is_wifi_connected()) {
+                            ai_cloud_send_audio_chunk((const uint8_t *)stream_chunk_buffer, bytes_read);
+                        }
+
                         if (has_voice) {
                             command_speech_chunks++;
                             command_silence_chunks = 0;
@@ -280,7 +284,7 @@ static void audio_recording_task(void *arg) {
                             command_silence_chunks++;
                         }
 
-                        // Tiếp tục gom âm thanh vào command_full_buffer
+                        // Tiếp tục gom âm thanh vào command_full_buffer cho Model 2
                         if (cmd_samples_from_speech + STREAM_CHUNK_SAMPLES <= EI_COMMAND_WINDOW_SAMPLES) {
                             memcpy(&command_full_buffer[cmd_samples_from_speech], stream_chunk_buffer, STREAM_CHUNK_SAMPLES * sizeof(int16_t));
                             cmd_samples_from_speech += STREAM_CHUNK_SAMPLES;
@@ -308,7 +312,7 @@ static void audio_recording_task(void *arg) {
                             ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS]: '%s' (Confidence: %.1f%%) <<<", lbl, conf * 100.0f);
                             ESP_LOGW(TAG, "==================================================");
                             dispatch_local_mesh_command(lbl);
-                            ai_cloud_stop_session();
+                            ai_cloud_cancel_turn(); // Hủy êm đẹp phiên Cloud đã lỡ stream song song (KHÔNG phát tiếng báo lỗi)
                             ei_wakeword_reset();
                             s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                             break;
@@ -382,15 +386,23 @@ static void audio_recording_task(void *arg) {
                             ESP_LOGI(TAG, ">>> [HYBRID ROUTING] Model 2 Lần 2 không khớp ('%s': %.1f%%) -> Chuyển tiếp sang Gemini Live! <<<",
                                      lbl ? lbl : "none", conf * 100.0f);
 
-                            if (sys_core_is_wifi_connected() && ai_cloud_start_turn()) {
-                                if (cloud_prebuffer && cloud_prebuffer_len > 0) {
-                                    ai_cloud_send_audio_chunk(cloud_prebuffer, cloud_prebuffer_len);
+                            if (sys_core_is_wifi_connected()) {
+                                // Kiểm tra xem người dùng đã dứt câu nói trong lúc Model 2 đang chạy hay chưa:
+                                if (command_silence_chunks >= STREAM_SILENCE_TARGET) {
+                                    ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói trong lúc Model 2 chạy (%dms im lặng) -> Chốt câu hỏi ngay lập tức! <<<",
+                                             command_silence_chunks * 60);
+                                    ei_wakeword_reset();
+                                    ai_cloud_end_turn(); // Gửi activityEnd ngay lập tức vì âm thanh đã stream sẵn!
+                                    s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
+                                    responding_log_counter = 0;
+                                } else {
+                                    // Người dùng vẫn đang nói tiếp câu hỏi dài -> Chuyển sang STREAMING_SPEECH thu tiếp
+                                    s_edge_state = AI_EDGE_STATE_STREAMING_SPEECH;
+                                    streaming_counter = 0;
+                                    silence_counter = command_silence_chunks;
+                                    s_consecutive_speech = (command_silence_chunks == 0) ? 2 : 0;
+                                    speech_chunks_total = command_speech_chunks;
                                 }
-                                s_edge_state = AI_EDGE_STATE_STREAMING_SPEECH;
-                                streaming_counter = 0;
-                                silence_counter = 0;
-                                s_consecutive_speech = 0;
-                                speech_chunks_total = (cloud_prebuffer_len / (STREAM_CHUNK_SAMPLES * sizeof(int16_t)));
                             } else {
                                 ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
                                 audio_hal_play_error_sound();
@@ -419,16 +431,12 @@ static void audio_recording_task(void *arg) {
                         break;
 #else
                         if (command_speech_started) {
-                            ESP_LOGI(TAG, ">>> [TIMEOUT ROUTING] Hết thời gian câu lệnh cục bộ -> Chuyển tiếp sang Gemini Live! <<<");
-                            if (sys_core_is_wifi_connected() && ai_cloud_start_turn()) {
-                                if (cloud_prebuffer && cloud_prebuffer_len > 0) {
-                                    ai_cloud_send_audio_chunk(cloud_prebuffer, cloud_prebuffer_len);
-                                }
-                                s_edge_state = AI_EDGE_STATE_STREAMING_SPEECH;
-                                streaming_counter = 0;
-                                silence_counter = 0;
-                                s_consecutive_speech = 0;
-                                speech_chunks_total = (cloud_prebuffer_len / (STREAM_CHUNK_SAMPLES * sizeof(int16_t)));
+                            ESP_LOGI(TAG, ">>> [TIMEOUT ROUTING] Hết thời gian câu lệnh cục bộ -> Chốt dứt câu sang Gemini Live! <<<");
+                            if (sys_core_is_wifi_connected()) {
+                                ei_wakeword_reset();
+                                ai_cloud_end_turn();
+                                s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
+                                responding_log_counter = 0;
                             } else {
                                 ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
                                 audio_hal_play_error_sound();
@@ -520,21 +528,14 @@ static void audio_recording_task(void *arg) {
                 }
 
                 // Kiểm tra khi cả Cloud đã trả lời xong VÀ loa đã xả hết âm thanh
-                // Chuẩn Continued Conversation (Google Nest / Alexa): Luôn mở Mic 3.6s chờ lệnh tiếp theo mà không cần "Hey Cherry"
+                // Chế độ 1 Hỏi - 1 Đáp (Single-Turn): Đóng phiên sạch sẽ & trở về chờ 'Hey Cherry' (Kháng 100% tiếng quạt gió & tạp âm)
                 if (!ai_cloud_is_busy() && !audio_hal_is_playing()) {
-                    ESP_LOGI(TAG, ">>> [CONTINUED CONVERSATION] AI trả lời hoàn tất & loa đã nghỉ -> Tự động mở Mic (3.6s) KHÔNG CẦN 'Hey Cherry' <<<");
-                    vTaskDelay(pdMS_TO_TICKS(400)); // Đệm 400ms tiêu âm phòng, triệt tiêu hoàn toàn tiếng vọng của loa
-                    audio_hal_flush_rx();
-                    audio_vad_reset_trigger();
-                    command_total_chunks = 0;
-                    command_speech_started = false;
-                    command_speech_chunks = 0;
-                    command_silence_chunks = 0;
-                    cloud_prebuffer_len = 0;
-                    preroll_count = 0;
-                    preroll_idx = 0;
-                    wake_dma_flushed = true;
-                    s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
+                    ESP_LOGI(TAG, ">>> [TURN COMPLETE] AI trả lời hoàn tất & loa đã nghỉ -> Trở về lắng nghe 'Hey Cherry' <<<");
+                    ai_cloud_stop_session();
+                    ei_wakeword_reset();
+                    idle_slice_counter = 0;
+                    wake_dma_flushed = false;
+                    s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                 }
                 break;
             }
@@ -545,7 +546,6 @@ static void audio_recording_task(void *arg) {
     if (stream_chunk_buffer) free(stream_chunk_buffer);
     if (command_full_buffer) free(command_full_buffer);
     if (stride_buffer) free(stride_buffer);
-    if (cloud_prebuffer) free(cloud_prebuffer);
     if (debug_1_6s_buffer) free(debug_1_6s_buffer);
     vTaskDelete(NULL);
 }
