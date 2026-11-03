@@ -195,16 +195,16 @@ void audio_hal_init(void) {
         return;
     }
     
-    // Tạo RingBuffer 1.5MB (1536KB) trong PSRAM để hấp thụ toàn bộ các câu trả lời dài từ Gemini Live
-    tx_ringbuf = xRingbufferCreateWithCaps(1536 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    // Tạo RingBuffer 2MB (2048KB) trong PSRAM chứa ~45 giây âm thanh 24kHz 16-bit hấp thụ trọn vẹn truyện dài
+    tx_ringbuf = xRingbufferCreateWithCaps(2048 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (tx_ringbuf == NULL) {
-        ESP_LOGW(TAG, "Failed to create 1.5MB PSRAM ringbuf. Fallback to 1MB...");
+        ESP_LOGW(TAG, "Failed to create 2MB PSRAM ringbuf. Fallback to 1MB...");
         tx_ringbuf = xRingbufferCreateWithCaps(1024 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
         if (tx_ringbuf == NULL) return;
     }
     xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 4096, NULL, 6, NULL, 1);
     
-    ESP_LOGI(TAG, "Speaker initialized with 1.5MB RingBuffer in PSRAM.");
+    ESP_LOGI(TAG, "Speaker initialized with 2MB RingBuffer in PSRAM (~45s speech absorption).");
 
     // Khởi tạo Espressif WebRTC VAD với Trigger tích hợp (Phương án A)
     // Mode 3 (Very Aggressive), 16000Hz, frame 30ms, min_speech = 60ms (nhạy hơn, bắt âm sớm), min_noise = 600ms
@@ -238,12 +238,13 @@ size_t audio_hal_record_chunk(int16_t *buffer, size_t buffer_size_bytes) {
 size_t audio_hal_play_chunk(const uint8_t *buffer, size_t buffer_size_bytes) {
     if (tx_ringbuf == NULL) return 0;
     
-    // Timeout 1500ms: Nếu buffer tạm thời đầy, hàm sẽ đợi loa xả bớt thay vì drop mất chữ
-    if (xRingbufferSend(tx_ringbuf, (void *)buffer, buffer_size_bytes, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    // Timeout 50ms: Không bao giờ block lâu trong luồng WebSocket task (Core 0),
+    // ngăn chặn 100% nguy cơ treo stack TCP/TLS gây ngắt kết nối Wi-Fi (DELBA reason 39)
+    if (xRingbufferSend(tx_ringbuf, (void *)buffer, buffer_size_bytes, pdMS_TO_TICKS(50)) == pdTRUE) {
         buffered_bytes += buffer_size_bytes;
         return buffer_size_bytes;
     } else {
-        ESP_LOGW(TAG, "Audio Ringbuffer full, dropped %d bytes", buffer_size_bytes);
+        ESP_LOGW(TAG, "Audio Ringbuffer (2MB) saturated, safely dropped %d bytes to protect TLS stack", buffer_size_bytes);
         return 0;
     }
 }

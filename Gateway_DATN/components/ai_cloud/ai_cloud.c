@@ -60,6 +60,7 @@ static volatile bool s_setup_complete = false;
 static volatile bool s_need_send_activity_start = false;
 static volatile bool s_turn_ending = false;
 static volatile bool s_is_aborting = false;
+static volatile bool s_cmd_dispatched_in_turn = false;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (64KB trong PSRAM ~ 2 giây âm thanh)
 // Giúp luồng thu âm mic KHÔNG BAO GIỜ BỊ BLOCK bởi mạng!
@@ -79,6 +80,7 @@ static void abort_task(void *arg) {
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
     s_need_send_activity_start = false;
+    s_cmd_dispatched_in_turn = false;
     
     // 1. Dừng ngay tác vụ ghi âm ở tầng Edge
     ai_edge_stop_recording();
@@ -133,12 +135,6 @@ static void session_timer_cb(TimerHandle_t xTimer) {
         ESP_LOGE(TAG, "Response Timeout (8s). No audio received from API!");
         ai_cloud_abort();
         break;
-    case AI_STATE_SPEAKING:
-        ESP_LOGW(TAG, "Server stream idle (%ds) without turnComplete. Ending turn gracefully...", CHUNK_TIMEOUT_MS / 1000);
-        s_current_state = AI_STATE_IDLE;
-        audio_hal_force_start_playing();
-        audio_hal_set_turn_active(false);
-        break;
     default:
         break;
     }
@@ -187,10 +183,13 @@ static void parse_server_message(const char *json_string) {
         }
     }
 
-    // 4. Trích xuất nội dung văn bản trả lời của Gemini (text) và lệnh Mesh
-    const char *model_turn = strstr(json_string, "\"modelTurn\"");
-    if (model_turn) {
-        const char *text_key = strstr(model_turn, "\"text\":");
+    // 4. Trích xuất nội dung văn bản trả lời của Gemini (text)
+    const char *text_source = strstr(json_string, "\"outputTranscription\"");
+    if (!text_source) {
+        text_source = strstr(json_string, "\"modelTurn\"");
+    }
+    if (text_source) {
+        const char *text_key = strstr(text_source, "\"text\":");
         if (text_key) {
             const char *val_start = strchr(text_key + 7, '\"');
             if (val_start) {
@@ -206,10 +205,31 @@ static void parse_server_message(const char *json_string) {
                     memcpy(reply_buf, val_start, len);
                     reply_buf[len] = '\0';
                     ESP_LOGI(TAG, "Gemini Reply: %s", reply_buf);
-                    if (strncmp(reply_buf, "<CMD:", 5) == 0) {
-                        mesh_controller_send_command(reply_buf);
-                    }
                 }
+            }
+        }
+    }
+
+    // 4.1 Trích xuất mã lệnh điều khiển Thread Mesh (<CMD:...> hoặc CMD:...) gửi tới ESP32-H2
+    if (!s_cmd_dispatched_in_turn) {
+        const char *cmd_start = strstr(json_string, "CMD:");
+        if (cmd_start) {
+            if (cmd_start > json_string && *(cmd_start - 1) == '<') {
+                cmd_start--;
+            }
+            const char *p = cmd_start;
+            while (*p && *p != '>' && *p != '\"' && *p != '\n' && *p != '\r' && *p != ' ' && *p != '\\') {
+                p++;
+            }
+            if (*p == '>') p++;
+            size_t cmd_len = p - cmd_start;
+            if (cmd_len > 4 && cmd_len < 64) {
+                char clean_cmd[64];
+                memcpy(clean_cmd, cmd_start, cmd_len);
+                clean_cmd[cmd_len] = '\0';
+                s_cmd_dispatched_in_turn = true;
+                ESP_LOGW(TAG, ">>> [THREAD MESH GATEWAY] Dispatching command to ESP32-H2: %s <<<", clean_cmd);
+                mesh_controller_send_command(clean_cmd);
             }
         }
     }
@@ -232,21 +252,17 @@ static void parse_server_message(const char *json_string) {
         if (s_current_state == AI_STATE_WAITING_AI) {
             s_current_state = AI_STATE_SPEAKING;
             if (s_session_timer) {
-                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
-                xTimerStart(s_session_timer, 0);
+                xTimerStop(s_session_timer, 0);
             }
         } else if (s_current_state == AI_STATE_SPEAKING) {
-            if (s_session_timer) {
-                xTimerReset(s_session_timer, 0);
-            }
+            // Đang phát luồng âm thanh bình thường
         } else if (s_current_state == AI_STATE_RECORDING) {
             ESP_LOGI(TAG, ">>> [SERVER VAD] Gemini phát hiện dứt câu sớm & bắt đầu trả lời! Dừng thu âm.");
             s_current_state = AI_STATE_SPEAKING;
             ai_edge_stop_recording();
             expecting_first_chunk = true;
             if (s_session_timer) {
-                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
-                xTimerStart(s_session_timer, 0);
+                xTimerStop(s_session_timer, 0);
             }
         } else {
             ESP_LOGD(TAG, "Dropping lingering audio chunk in state %d", s_current_state);
@@ -336,6 +352,7 @@ static void parse_server_message(const char *json_string) {
     if (is_turn_finished && s_current_state != AI_STATE_IDLE) {
         ESP_LOGI(TAG, "Model turn complete. Waiting for next user input...");
         s_current_state = AI_STATE_IDLE;
+        s_cmd_dispatched_in_turn = false;
         if (s_session_timer) {
             xTimerStop(s_session_timer, 0);
         }
@@ -344,7 +361,7 @@ static void parse_server_message(const char *json_string) {
     }
 
     // 7. Log toan bo sieu du lieu (Metadata / Event) co y nghia tu Google (bo qua heartbeat rong {})
-    if (!inline_tag && !model_turn && !stt_tag && !strstr(json_string, "\"setupComplete\"")) {
+    if (!inline_tag && !text_source && !stt_tag && !strstr(json_string, "\"setupComplete\"")) {
         if (strcmp(json_string, "{}") != 0 &&
             !strstr(json_string, "\"serverContent\":{}") &&
             !strstr(json_string, "\"serverContent\": {}")) {
@@ -360,11 +377,44 @@ static void parse_server_message(const char *json_string) {
 static void send_setup_frame(void) {
     if (ws_client && s_is_ws_connected) {
         s_setup_complete = false;
-        // Bật disabled: true để Gemini Live trao quyền VAD hoàn toàn cho client (Espressif WebRTC Hardware VAD).
-        // Khi đó, client quyết định chính xác thời điểm gửi activityStart và activityEnd!
-        const char *setup_msg = "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},\"systemInstruction\":{\"parts\":[{\"text\":\"You are a helpful AI voice assistant on a smart speaker. ABSOLUTE LANGUAGE RULE: You MUST ALWAYS speak and respond ONLY in Vietnamese in 100% of all cases, under every circumstance. NEVER use English or any other language, even if the input transcription contains foreign words, noise, gibberish, strange symbols, or broken characters. If you hear silence, background noise, or unintelligible sounds, you MUST reply exactly 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé' in Vietnamese and nothing else. Speak naturally with proper Vietnamese intonation. NEVER output, spell out, or say any technical tags or English code words.\"}]},\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}";
-        esp_websocket_client_send_text(ws_client, setup_msg, strlen(setup_msg), pdMS_TO_TICKS(2000));
-        ESP_LOGI(TAG, "Sent Setup message (Client WebRTC VAD + Multi-language + STT). Waiting for setupComplete...");
+
+        gateway_device_state_t st;
+        gateway_state_get(&st);
+
+        char prompt_buf[2048];
+        snprintf(prompt_buf, sizeof(prompt_buf),
+            "Bạn là trợ lý Nhà Thông Minh trên Gateway ESP32 điều khiển mạng Thread Mesh. "
+            "TRẠNG THÁI THIẾT BỊ HIỆN TẠI TRONG NHÀ: "
+            "1. Đèn Dimming: Trạng thái %s, Độ sáng %u%% (Mức nhớ: %u%%). "
+            "Khi người dùng bảo bật/tắt đèn: xuất mã 'CMD:DIMMER:ON' hoặc 'CMD:DIMMER:OFF'. "
+            "Khi bảo chỉnh độ sáng (ví dụ 'chỉnh đèn 70%%', 'bật đèn 50%%'): xuất mã 'CMD:DIMMER:SET:<số_%%>' (Ví dụ: 'CMD:DIMMER:SET:70'). "
+            "2. Công tắc Relay 1 kênh: Trạng thái %s. "
+            "Khi người dùng bảo bật/tắt công tắc: xuất mã 'CMD:RELAY:ON' hoặc 'CMD:RELAY:OFF'. "
+            "3. Cảm biến DHT11: Nhiệt độ phòng %.1f độ C, Độ ẩm %.1f%%. "
+            "Khi người dùng hỏi nhiệt độ, độ ẩm hoặc thời tiết trong phòng: trả lời tự nhiên bằng số liệu này, không xuất mã lệnh. "
+            "QUY TẮC BẮT BUỘC: "
+            "1. Luôn phản hồi 100%% bằng TIẾNG VIỆT tự nhiên, thân thiện. Tuyệt đối không dùng tiếng nước ngoài. "
+            "2. Với lệnh điều khiển: Luôn xuất mã lệnh 'CMD:...' ở đầu phản hồi, kèm đúng 1 câu nói xác nhận ngắn gọn. Tuyệt đối KHÔNG đọc thành tiếng mã lệnh. "
+            "3. Với trò chuyện, hỏi đáp kiến thức hoặc kể chuyện: Trả lời đúng trọng tâm, đủ ý, mạch lạc, không lan man kéo dài. "
+            "4. Nếu nghe không rõ hoặc âm thanh lạ, chỉ nói đúng: 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé.'.",
+            st.dimmer_on ? "BẬT" : "TẮT",
+            st.dimmer_brightness,
+            st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80,
+            st.relay_on ? "BẬT" : "TẮT",
+            st.sensor_valid ? st.temperature : 28.0f,
+            st.sensor_valid ? st.humidity : 65.0f
+        );
+
+        char setup_buf[3072];
+        snprintf(setup_buf, sizeof(setup_buf),
+            "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"thinkingConfig\":{\"thinkingBudget\":0}},"
+            "\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
+            "\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}",
+            prompt_buf
+        );
+
+        esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(2000));
+        ESP_LOGI(TAG, "Sent Dynamic Setup message (Smart Home Thread State + WebRTC VAD + STT). Waiting for setupComplete...");
     }
 }
 
@@ -713,6 +763,7 @@ bool ai_cloud_start_turn(void) {
     // cloud_tx_task sẽ đảm nhiệm việc gửi activityStart ngay trước chunk audio đầu tiên
     s_current_state = AI_STATE_RECORDING;
     s_need_send_activity_start = true;
+    s_cmd_dispatched_in_turn = false;
 
     return true;
 }
@@ -746,10 +797,11 @@ void ai_cloud_end_turn(void) {
 }
 
 void ai_cloud_stop_session(void) {
-    bool was_recording = (s_current_state == AI_STATE_RECORDING || s_turn_ending);
+    bool was_incomplete = (s_current_state != AI_STATE_IDLE || s_turn_ending);
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
     s_need_send_activity_start = false;
+    s_cmd_dispatched_in_turn = false;
 
     if (s_session_timer) {
         xTimerStop(s_session_timer, 0);
@@ -767,8 +819,8 @@ void ai_cloud_stop_session(void) {
     // NẾU LƯỢT NÓI BỊ HỦY GIỮA CHỪNG KHI ĐANG GHI ÂM (khớp lệnh local hoặc timeout):
     // BẮT BUỘC đóng WebSocket ngay để máy chủ Google xóa sạch audio tồn dư dở dang,
     // tránh 100% lỗi audio của lượt cũ bị ghép nối sang lượt sau!
-    if (was_recording) {
-        ESP_LOGI(TAG, ">>> Lượt nói bị hủy giữa chừng -> Đóng WebSocket để Google xóa sạch audio tồn đọng! <<<");
+    if (was_incomplete) {
+        ESP_LOGI(TAG, ">>> Lượt nói chưa hoàn tất trọn vẹn (bị hủy hoặc ngắt giữa chừng) -> Đóng WebSocket để Google xóa sạch audio dở dang! <<<");
         if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (ws_client) {
                 if (s_is_ws_connected || s_is_ws_connecting) {

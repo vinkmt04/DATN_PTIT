@@ -31,24 +31,22 @@ static volatile ai_edge_state_t s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
 
 static void dispatch_local_mesh_command(const char *cmd_label) {
     if (!cmd_label) return;
-    char mesh_cmd[64] = {0};
+
     if (strcmp(cmd_label, "bat_den") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:LIGHT:ON>");
+        ESP_LOGI(TAG, "Local Edge AI: BẬT ĐÈN (khôi phục mức sáng gần nhất)");
+        mesh_controller_set_dimmer(true, 0);
     } else if (strcmp(cmd_label, "tat_den") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:LIGHT:OFF>");
-    } else if (strcmp(cmd_label, "bat_quat") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:FAN:ON>");
-    } else if (strcmp(cmd_label, "tat_quat") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:FAN:OFF>");
+        ESP_LOGI(TAG, "Local Edge AI: TẮT ĐÈN");
+        mesh_controller_set_dimmer(false, 0);
     } else if (strcmp(cmd_label, "bat_cong_tac") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:SWITCH:ON>");
+        ESP_LOGI(TAG, "Local Edge AI: BẬT CÔNG TẮC RELAY");
+        mesh_controller_set_relay(true);
     } else if (strcmp(cmd_label, "tat_cong_tac") == 0) {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:SWITCH:OFF>");
+        ESP_LOGI(TAG, "Local Edge AI: TẮT CÔNG TẮC RELAY");
+        mesh_controller_set_relay(false);
     } else {
-        snprintf(mesh_cmd, sizeof(mesh_cmd), "<CMD:%s>", cmd_label);
+        ESP_LOGW(TAG, "Bỏ qua nhãn không thuộc hệ thống (như quạt hoặc unknown): %s", cmd_label);
     }
-    ESP_LOGI(TAG, "Gửi lệnh thực thi tới Thread Mesh qua UART: %s", mesh_cmd);
-    mesh_controller_send_command(mesh_cmd);
 }
 
 static void audio_recording_task(void *arg) {

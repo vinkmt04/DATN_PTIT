@@ -58,12 +58,11 @@ void ei_command_reset_window(void) {
 
 static bool is_valid_local_command(const char *label) {
     if (!label) return false;
+    // Hệ thống thực tế chỉ giữ Đèn và Công tắc Relay 1 kênh (bỏ Quạt)
     return (strcmp(label, "bat_cong_tac") == 0 ||
             strcmp(label, "tat_cong_tac") == 0 ||
             strcmp(label, "bat_den") == 0 ||
-            strcmp(label, "tat_den") == 0 ||
-            strcmp(label, "bat_quat") == 0 ||
-            strcmp(label, "tat_quat") == 0);
+            strcmp(label, "tat_den") == 0);
 }
 
 bool ei_command_slide_chunk(const int16_t *chunk_400ms, size_t num_samples,

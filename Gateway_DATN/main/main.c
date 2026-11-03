@@ -31,6 +31,9 @@ void app_main(void)
     // Initialize Mesh UART Controller
     mesh_controller_init();
     
+    // Initialize ThingsBoard IoT Cloud
+    iot_cloud_init();
+    
     ai_cloud_init();
 
     // Initialize Edge AI (Gatekeeper)
