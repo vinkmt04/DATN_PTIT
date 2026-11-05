@@ -572,12 +572,24 @@ static void cloud_tx_task(void *arg) {
                 wait_ticks++;
             }
 
+            // NẾU TRONG LÚC CHỜ, LƯỢT NÓI ĐÃ BỊ HỦY HOẶC KẾT THÚC (ví dụ: khớp lệnh cục bộ Model 2 -> State về IDLE):
+            // THOÁT NGAY VỀ ĐẦU VÒNG LẶP TRONG YÊN LẶNG (Silent Graceful Exit), TUYỆT ĐỐI KHÔNG BÁO LỖI!
+            if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
+                ESP_LOGI(TAG, "Turn cancelled or finished during connection wait (Local match or idle). Exiting cleanly.");
+                continue;
+            }
+
             if (!s_is_ws_connected || !s_setup_complete) {
                 ESP_LOGE(TAG, "WebSocket connection failed or setup timeout! Aborting turn...");
                 ai_cloud_abort();
                 vTaskDelay(pdMS_TO_TICKS(500)); // Ngăn ngừa 100% spin loop nghẽn CPU
                 continue;
             }
+        }
+
+        // Kiểm tra an toàn trước khi xử lý các bước tiếp theo
+        if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
+            continue;
         }
 
         // 3. Khi WebSocket đã sẵn sàng: Gửi activityStart trước nếu chưa gửi
@@ -601,9 +613,9 @@ static void cloud_tx_task(void *arg) {
             continue;
         }
 
-        // 4. Lấy từng chunk âm thanh từ RingBuffer để stream lên WebSocket (Tối đa 3840 bytes = 120ms để tự động gộp chunk khi mạng trễ)
+        // 4. Lấy từng chunk âm thanh từ RingBuffer để stream lên WebSocket (Chuẩn hóa 1920 bytes = 60ms để frame JSON ~2.7KB vừa khít 2 packet TCP MSS)
         size_t item_size = 0;
-        uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(s_tx_audio_ringbuf, &item_size, pdMS_TO_TICKS(20), 3840);
+        uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(s_tx_audio_ringbuf, &item_size, pdMS_TO_TICKS(20), 1920);
 
         if (item && item_size > 0) {
             // Đảm bảo số bytes là bội số của 2 (16-bit PCM)
@@ -623,7 +635,7 @@ static void cloud_tx_task(void *arg) {
                                      (char *)s_tx_base64_buf);
                             
                             if (json_len > 0 && json_len < TX_JSON_BUF_SIZE) {
-                                int sent = esp_websocket_client_send_text(ws_client, s_tx_json_buf, json_len, pdMS_TO_TICKS(3000));
+                                int sent = esp_websocket_client_send_text(ws_client, s_tx_json_buf, json_len, pdMS_TO_TICKS(4000));
                                 if (sent <= 0) {
                                     ESP_LOGW(TAG, "Audio send_text poll timeout or write fail (sent=%d)", sent);
                                 }
@@ -635,6 +647,10 @@ static void cloud_tx_task(void *arg) {
             }
 
             vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)item);
+
+            // Điều tiết tốc độ (Traffic Pacing): Nghỉ 15ms sau mỗi frame 60ms.
+            // Khi xả audio dồn ứ (ví dụ sau Model 2), tốc độ xả đạt ~4x thời gian thực mà không bao giờ làm tràn TCP send buffer!
+            vTaskDelay(pdMS_TO_TICKS(10));
         } else {
             // RingBuffer đã rỗng hoàn toàn (toàn bộ âm thanh câu nói đã được gửi lên Google)
             if (s_turn_ending && s_current_state == AI_STATE_RECORDING) {
