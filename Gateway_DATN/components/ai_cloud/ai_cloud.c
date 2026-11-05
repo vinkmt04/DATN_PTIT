@@ -54,12 +54,13 @@ static SemaphoreHandle_t ws_mutex = NULL;
 static esp_websocket_client_handle_t ws_client = NULL;
 static volatile bool s_is_ws_connected = false;
 static volatile bool s_is_ws_connecting = false;
+static volatile bool s_is_ws_stopping = false;
 static volatile bool s_setup_complete = false;
+static uint32_t s_last_disconnect_time_ms = 0;
 
 // Cờ đồng bộ tín hiệu thoại: đảm bảo gửi activityStart trước audio, và activityEnd sau cùng khi xả hết buffer
 static volatile bool s_need_send_activity_start = false;
 static volatile bool s_turn_ending = false;
-static volatile bool s_is_aborting = false;
 static volatile bool s_cmd_dispatched_in_turn = false;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (64KB trong PSRAM ~ 2 giây âm thanh)
@@ -75,13 +76,13 @@ static bool expecting_first_chunk = false;
 
 
 
-static void abort_task(void *arg) {
-    ESP_LOGE(TAG, "Network Drop/Timeout Detected! Aborting turn immediately.");
+void ai_cloud_abort(void) {
+    ESP_LOGW(TAG, "ai_cloud_abort() triggered: resetting turn state immediately (Zero-Task).");
     s_current_state = AI_STATE_IDLE;
     s_turn_ending = false;
     s_need_send_activity_start = false;
     s_cmd_dispatched_in_turn = false;
-    
+
     // 1. Dừng ngay tác vụ ghi âm ở tầng Edge
     ai_edge_stop_recording();
 
@@ -103,29 +104,19 @@ static void abort_task(void *arg) {
     audio_hal_set_turn_active(false);
     audio_hal_play_error_sound();
 
-    // 5. Ngắt phiên WebSocket để giải phóng triệt để session cũ trên Google server.
-    // Sẽ chỉ kết nối lại On-Demand khi có lượt nói mới (tránh reconnect liên tục làm nghẽn CPU/mạng).
-    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        if (ws_client) {
-            if (esp_websocket_client_is_connected(ws_client)) {
-                ESP_LOGW(TAG, "Stopping WebSocket session (will reconnect on next turn)...");
-                esp_websocket_client_stop(ws_client);
-            }
-            s_is_ws_connected = false;
-            s_is_ws_connecting = false;
-            s_setup_complete = false;
+    // 5. Ngắt phiên WebSocket an toàn nếu đang kết nối dở dang (tránh reconnect liên tục)
+    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
+            s_is_ws_stopping = true;
+            ESP_LOGW(TAG, "Stopping WebSocket session (will reconnect on next turn)...");
+            esp_websocket_client_stop(ws_client);
+            s_is_ws_stopping = false;
         }
+        s_is_ws_connected = false;
+        s_is_ws_connecting = false;
+        s_setup_complete = false;
+        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         xSemaphoreGive(ws_mutex);
-    }
-
-    s_is_aborting = false;
-    vTaskDelete(NULL);
-}
-
-void ai_cloud_abort(void) {
-    if (!s_is_aborting) {
-        s_is_aborting = true;
-        xTaskCreate(abort_task, "abort_task", 4096, NULL, 5, NULL);
     }
 }
 
@@ -407,7 +398,7 @@ static void send_setup_frame(void) {
 
         char setup_buf[3072];
         snprintf(setup_buf, sizeof(setup_buf),
-            "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"],\"thinkingConfig\":{\"thinkingBudget\":0}},"
+            "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},"
             "\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
             "\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}",
             prompt_buf
@@ -433,6 +424,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         s_is_ws_connected = false;
         s_is_ws_connecting = false;
         s_setup_complete = false;
+        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         s_ws_rx_len = 0;
         if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
             ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
@@ -445,6 +437,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         s_is_ws_connected = false;
         s_is_ws_connecting = false;
         s_setup_complete = false;
+        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
         if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
             ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
             ai_cloud_abort();
@@ -468,6 +461,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             s_is_ws_connected = false;
             s_is_ws_connecting = false;
             s_setup_complete = false;
+            s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
                 ai_cloud_abort();
             }
@@ -539,12 +533,15 @@ static void cloud_tx_task(void *arg) {
                 if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                     if (ws_client) {
                         if (s_is_ws_connected || s_is_ws_connecting) {
+                            s_is_ws_stopping = true;
                             esp_websocket_client_stop(ws_client);
+                            s_is_ws_stopping = false;
                         }
                     }
                     s_is_ws_connected = false;
                     s_is_ws_connecting = false;
                     s_setup_complete = false;
+                    s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                     xSemaphoreGive(ws_mutex);
                 }
             }
@@ -578,6 +575,7 @@ static void cloud_tx_task(void *arg) {
             if (!s_is_ws_connected || !s_setup_complete) {
                 ESP_LOGE(TAG, "WebSocket connection failed or setup timeout! Aborting turn...");
                 ai_cloud_abort();
+                vTaskDelay(pdMS_TO_TICKS(500)); // Ngăn ngừa 100% spin loop nghẽn CPU
                 continue;
             }
         }
@@ -679,13 +677,26 @@ void ai_cloud_prewarm_session(void) {
         xTimerStop(s_keep_alive_timer, 0);
     }
 
+    if (s_is_ws_stopping) {
+        ESP_LOGD(TAG, "WebSocket client is currently stopping. Skipping prewarm.");
+        return;
+    }
+
+    // Rate-limit backoff: Chờ tối thiểu 2.0s sau khi đứt kết nối / hủy trước khi cho phép kết nối lại
+    uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (s_last_disconnect_time_ms > 0 && (now - s_last_disconnect_time_ms < 2000)) {
+        ESP_LOGD(TAG, "WebSocket reconnect cooldown active (%lu ms remaining)...",
+                 (unsigned long)(2000 - (now - s_last_disconnect_time_ms)));
+        return;
+    }
+
     if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         if (ws_client == NULL) {
             ESP_LOGI(TAG, "Initializing WebSocket connection to Gemini Live...");
             esp_websocket_client_config_t websocket_cfg = {
                 .uri = GEMINI_WS_URL,
                 .crt_bundle_attach = esp_crt_bundle_attach,
-                .buffer_size = 32768, // 32KB: Nhận trọn vẹn frame lớn, giảm 75% số lần ngắt mạng
+                .buffer_size = 16384, // 16KB: Tiết kiệm 16KB Internal SRAM cho phần cứng DMA AES
                 .task_stack = 8192,
                 .task_core_id_set = true,
                 .task_core_id = 0,    // Ghim luồng WebSocket cố định vào Core 0 (Nhân Mạng)
@@ -700,7 +711,7 @@ void ai_cloud_prewarm_session(void) {
             esp_websocket_client_start(ws_client);
         } else if (s_is_ws_connected && s_setup_complete) {
             ESP_LOGI(TAG, ">>> [KEEP-ALIVE POOL HIT] WebSocket đã kết nối & Setup sẵn sàng (0ms độ trễ TLS)! <<<");
-        } else if (!s_is_ws_connected && !s_is_ws_connecting) {
+        } else if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping) {
             ESP_LOGI(TAG, "Starting WebSocket in background...");
             s_is_ws_connecting = true;
             esp_websocket_client_start(ws_client);
@@ -824,12 +835,15 @@ void ai_cloud_stop_session(void) {
         if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (ws_client) {
                 if (s_is_ws_connected || s_is_ws_connecting) {
+                    s_is_ws_stopping = true;
                     esp_websocket_client_stop(ws_client);
+                    s_is_ws_stopping = false;
                 }
             }
             s_is_ws_connected = false;
             s_is_ws_connecting = false;
             s_setup_complete = false;
+            s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
             xSemaphoreGive(ws_mutex);
         }
     } else {
@@ -845,12 +859,15 @@ void ai_cloud_stop_session(void) {
             if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                 if (ws_client) {
                     if (s_is_ws_connected || s_is_ws_connecting) {
+                        s_is_ws_stopping = true;
                         esp_websocket_client_stop(ws_client);
+                        s_is_ws_stopping = false;
                     }
                 }
                 s_is_ws_connected = false;
                 s_is_ws_connecting = false;
                 s_setup_complete = false;
+                s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
                 xSemaphoreGive(ws_mutex);
             }
         }
