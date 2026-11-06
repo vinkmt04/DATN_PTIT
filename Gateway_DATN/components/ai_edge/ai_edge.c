@@ -56,10 +56,11 @@ static void audio_recording_task(void *arg) {
     ei_wakeword_init();
     ei_command_init();
 
-    // 1. Buffer lát cắt Wake Word (4000 mẫu = 250ms @ 16kHz = 8000 bytes)
+    // 1. Buffer lát cắt Wake Word (4000 mẫu = 250ms @ 16kHz = 8000 bytes trong PSRAM)
     size_t wake_slice_size = ei_wakeword_get_slice_size();
     if (wake_slice_size == 0) wake_slice_size = EI_WAKEWORD_SLICE_SAMPLES;
-    int16_t *wake_slice_buffer = (int16_t *)heap_caps_malloc(wake_slice_size * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    int16_t *wake_slice_buffer = (int16_t *)heap_caps_malloc(wake_slice_size * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wake_slice_buffer) wake_slice_buffer = (int16_t *)heap_caps_malloc(wake_slice_size * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!wake_slice_buffer) wake_slice_buffer = (int16_t *)malloc(wake_slice_size * sizeof(int16_t));
 
     // 2. Buffer streaming 60ms cho mic (960 mẫu @ 16kHz = 1920 bytes)
@@ -82,9 +83,18 @@ static void audio_recording_task(void *arg) {
     size_t debug_1_6s_samples = 0;
 
     // 6. Buffer Pre-roll 420ms (7 chunks * 60ms) lùi lại >240ms giữ trọn vẹn 100% phụ âm đầu ("b...", "t...")
+    // Cấp phát trong PSRAM để giải phóng 13.5 KB DMA Internal SRAM cho mbedtls/esp-sha
     #define PREROLL_CHUNKS 7
-    static int16_t s_preroll_buffer[PREROLL_CHUNKS][STREAM_CHUNK_SAMPLES];
-    memset(s_preroll_buffer, 0, sizeof(s_preroll_buffer));
+    #define PREROLL_BUFFER_SIZE (PREROLL_CHUNKS * STREAM_CHUNK_SAMPLES * sizeof(int16_t))
+    int16_t (*s_preroll_buffer)[STREAM_CHUNK_SAMPLES] = (int16_t (*)[STREAM_CHUNK_SAMPLES])heap_caps_malloc(PREROLL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_preroll_buffer) {
+        s_preroll_buffer = (int16_t (*)[STREAM_CHUNK_SAMPLES])malloc(PREROLL_BUFFER_SIZE);
+    }
+    if (s_preroll_buffer) {
+        memset(s_preroll_buffer, 0, PREROLL_BUFFER_SIZE);
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate s_preroll_buffer in PSRAM!");
+    }
     int preroll_count = 0;
     int preroll_idx = 0;
 
@@ -165,7 +175,9 @@ static void audio_recording_task(void *arg) {
                         command_total_chunks = 0;
                         preroll_count = 0;
                         preroll_idx = 0;
-                        memset(s_preroll_buffer, 0, sizeof(s_preroll_buffer));
+                        if (s_preroll_buffer) {
+                            memset(s_preroll_buffer, 0, PREROLL_BUFFER_SIZE);
+                        }
                         if (command_full_buffer) {
                             memset(command_full_buffer, 0, EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t));
                         }
@@ -211,7 +223,9 @@ static void audio_recording_task(void *arg) {
                         audio_vad_reset_trigger();
                         preroll_count = 0;
                         preroll_idx = 0;
-                        memset(s_preroll_buffer, 0, sizeof(s_preroll_buffer));
+                        if (s_preroll_buffer) {
+                            memset(s_preroll_buffer, 0, PREROLL_BUFFER_SIZE);
+                        }
                         ESP_LOGI(TAG, ">>> [RECORDING OPEN] Chuông Ding đã dứt hoàn toàn -> Bắt đầu thu âm câu lệnh! <<<");
                         break;
                     }
@@ -225,9 +239,11 @@ static void audio_recording_task(void *arg) {
                     // 4. Quản lý Pre-roll và Kích hoạt Speech Start:
                     if (!command_speech_started) {
                         // Lưu chunk vào preroll buffer xoay vòng
-                        memcpy(s_preroll_buffer[preroll_idx], stream_chunk_buffer, sizeof(int16_t) * STREAM_CHUNK_SAMPLES);
-                        preroll_idx = (preroll_idx + 1) % PREROLL_CHUNKS;
-                        if (preroll_count < PREROLL_CHUNKS) preroll_count++;
+                        if (s_preroll_buffer) {
+                            memcpy(s_preroll_buffer[preroll_idx], stream_chunk_buffer, sizeof(int16_t) * STREAM_CHUNK_SAMPLES);
+                            preroll_idx = (preroll_idx + 1) % PREROLL_CHUNKS;
+                            if (preroll_count < PREROLL_CHUNKS) preroll_count++;
+                        }
 
                         if (has_voice) {
                             command_speech_started = true;
@@ -244,17 +260,19 @@ static void audio_recording_task(void *arg) {
                             // Nạp các chunk Pre-roll (lùi tối đa 420ms) vào đầu command_full_buffer VÀ stream ngay lên Cloud
                             cmd_samples_from_speech = 0;
                             debug_1_6s_samples = 0;
-                            int start_idx = (preroll_idx - preroll_count + PREROLL_CHUNKS) % PREROLL_CHUNKS;
-                            for (int p = 0; p < preroll_count; p++) {
-                                int cur_p = (start_idx + p) % PREROLL_CHUNKS;
-                                memcpy(&command_full_buffer[cmd_samples_from_speech], s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
-                                if (debug_1_6s_buffer && (debug_1_6s_samples + STREAM_CHUNK_SAMPLES <= FULL_1_6S_SAMPLES)) {
-                                    memcpy(&debug_1_6s_buffer[debug_1_6s_samples], s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
-                                    debug_1_6s_samples += STREAM_CHUNK_SAMPLES;
-                                }
-                                cmd_samples_from_speech += STREAM_CHUNK_SAMPLES;
-                                if (sys_core_is_wifi_connected()) {
-                                    ai_cloud_send_audio_chunk((const uint8_t *)s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
+                            if (s_preroll_buffer) {
+                                int start_idx = (preroll_idx - preroll_count + PREROLL_CHUNKS) % PREROLL_CHUNKS;
+                                for (int p = 0; p < preroll_count; p++) {
+                                    int cur_p = (start_idx + p) % PREROLL_CHUNKS;
+                                    memcpy(&command_full_buffer[cmd_samples_from_speech], s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
+                                    if (debug_1_6s_buffer && (debug_1_6s_samples + STREAM_CHUNK_SAMPLES <= FULL_1_6S_SAMPLES)) {
+                                        memcpy(&debug_1_6s_buffer[debug_1_6s_samples], s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
+                                        debug_1_6s_samples += STREAM_CHUNK_SAMPLES;
+                                    }
+                                    cmd_samples_from_speech += STREAM_CHUNK_SAMPLES;
+                                    if (sys_core_is_wifi_connected()) {
+                                        ai_cloud_send_audio_chunk((const uint8_t *)s_preroll_buffer[cur_p], STREAM_CHUNK_SAMPLES * sizeof(int16_t));
+                                    }
                                 }
                             }
                         } else {
@@ -545,6 +563,7 @@ static void audio_recording_task(void *arg) {
     if (command_full_buffer) free(command_full_buffer);
     if (stride_buffer) free(stride_buffer);
     if (debug_1_6s_buffer) free(debug_1_6s_buffer);
+    if (s_preroll_buffer) free(s_preroll_buffer);
     vTaskDelete(NULL);
 }
 
