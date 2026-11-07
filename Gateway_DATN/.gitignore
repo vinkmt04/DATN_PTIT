@@ -83,3 +83,4 @@ dataset_tools/
 .venv/
 .vscode/
 build/
+model_edge_ai/
