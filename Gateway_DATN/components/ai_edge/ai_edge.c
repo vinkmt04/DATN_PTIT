@@ -29,21 +29,48 @@ static TaskHandle_t audio_task_handle = NULL;
 static TaskHandle_t button_task_handle = NULL;
 static volatile ai_edge_state_t s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
 
+static bool is_command_device_enabled(const char *cmd_label) {
+    if (!cmd_label) return false;
+    if (strcmp(cmd_label, "bat_den") == 0 || strcmp(cmd_label, "tat_den") == 0) {
+        return (GATEWAY_ENABLE_DIMMER == 1);
+    }
+    if (strcmp(cmd_label, "bat_cong_tac") == 0 || strcmp(cmd_label, "tat_cong_tac") == 0) {
+        return (GATEWAY_ENABLE_RELAY == 1);
+    }
+    return false;
+}
+
 static void dispatch_local_mesh_command(const char *cmd_label) {
     if (!cmd_label) return;
 
     if (strcmp(cmd_label, "bat_den") == 0) {
+#if GATEWAY_ENABLE_DIMMER
         ESP_LOGI(TAG, "Local Edge AI: BẬT ĐÈN (khôi phục mức sáng gần nhất)");
         mesh_controller_set_dimmer(true, 0);
+#else
+        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'bat_den' do GATEWAY_ENABLE_DIMMER == 0");
+#endif
     } else if (strcmp(cmd_label, "tat_den") == 0) {
+#if GATEWAY_ENABLE_DIMMER
         ESP_LOGI(TAG, "Local Edge AI: TẮT ĐÈN");
         mesh_controller_set_dimmer(false, 0);
+#else
+        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'tat_den' do GATEWAY_ENABLE_DIMMER == 0");
+#endif
     } else if (strcmp(cmd_label, "bat_cong_tac") == 0) {
+#if GATEWAY_ENABLE_RELAY
         ESP_LOGI(TAG, "Local Edge AI: BẬT CÔNG TẮC RELAY");
         mesh_controller_set_relay(true);
+#else
+        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'bat_cong_tac' do GATEWAY_ENABLE_RELAY == 0");
+#endif
     } else if (strcmp(cmd_label, "tat_cong_tac") == 0) {
+#if GATEWAY_ENABLE_RELAY
         ESP_LOGI(TAG, "Local Edge AI: TẮT CÔNG TẮC RELAY");
         mesh_controller_set_relay(false);
+#else
+        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'tat_cong_tac' do GATEWAY_ENABLE_RELAY == 0");
+#endif
     } else {
         ESP_LOGW(TAG, "Bỏ qua nhãn không thuộc hệ thống (như quạt hoặc unknown): %s", cmd_label);
     }
@@ -277,9 +304,9 @@ static void audio_recording_task(void *arg) {
                             }
                         } else {
                             audio_dsp_update_ambient_noise(rms);
-                            // Quá 3.6s không ai nói gì: No-Speech Guard (60 chunks * 60ms = 3.6s)
-                            if (command_total_chunks >= 60) {
-                                ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Không phát hiện tiếng nói sau 3.6s -> Hủy lượt & tiếp tục lắng nghe. <<<");
+                            // Quá 5.0s không ai nói gì: No-Speech Guard (84 chunks * 60ms = 5.04s)
+                            if (command_total_chunks >= 84) {
+                                ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Không phát hiện tiếng nói sau 5.0s -> Hủy lượt & tiếp tục lắng nghe. <<<");
                                 ai_cloud_stop_session();
                                 ei_wakeword_reset();
                                 s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
@@ -323,7 +350,7 @@ static void audio_recording_task(void *arg) {
                         bool match = ei_command_classify(command_full_buffer, EI_COMMAND_WINDOW_SAMPLES, &conf, &lbl);
                         vTaskDelay(pdMS_TO_TICKS(15));
 
-                        if (match) {
+                        if (match && is_command_device_enabled(lbl)) {
                             ESP_LOGW(TAG, "==================================================");
                             ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS]: '%s' (Confidence: %.1f%%) <<<", lbl, conf * 100.0f);
                             ESP_LOGW(TAG, "==================================================");
@@ -332,6 +359,9 @@ static void audio_recording_task(void *arg) {
                             ei_wakeword_reset();
                             s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                             break;
+                        } else if (match) {
+                            ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Chuyển sang Cloud <<<",
+                                     lbl ? lbl : "none", conf * 100.0f);
                         }
 
                         // Lần 1 chưa khớp: Thu tiếp 400ms đến mốc 1.6s để chạy Lần 2 (cửa sổ trượt 0.4s - 1.6s)
@@ -373,7 +403,7 @@ static void audio_recording_task(void *arg) {
                             bool match = ei_command_classify(command_full_buffer, EI_COMMAND_WINDOW_SAMPLES, &conf, &lbl);
                             vTaskDelay(pdMS_TO_TICKS(15));
 
-                            if (match) {
+                            if (match && is_command_device_enabled(lbl)) {
                                 ESP_LOGW(TAG, "==================================================");
                                 ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS]: '%s' (Confidence: %.1f%%) <<<", lbl, conf * 100.0f);
                                 ESP_LOGW(TAG, "==================================================");
@@ -382,6 +412,9 @@ static void audio_recording_task(void *arg) {
                                 ei_wakeword_reset();
                                 s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                                 break;
+                            } else if (match) {
+                                ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Chuyển sang Cloud <<<",
+                                         lbl ? lbl : "none", conf * 100.0f);
                             }
 
                             // Sau Lần 2 không khớp:
@@ -399,6 +432,15 @@ static void audio_recording_task(void *arg) {
                             s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                             break;
 #else
+                            // SMART NOISE GUARD: Nếu Model 2 Lần 2 xác nhận là tạp âm ('noise' >= 80%) và sau đó người dùng hoàn toàn im lặng
+                            if (lbl && strcmp(lbl, "noise") == 0 && conf >= 0.80f && command_silence_chunks >= STREAM_SILENCE_TARGET) {
+                                ESP_LOGW(TAG, ">>> [SMART NOISE GUARD] Tạp âm ngoại cảnh ('noise': %.1f%%) & người dùng không nói tiếp -> Hủy lượt êm! <<<", conf * 100.0f);
+                                ai_cloud_cancel_turn();
+                                ei_wakeword_reset();
+                                s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                                break;
+                            }
+
                             ESP_LOGI(TAG, ">>> [HYBRID ROUTING] Model 2 Lần 2 không khớp ('%s': %.1f%%) -> Chuyển tiếp sang Gemini Live! <<<",
                                      lbl ? lbl : "none", conf * 100.0f);
 

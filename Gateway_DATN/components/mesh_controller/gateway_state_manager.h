@@ -7,6 +7,14 @@
 extern "C" {
 #endif
 
+// =============================================================================
+// CẤU HÌNH THIẾT BỊ HIỆN DIỆN TRONG HỆ THỐNG
+// (1: Thiết bị có mặt / Bật điều khiển, 0: Chưa có / Tắt điều khiển)
+// =============================================================================
+#define GATEWAY_ENABLE_DIMMER   1   // 1: Đèn Dimming (0-100%), 0: Chưa kết nối/Tắt
+#define GATEWAY_ENABLE_RELAY    1   // 1: Công tắc Relay 1 kênh, 0: Chưa kết nối/Tắt
+#define GATEWAY_ENABLE_DHT11    1   // 1: Cảm biến DHT11 (Nhiệt độ/Độ ẩm), 0: Chưa kết nối/Tắt
+
 typedef struct {
     // Dimmer Light (0 - 100%)
     bool dimmer_on;

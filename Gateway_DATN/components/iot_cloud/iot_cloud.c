@@ -29,14 +29,21 @@ void iot_cloud_publish_telemetry_now(void) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
 
+#if GATEWAY_ENABLE_DIMMER
     cJSON_AddNumberToObject(root, "dimmer_status", st.dimmer_on ? 1 : 0);
     cJSON_AddNumberToObject(root, "dimmer_brightness", st.dimmer_brightness);
-    cJSON_AddNumberToObject(root, "relay_status", st.relay_on ? 1 : 0);
+#endif
 
+#if GATEWAY_ENABLE_RELAY
+    cJSON_AddNumberToObject(root, "relay_status", st.relay_on ? 1 : 0);
+#endif
+
+#if GATEWAY_ENABLE_DHT11
     if (st.sensor_valid) {
         cJSON_AddNumberToObject(root, "temperature", (double)st.temperature);
         cJSON_AddNumberToObject(root, "humidity", (double)st.humidity);
     }
+#endif
 
     char *json_str = cJSON_PrintUnformatted(root);
     if (json_str) {
@@ -63,6 +70,7 @@ static void handle_rpc_request(const char *topic, const char *data, size_t data_
     if (cJSON_IsString(method)) {
         ESP_LOGI(TAG, "ThingsBoard RPC Call: Method='%s'", method->valuestring);
 
+#if GATEWAY_ENABLE_DIMMER
         // 1. Điều khiển Đèn Dimmer
         if (strcmp(method->valuestring, "setDimmerStatus") == 0) {
             int status = 1;
@@ -81,6 +89,8 @@ static void handle_rpc_request(const char *topic, const char *data, size_t data_
             mesh_controller_set_dimmer(status == 1, (uint8_t)brightness);
             esp_mqtt_client_publish(s_mqtt_client, rpc_response_topic, "{\"result\":\"ok\"}", 0, 1, 0);
         }
+#endif
+#if GATEWAY_ENABLE_RELAY
         // 2. Điều khiển Relay 1 kênh
         else if (strcmp(method->valuestring, "setRelayStatus") == 0) {
             int status = 0;
@@ -96,16 +106,25 @@ static void handle_rpc_request(const char *topic, const char *data, size_t data_
             mesh_controller_set_relay(status == 1);
             esp_mqtt_client_publish(s_mqtt_client, rpc_response_topic, "{\"result\":\"ok\"}", 0, 1, 0);
         }
+#endif
         // 3. Lấy trạng thái hiện tại
         else if (strcmp(method->valuestring, "getDeviceStatus") == 0) {
             gateway_device_state_t st;
             gateway_state_get(&st);
             cJSON *resp = cJSON_CreateObject();
+#if GATEWAY_ENABLE_DIMMER
             cJSON_AddNumberToObject(resp, "dimmer_status", st.dimmer_on ? 1 : 0);
             cJSON_AddNumberToObject(resp, "dimmer_brightness", st.dimmer_brightness);
+#endif
+#if GATEWAY_ENABLE_RELAY
             cJSON_AddNumberToObject(resp, "relay_status", st.relay_on ? 1 : 0);
-            cJSON_AddNumberToObject(resp, "temperature", st.temperature);
-            cJSON_AddNumberToObject(resp, "humidity", st.humidity);
+#endif
+#if GATEWAY_ENABLE_DHT11
+            if (st.sensor_valid) {
+                cJSON_AddNumberToObject(resp, "temperature", st.temperature);
+                cJSON_AddNumberToObject(resp, "humidity", st.humidity);
+            }
+#endif
 
             char *resp_str = cJSON_PrintUnformatted(resp);
             if (resp_str) {

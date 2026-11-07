@@ -295,6 +295,7 @@ static void parse_server_message(const char *json_string) {
             char result_msg[128] = "Đã thực hiện";
 
             if (strcmp(fn_name, "control_dimmer") == 0) {
+#if GATEWAY_ENABLE_DIMMER
                 if (strcmp(action, "set_brightness") == 0 || brightness >= 0) {
                     if (brightness < 0) brightness = 80;
                     if (brightness > 100) brightness = 100;
@@ -312,7 +313,12 @@ static void parse_server_message(const char *json_string) {
                     mesh_controller_send_command("CMD:DIMMER:OFF");
                     snprintf(result_msg, sizeof(result_msg), "Đã tắt đèn");
                 }
+#else
+                ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer bị vô hiệu hóa (GATEWAY_ENABLE_DIMMER == 0)! Không gửi lệnh Mesh. <<<");
+                snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn chưa được kết nối vào hệ thống");
+#endif
             } else if (strcmp(fn_name, "control_relay") == 0) {
+#if GATEWAY_ENABLE_RELAY
                 if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
                     ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:ON <<<");
                     mesh_controller_send_command("CMD:RELAY:ON");
@@ -322,6 +328,10 @@ static void parse_server_message(const char *json_string) {
                     mesh_controller_send_command("CMD:RELAY:OFF");
                     snprintf(result_msg, sizeof(result_msg), "Đã tắt công tắc");
                 }
+#else
+                ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay bị vô hiệu hóa (GATEWAY_ENABLE_RELAY == 0)! Không gửi lệnh Mesh. <<<");
+                snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc chưa được kết nối vào hệ thống");
+#endif
             }
 
             // Ghi nhận functionResponse cho ID tương ứng
@@ -559,45 +569,133 @@ static void send_setup_frame(void) {
         gateway_device_state_t st;
         gateway_state_get(&st);
 
-        char prompt_buf[1536];
-        snprintf(prompt_buf, sizeof(prompt_buf),
+        char *prompt_buf = (char *)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!prompt_buf) prompt_buf = (char *)malloc(4096);
+        char *setup_buf = (char *)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!setup_buf) setup_buf = (char *)malloc(8192);
+
+        if (!prompt_buf || !setup_buf) {
+            ESP_LOGE(TAG, "Failed to allocate memory for Setup Frame!");
+            if (prompt_buf) free(prompt_buf);
+            if (setup_buf) free(setup_buf);
+            return;
+        }
+
+        int p_len = snprintf(prompt_buf, 4096,
             "Bạn là trợ lý Nhà Thông Minh trên Gateway ESP32 điều khiển mạng Thread Mesh. "
-            "TRẠNG THÁI THIẾT BỊ HIỆN TẠI TRONG NHÀ: "
-            "1. Đèn Dimming: Trạng thái %s, Độ sáng %u%% (Mức nhớ gần nhất: %u%%). "
-            "2. Công tắc Relay 1 kênh: Trạng thái %s. "
-            "3. Cảm biến DHT11: Nhiệt độ phòng %.1f độ C, Độ ẩm %.1f%%. "
-            "QUY TẮC BẮT BUỘC: "
-            "1. Luôn dùng TIẾNG VIỆT tự nhiên, thân thiện. Tuyệt đối không dùng tiếng nước ngoài. "
-            "2. Khi người dùng yêu cầu bật, tắt hoặc chỉnh độ sáng đèn: BẮT BUỘC gọi hàm control_dimmer. "
-            "3. Khi người dùng yêu cầu bật hoặc tắt công tắc: BẮT BUỘC gọi hàm control_relay. "
-            "4. TUYỆT ĐỐI KHÔNG gọi lại hàm lần thứ 2 trong cùng một lượt. "
-            "5. Khi gọi hàm điều khiển thiết bị: Sau khi nhận kết quả hàm, chỉ cần xác nhận cực kỳ ngắn gọn (dưới 4 từ, ví dụ: 'Đã bật đèn.', 'Đã tắt quạt.') và kết thúc lượt ngay. "
-            "6. Khi người dùng hỏi nhiệt độ, độ ẩm phòng (từ cảm biến DHT11) hoặc trò chuyện, hỏi đáp kiến thức: BẮT BUỘC trả lời tự nhiên bằng giọng nói qua loa, không gọi hàm. "
-            "7. Nếu nghe không rõ hoặc âm thanh lạ, chỉ nói đúng: 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé.'. "
-            "8. Tuyệt đối KHÔNG tự ý xuất bất kỳ thẻ XML, HTML hay SSML nào như <audio>.",
-            st.dimmer_on ? "BẬT" : "TẮT",
-            st.dimmer_brightness,
-            st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80,
-            st.relay_on ? "BẬT" : "TẮT",
-            st.sensor_valid ? st.temperature : 28.0f,
-            st.sensor_valid ? st.humidity : 65.0f
+            "TRẠNG THÁI THIẾT BỊ TRONG NHÀ: "
         );
 
-        const char *tools_json = 
+        int dev_idx = 1;
+#if GATEWAY_ENABLE_DIMMER
+        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+            "%d. Đèn Dimming: %s, độ sáng %u%% (mức nhớ: %u%%). ",
+            dev_idx++, st.dimmer_on ? "BẬT" : "TẮT", st.dimmer_brightness,
+            st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80
+        );
+#endif
+
+#if GATEWAY_ENABLE_RELAY
+        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+            "%d. Công tắc Relay 1 kênh: %s. ",
+            dev_idx++, st.relay_on ? "BẬT" : "TẮT"
+        );
+#endif
+
+#if GATEWAY_ENABLE_DHT11
+        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+            "%d. Cảm biến DHT11: Nhiệt độ %.1f độ C, Độ ẩm %.1f%%. ",
+            dev_idx++, st.sensor_valid ? st.temperature : 28.0f, st.sensor_valid ? st.humidity : 65.0f
+        );
+#endif
+
+        if (dev_idx == 1) {
+            p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+                "Hiện chưa có thiết bị nào kết nối trong mạng. "
+            );
+        }
+
+        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+            "THIẾT BỊ KHÔNG CÓ: "
+#if !GATEWAY_ENABLE_DIMMER
+            "Đèn chiếu sáng; "
+#endif
+#if !GATEWAY_ENABLE_RELAY
+            "Công tắc Relay; "
+#endif
+#if !GATEWAY_ENABLE_DHT11
+            "Cảm biến nhiệt ẩm DHT11; "
+#endif
+            "Quạt, tivi, điều hòa, bình nóng lạnh, máy bơm. "
+        );
+
+        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+            "QUY TẮC BẮT BUỘC: "
+            "1. Luôn dùng TIẾNG VIỆT tự nhiên, thân thiện. "
+            "2. XỬ LÝ TẠP ÂM/TỪ LẠ (ƯU TIÊN CAO NHẤT): Nếu nghe tiếng ồn, tiếng thở, từ vô nghĩa, tiếng lạ (như '¿Qué?', 'what', 'hả') hoặc nghe không rõ: BẮT BUỘC chỉ trả lời duy nhất: 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé.'. TUYỆT ĐỐI KHÔNG trả lời 'Nhà hiện không có thiết bị này.' khi gặp tạp âm/từ vô nghĩa. "
+            "3. THIẾT BỊ KHÔNG TỒN TẠI: Câu 'Nhà hiện tại không có thiết bị này.' CHỈ ĐƯỢC DÙNG khi người dùng gọi ĐÍCH DANH tên thiết bị không có trong nhà (ví dụ: 'bật quạt', 'tắt tivi', 'bật bình nóng lạnh', 'bật máy bơm'"
+#if !GATEWAY_ENABLE_RELAY
+            ", 'bật công tắc'"
+#endif
+#if !GATEWAY_ENABLE_DIMMER
+            ", 'bật đèn'"
+#endif
+            "). "
+#if GATEWAY_ENABLE_DIMMER
+            "4. Hàm control_dimmer CHỈ gọi khi người dùng nói 'đèn' hoặc 'ánh sáng'. Tuyệt đối không gọi cho 'công tắc', 'quạt'. "
+#endif
+#if GATEWAY_ENABLE_RELAY
+            "5. Hàm control_relay CHỈ gọi khi người dùng nói 'công tắc'. Tuyệt đối không gọi cho 'đèn', 'quạt'. "
+#endif
+            "6. Tuyệt đối không tự suy diễn câu lệnh của thiết bị này sang thiết bị khác, không gọi hàm lần thứ 2 trong cùng lượt. "
+            "7. Sau khi gọi hàm điều khiển: Phản hồi cực ngắn (dưới 4 từ, ví dụ: 'Đã bật đèn.', 'Đã bật công tắc.') và kết thúc lượt ngay. "
+#if GATEWAY_ENABLE_DHT11
+            "8. Khi hỏi nhiệt độ, độ ẩm phòng (DHT11) hoặc trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
+#else
+            "8. Khi người dùng trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
+#endif
+            "9. Tuyệt đối không xuất thẻ XML, HTML hay SSML như <audio>."
+        );
+
+        if (p_len >= 4096) {
+            ESP_LOGE(TAG, "Prompt buffer overflow! p_len=%d >= 4096", p_len);
+        }
+
+        // Sinh động trường tools_json: chỉ khai báo tool cho thiết bị có cờ enable = 1
+        char tools_json[2048] = "";
+#if GATEWAY_ENABLE_DIMMER && GATEWAY_ENABLE_RELAY
+        snprintf(tools_json, sizeof(tools_json), "%s",
             "\"tools\":[{\"functionDeclarations\":["
-                "{\"name\":\"control_dimmer\",\"description\":\"Điều khiển đèn Dimming. Bật, tắt hoặc chỉnh độ sáng 0-100%.\","
+                "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
                 "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
                     "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
                     "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
                 "},\"required\":[\"action\"]}},"
-                "{\"name\":\"control_relay\",\"description\":\"Điều khiển công tắc Relay 1 kênh (bật hoặc tắt).\" ,"
+                "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
                 "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
                     "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
                 "},\"required\":[\"action\"]}}"
-            "]}],";
+            "]}],");
+#elif GATEWAY_ENABLE_DIMMER
+        snprintf(tools_json, sizeof(tools_json), "%s",
+            "\"tools\":[{\"functionDeclarations\":["
+                "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
+                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
+                    "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
+                "},\"required\":[\"action\"]}}"
+            "]}],");
+#elif GATEWAY_ENABLE_RELAY
+        snprintf(tools_json, sizeof(tools_json), "%s",
+            "\"tools\":[{\"functionDeclarations\":["
+                "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
+                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
+                "},\"required\":[\"action\"]}}"
+            "]}],");
+#endif
 
-        char setup_buf[3584];
-        snprintf(setup_buf, sizeof(setup_buf),
+        int setup_len = snprintf(setup_buf, 8192,
             "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},"
             "%s"
             "\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
@@ -606,8 +704,16 @@ static void send_setup_frame(void) {
             prompt_buf
         );
 
-        esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(3000));
-        ESP_LOGI(TAG, "Sent Dynamic Setup message with Gemini Tools (control_dimmer, control_relay). Waiting for setupComplete...");
+        if (setup_len >= 8192) {
+            ESP_LOGE(TAG, "Setup buffer overflow! setup_len=%d >= 8192", setup_len);
+        }
+
+        esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(4000));
+        ESP_LOGI(TAG, "Sent Dynamic Setup message (len: %d bytes, DIMMER=%d, RELAY=%d, DHT11=%d). Waiting for setupComplete...",
+                 setup_len, GATEWAY_ENABLE_DIMMER, GATEWAY_ENABLE_RELAY, GATEWAY_ENABLE_DHT11);
+
+        free(prompt_buf);
+        free(setup_buf);
     }
 }
 

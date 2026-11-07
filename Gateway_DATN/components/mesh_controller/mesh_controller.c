@@ -1,6 +1,7 @@
 #include "mesh_controller.h"
 #include "esp_log.h"
 #include "driver/uart.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -14,10 +15,16 @@ static const char *TAG = "mesh_controller";
 #define MESH_UART_RX_PIN   14 // Chân RX nối sang TX của ESP32-H2
 #define MESH_UART_BUF_SIZE 1024
 
+#if MESH_ENABLE_RX_TASK
 static TaskHandle_t s_rx_task_handle = NULL;
 
 static void parse_mesh_rx_line(const char *line) {
     if (!line || strlen(line) == 0) return;
+
+    // Chỉ chấp nhận bản tin có tiền tố hợp lệ trong giao thức (ACK:, DATA:, ERR:)
+    if (strncmp(line, "ACK:", 4) != 0 && strncmp(line, "DATA:", 5) != 0 && strncmp(line, "ERR:", 4) != 0) {
+        return;
+    }
 
     ESP_LOGI(TAG, ">>> [THREAD MESH RX]: '%s' <<<", line);
 
@@ -90,7 +97,8 @@ static void mesh_uart_rx_task(void *arg) {
                         parse_mesh_rx_line(line_buf);
                         line_len = 0;
                     }
-                } else {
+                } else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) {
+                    // Chỉ gom các ký tự ASCII hiển thị được, loại bỏ hoàn toàn nhiễu nhị phân
                     if (line_len < sizeof(line_buf) - 1) {
                         line_buf[line_len++] = c;
                     } else {
@@ -102,6 +110,7 @@ static void mesh_uart_rx_task(void *arg) {
         }
     }
 }
+#endif
 
 void mesh_controller_init(void) {
     ESP_LOGI(TAG, "Initializing Mesh Controller (UART1 to ESP32-H2 Thread Co-processor)");
@@ -124,12 +133,20 @@ void mesh_controller_init(void) {
     ESP_ERROR_CHECK(uart_param_config(MESH_UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(MESH_UART_NUM, MESH_UART_TX_PIN, MESH_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    ESP_LOGI(TAG, "UART1 initialized on TX:%d RX:%d @ 115200bps", MESH_UART_TX_PIN, MESH_UART_RX_PIN);
+    // Bật Internal Pull-Up trên chân RX (GPIO 14) để luôn giữ mức 3.3V (UART Idle),
+    // chống sóng nhiễu điện từ kích hoạt Start Bit giả mạo khi chân đang để lơ lửng
+    gpio_set_pull_mode(MESH_UART_RX_PIN, GPIO_PULLUP_ONLY);
 
+    ESP_LOGI(TAG, "UART1 initialized on TX:%d RX:%d @ 115200bps (Internal Pull-Up enabled on RX)", MESH_UART_TX_PIN, MESH_UART_RX_PIN);
+
+#if MESH_ENABLE_RX_TASK
     // 3. Tạo Task đón bản tin ACK / DATA từ ESP32-H2
     if (s_rx_task_handle == NULL) {
         xTaskCreate(mesh_uart_rx_task, "mesh_rx_task", 4096, NULL, 5, &s_rx_task_handle);
     }
+#else
+    ESP_LOGI(TAG, "Mesh UART RX Task tạm thời TẮT (MESH_ENABLE_RX_TASK == 0). Bật lại trong mesh_controller.h khi cắm H2.");
+#endif
 }
 
 void mesh_controller_send_command(const char *cmd_str) {
