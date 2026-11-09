@@ -49,7 +49,7 @@
 
 namespace ModelCommand {
 
-const char* ei_classifier_inferencing_categories_1147290_1[] = { "bat_cong_tac", "bat_den", "bat_quat", "noise", "tat_cong_tac", "tat_den", "tat_quat", "unknown" };
+const char* ei_classifier_inferencing_categories_1147290_1[] = { "bat_cong_tac", "bat_den", "noise", "tat_cong_tac", "tat_den", "unknown" };
 
 ei_dsp_named_axis_t ei_dsp_config_1147290_8_named_axes[] = {
     { .name = "Signal", .axis = 0 }
@@ -154,7 +154,7 @@ const ei_impulse_t impulse_1147290_1 = {
     .project_name = "control",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 1,
+    .deploy_version = 3,
 
     .nn_input_frame_size = 1264,
     .raw_sample_count = 19200,
@@ -185,7 +185,7 @@ const ei_impulse_t impulse_1147290_1 = {
     .slices_per_model_window = 4,
 
     .has_anomaly = EI_ANOMALY_TYPE_UNKNOWN,
-    .label_count = 8,
+    .label_count = 6,
     .categories = ei_classifier_inferencing_categories_1147290_1,
     .results_type = EI_CLASSIFIER_TYPE_CLASSIFICATION,
     .freeform_outputs_size = freeform_outputs_1147290_1_size,

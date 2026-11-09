@@ -88,26 +88,23 @@ bool ei_command_classify(const int16_t *audio_buffer, size_t num_samples,
                          float *out_confidence, const char **out_label) {
     if (audio_buffer == nullptr || num_samples == 0) return false;
 
-    // Chuẩn hóa đỉnh âm thanh (Peak Normalization) khớp với dữ liệu huấn luyện Studio (Target ~24,000)
+    // Chuẩn hóa đỉnh âm thanh (Peak Normalization) khớp 100% với dữ liệu huấn luyện dataset_recorder_main.c (Target Peak = 24500, Max Gain = 14.0x)
     int16_t max_peak = 0;
     for (size_t i = 0; i < num_samples; i++) {
         int16_t abs_v = abs(audio_buffer[i]);
         if (abs_v > max_peak) max_peak = abs_v;
     }
 
-    // Chuẩn hóa đỉnh âm thanh thông minh (Target Peak Normalization ~24,000)
-    // Giúp mạng nơ-ron INT8 lượng tử hóa đạt dải động tối ưu (tránh suy biến về 'unknown')
-    // Giới hạn dải Gain an toàn từ 1.0x đến 10.0x (+20dB) kèm Soft Limiter (-30000 -> +30000)
-    float target_peak = 24000.0f;
-    if (max_peak > 600) {
-        s_command_gain = target_peak / (float)max_peak;
-        if (s_command_gain > 10.0f) s_command_gain = 10.0f;
+    const int16_t TARGET_PEAK = 24500;
+    if (max_peak > 150) {
+        s_command_gain = (float)TARGET_PEAK / (float)max_peak;
+        if (s_command_gain > 14.0f) s_command_gain = 14.0f; // Giới hạn khuếch đại tối đa x14.0 (+23 dB) giống dataset_recorder
         if (s_command_gain < 1.0f) s_command_gain = 1.0f;
     } else {
-        s_command_gain = 4.0f;
+        s_command_gain = 4.0f; // Mức cơ sở khi im lặng / sàn ồn
     }
 
-    ESP_LOGI(TAG, "[COMMAND GAIN] Peak: %d (x%.2f = %d, Target ~24000, Soft Limit 30000)", 
+    ESP_LOGI(TAG, "[COMMAND AUTO-GAIN] RawPeak: %d, Gain: x%.2f -> BoostedPeak: %d (Target ~24500, Max x14.0)", 
              max_peak, s_command_gain, (int)(max_peak * s_command_gain));
 
     s_raw_audio_ptr = audio_buffer;
@@ -131,31 +128,45 @@ bool ei_command_classify(const int16_t *audio_buffer, size_t num_samples,
 
     float max_score = 0.0f;
     const char *best_label = "unknown";
+    float score_bat_cong_tac = 0.0f;
+    float score_bat_den = 0.0f;
+    float score_noise = 0.0f;
+    float score_tat_cong_tac = 0.0f;
+    float score_tat_den = 0.0f;
+    float score_unknown = 0.0f;
 
-    char score_summary[128] = {0};
-    int off = 0;
     for (size_t i = 0; i < ModelCommand::ei_default_impulse.impulse->label_count; i++) {
         float val = result.classification[i].value;
         const char *lbl = result.classification[i].label;
 
+        if (strcmp(lbl, "bat_cong_tac") == 0) score_bat_cong_tac = val;
+        else if (strcmp(lbl, "bat_den") == 0) score_bat_den = val;
+        else if (strcmp(lbl, "noise") == 0) score_noise = val;
+        else if (strcmp(lbl, "tat_cong_tac") == 0) score_tat_cong_tac = val;
+        else if (strcmp(lbl, "tat_den") == 0) score_tat_den = val;
+        else if (strcmp(lbl, "unknown") == 0) score_unknown = val;
+
         if (val > max_score) {
             max_score = val;
             best_label = lbl;
-        }
-
-        if (val >= 0.05f && off < (int)sizeof(score_summary) - 25) {
-            off += snprintf(score_summary + off, sizeof(score_summary) - off, " %s:%.1f%%", lbl, val * 100.0f);
         }
     }
 
     if (out_confidence) *out_confidence = max_score;
     if (out_label) *out_label = best_label;
 
-    ESP_LOGI(TAG, ">>> [EVAL COMMAND] Best: '%s' (%.1f%%) | Detail:%s | DSP: %dms, NN: %dms <<<",
-             best_label, max_score * 100.0f, score_summary, result.timing.dsp, result.timing.classification);
+    ESP_LOGI(TAG, ">>> [CMD_EVAL] bat_den: %.1f%% | tat_den: %.1f%% | bat_cong_tac: %.1f%% | tat_cong_tac: %.1f%% | unknown: %.1f%% | noise: %.1f%% (DSP: %dms, NN: %dms) <<<",
+             score_bat_den * 100.0f, score_tat_den * 100.0f,
+             score_bat_cong_tac * 100.0f, score_tat_cong_tac * 100.0f,
+             score_unknown * 100.0f, score_noise * 100.0f,
+             result.timing.dsp, result.timing.classification);
 
     bool is_command = is_valid_local_command(best_label);
-    if (is_command && max_score >= EI_COMMAND_THRESHOLD) {
+    bool meets_threshold = (max_score >= EI_COMMAND_THRESHOLD);
+    bool beats_unknown = ((max_score - score_unknown) >= EI_COMMAND_MARGIN_UNKNOWN);
+    bool beats_noise = ((max_score - score_noise) >= EI_COMMAND_MARGIN_UNKNOWN);
+
+    if (is_command && meets_threshold && beats_unknown && beats_noise) {
         return true;
     }
 

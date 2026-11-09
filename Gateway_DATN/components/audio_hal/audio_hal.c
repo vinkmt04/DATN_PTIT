@@ -106,9 +106,12 @@ static void audio_playback_task(void *arg) {
                     i2s_channel_write(tx_handle, s_silence_buf, sizeof(s_silence_buf), &written, 0);
                 }
 
-                // Sau khi phát xong chuông Ding gọn (~240ms): đệm 30ms âm lặng là xác nhận xong chuông Ding
-                if (s_is_wake_sound_playing && idle_time_ms >= 30) {
-                    s_is_wake_sound_playing = false; // Chuông Ding đã ngân xong hoàn toàn!
+                // Sau khi phát xong chuông Ding: chỉ reset cờ khi đã trôi qua đủ thời gian vật lý (>= 500ms = 450ms Ding + 50ms tiêu âm)
+                if (s_is_wake_sound_playing && idle_time_ms >= 50) {
+                    TickType_t elapsed_ticks = xTaskGetTickCount() - s_wake_sound_start_tick;
+                    if ((elapsed_ticks * portTICK_PERIOD_MS) >= 500) {
+                        s_is_wake_sound_playing = false;
+                    }
                 }
 
                 if (idle_time_ms >= 400 && !s_idle_notified) {
@@ -348,10 +351,7 @@ int audio_vad_get_noise_floor(void) {
 bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms) {
     if (!buffer || num_samples == 0) return false;
 
-    // 1. Áp dụng bộ lọc Biquad High-Pass bậc 2 (~90Hz) để triệt tiêu DC bias và tiếng ù quạt/rung chấn
-    audio_hal_apply_dc_filter(buffer, num_samples);
-
-    // 2. Tính RMS năng lượng âm thanh sạch sau lọc
+    // 1. Tính RMS năng lượng âm thanh sạch (buffer đã được lọc DC trước khi truyền vào)
     int rms = audio_vad_get_rms(buffer, num_samples);
     if (out_rms) *out_rms = rms;
 
@@ -410,11 +410,16 @@ void audio_hal_play_wake_sound(void) {
 }
 
 bool audio_hal_is_wake_recording_ready(void) {
-    if (!s_is_wake_sound_playing) return true;
+    if (!s_is_wake_sound_playing && (s_wake_sound_start_tick == 0)) return true;
     TickType_t elapsed_ticks = xTaskGetTickCount() - s_wake_sound_start_tick;
     uint32_t elapsed_ms = (uint32_t)(elapsed_ticks * portTICK_PERIOD_MS);
-    uint32_t total_ding_ms = (wake_sound_len * 1000) / (24000 * sizeof(int16_t));
-    return (elapsed_ms >= total_ding_ms + 50); // Đợi dứt chuông 100% + 50ms tiêu âm phòng
+    const uint32_t total_wait_ms = 500; // 450ms Ding dứt trọn vẹn + 50ms tiêu âm phòng tuyệt đối
+    if (elapsed_ms < total_wait_ms) {
+        return false;
+    }
+    s_is_wake_sound_playing = false;
+    s_wake_sound_start_tick = 0;
+    return true;
 }
 
 void audio_hal_flush_rx(void) {

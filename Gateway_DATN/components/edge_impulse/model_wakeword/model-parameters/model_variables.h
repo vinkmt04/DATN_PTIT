@@ -49,7 +49,7 @@
 
 namespace ModelWakeWord {
 
-const char* ei_classifier_inferencing_categories_1142431_1[] = { "hey_cherry", "noise", "unknown" };
+const char* ei_classifier_inferencing_categories_1142431_1[] = { "hey_cherry", "noise", "similar", "unknown" };
 
 ei_dsp_named_axis_t ei_dsp_config_1142431_2_named_axes[] = {
     { .name = "Signal", .axis = 0 }
@@ -63,14 +63,14 @@ ei_dsp_config_mfcc_t ei_dsp_config_1142431_2 = {
     1, // int length of axes
     ei_dsp_config_1142431_2_named_axes, // named axes
     ei_dsp_config_1142431_2_named_axes_size, // size of the named axes array
-    13, // int num_cepstral
+    16, // int num_cepstral
     0.02f, // float frame_length
-    0.02f, // float frame_stride
+    0.015f, // float frame_stride
     32, // int num_filters
     256, // int fft_length
     101, // int win_size
     80, // int low_frequency
-    7600, // int high_frequency
+    0, // int high_frequency
     0.98f, // float pre_cof
     1 // int pre_shift
 };
@@ -79,7 +79,7 @@ const uint8_t ei_dsp_blocks_1142431_1_size = 1;
 ei_model_dsp_t ei_dsp_blocks_1142431_1[ei_dsp_blocks_1142431_1_size] = {
     { // DSP block 2
         2,
-        650, // output size
+        1056, // output size
         &extract_mfcc_features, // DSP function pointer
         (void*)&ei_dsp_config_1142431_2, // pointer to config struct
         ei_dsp_config_1142431_2_axes, // array of offsets into the input stream, one for each axis
@@ -154,9 +154,9 @@ const ei_impulse_t impulse_1142431_1 = {
     .project_name = "heycherry",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 2,
+    .deploy_version = 9,
 
-    .nn_input_frame_size = 650,
+    .nn_input_frame_size = 1056,
     .raw_sample_count = 16000,
     .raw_samples_per_frame = 1,
     .dsp_input_frame_size = 16000 * 1,
@@ -185,7 +185,7 @@ const ei_impulse_t impulse_1142431_1 = {
     .slices_per_model_window = 4,
 
     .has_anomaly = EI_ANOMALY_TYPE_UNKNOWN,
-    .label_count = 3,
+    .label_count = 4,
     .categories = ei_classifier_inferencing_categories_1142431_1,
     .results_type = EI_CLASSIFIER_TYPE_CLASSIFICATION,
     .freeform_outputs_size = freeform_outputs_1142431_1_size,
@@ -198,7 +198,6 @@ ei_impulse_handle_t& ei_default_impulse = impulse_handle_1142431_1;
 constexpr auto& ei_classifier_inferencing_categories = ei_classifier_inferencing_categories_1142431_1;
 const auto ei_dsp_blocks_size = ei_dsp_blocks_1142431_1_size;
 ei_model_dsp_t *ei_dsp_blocks = ei_dsp_blocks_1142431_1;
-
 } // namespace ModelWakeWord
 
 #endif // _EI_CLASSIFIER_MODEL_VARIABLES_WAKEWORD_H_

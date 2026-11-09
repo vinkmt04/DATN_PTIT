@@ -62,6 +62,7 @@ idf_component_register(
 
 target_compile_options(${COMPONENT_LIB} PRIVATE 
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17 -fno-rtti>
+    -O3
     -w
 )
 target_compile_definitions(${COMPONENT_LIB} PUBLIC 

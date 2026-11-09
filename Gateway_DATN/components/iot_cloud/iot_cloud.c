@@ -4,6 +4,7 @@
 #include "cJSON.h"
 #include "mesh_controller.h"
 #include "gateway_state_manager.h"
+#include "ai_cloud.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -198,7 +199,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 static void telemetry_periodic_task(void *arg) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(THINGSBOARD_TELEMETRY_PERIOD_S * 1000));
-        if (s_is_connected) {
+        // Chỉ đẩy bản tin định kỳ khi không có lượt hội thoại AI nào đang diễn ra,
+        // nhằm ưu tiên 100% băng thông Wi-Fi và CPU Core 0 cho luồng âm thanh thời gian thực.
+        if (s_is_connected && !ai_cloud_is_busy()) {
             iot_cloud_publish_telemetry_now();
         }
     }

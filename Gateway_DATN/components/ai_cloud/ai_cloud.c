@@ -37,6 +37,7 @@ static unsigned char *s_rx_pcm_buf = NULL;
 #define RESPONSE_TIMEOUT_MS  8000   // Chờ phản hồi đầu tiên từ Gemini: 8s
 #define CHUNK_TIMEOUT_MS     5000   // Chờ chunk tiếp theo giữa chừng: 5s (phản ứng nhanh khi cloud ngừng cấp audio)
 #define WS_KEEP_ALIVE_TIMEOUT_MS 15000 // Giữ kết nối ngầm 15 giây (Keep-Alive Idle Pool)
+#define WS_RECONNECT_COOLDOWN_MS 300   // Cooldown kết nối lại 300ms (đủ cho lwIP TCP socket teardown, không chặn câu lệnh liên tiếp)
 
 typedef enum {
     AI_STATE_IDLE = 0,
@@ -376,31 +377,6 @@ static void parse_server_message(const char *json_string) {
         if (s_session_timer) {
             xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(3000), 0);
             xTimerStart(s_session_timer, 0);
-        }
-    }
-
-    // 4.2 Trích xuất mã lệnh điều khiển Thread Mesh (<CMD:...> hoặc CMD:...) gửi tới ESP32-H2 (Dự phòng Fallback)
-    if (!s_cmd_dispatched_in_turn) {
-        const char *cmd_start = strstr(json_string, "CMD:");
-        if (cmd_start) {
-            if (cmd_start > json_string && *(cmd_start - 1) == '<') {
-                cmd_start--;
-            }
-            const char *p = cmd_start;
-            while (*p && *p != '>' && *p != '\"' && *p != '\n' && *p != '\r' && *p != ' ' && *p != '\\') {
-                p++;
-            }
-            if (*p == '>') p++;
-            size_t cmd_len = p - cmd_start;
-            if (cmd_len > 4 && cmd_len < 64) {
-                char clean_cmd[64];
-                memcpy(clean_cmd, cmd_start, cmd_len);
-                clean_cmd[cmd_len] = '\0';
-                s_cmd_dispatched_in_turn = true;
-                s_mute_response_audio = true;
-                ESP_LOGW(TAG, ">>> [THREAD MESH GATEWAY] Dispatching command to ESP32-H2: %s <<<", clean_cmd);
-                mesh_controller_send_command(clean_cmd);
-            }
         }
     }
 
@@ -765,6 +741,17 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                     reason_buf[rlen] = '\0';
                 }
             }
+
+            // Chốt chặn RFC 6455 (WebSocket Framing Guard):
+            // Các mã đóng hợp lệ theo chuẩn quốc tế chỉ nằm trong dải 1000 - 4999 (1000-1015 chuẩn, 3000-4999 app).
+            // Nếu close_code ngoài dải này (ví dụ 21575 = 0x5447 'TG'), đây chắc chắn là lỗi lệch khung (Frame Desync)
+            // do driver đọc nhầm chuỗi Base64 thành Header -> Bỏ qua ngay, TUYỆT ĐỐI không ngắt kết nối và không kêu lỗi!
+            if (close_code < 1000 || close_code > 4999) {
+                ESP_LOGW(TAG, "Bỏ qua WebSocket CLOSE Frame giả mạo do lệch khung (Invalid Code: %u, Raw: '%s')",
+                         close_code, reason_buf);
+                break;
+            }
+
             ESP_LOGE(TAG, ">>> WS CLOSE FRAME from Google: Code %u | Reason: '%s' <<<", close_code, reason_buf);
             s_is_ws_connected = false;
             s_is_ws_connecting = false;
@@ -861,7 +848,7 @@ static void cloud_tx_task(void *arg) {
                     audio_hal_play_error_sound();
                 }
                 if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    if (ws_client) {
+                    if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
                         s_is_ws_stopping = true;
                         esp_websocket_client_stop(ws_client);
                         s_is_ws_stopping = false;
@@ -892,7 +879,7 @@ static void cloud_tx_task(void *arg) {
                         audio_hal_play_error_sound();
                     }
                     if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                        if (ws_client) {
+                        if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
                             s_is_ws_stopping = true;
                             esp_websocket_client_stop(ws_client);
                             s_is_ws_stopping = false;
@@ -924,7 +911,7 @@ static void cloud_tx_task(void *arg) {
                     }
                 }
                 if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    if (ws_client) {
+                    if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
                         s_is_ws_stopping = true;
                         esp_websocket_client_stop(ws_client);
                         s_is_ws_stopping = false;
@@ -943,7 +930,7 @@ static void cloud_tx_task(void *arg) {
                 if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
                     ESP_LOGI(TAG, ">>> [KEEP-ALIVE EXPIRED] Hết 15s không có câu lệnh mới -> Đóng WebSocket an toàn từ Worker Task. <<<");
                     if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                        if (ws_client) {
+                        if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
                             s_is_ws_stopping = true;
                             esp_websocket_client_stop(ws_client);
                             s_is_ws_stopping = false;
@@ -995,6 +982,12 @@ static void cloud_tx_task(void *arg) {
             while ((!s_is_ws_connected || !s_setup_complete) && 
                    wait_ticks < 50 && 
                    (s_current_state == AI_STATE_RECORDING || s_turn_ending)) {
+                // [ACTIVE RETRY]: Nếu chưa kết nối và chưa trong tiến trình connecting (ví dụ vừa thoát Cooldown 300ms)
+                // -> Tự động phát động kết nối lại ngay lập tức!
+                if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping) {
+                    ai_cloud_prewarm_session();
+                }
+
                 // Kiểm tra notification trong lúc chờ (ví dụ nếu có CANCEL/ABORT trong lúc chờ kết nối)
                 uint32_t wait_bits = 0;
                 if (xTaskNotifyWait(0, 0xFFFFFFFF, &wait_bits, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1002,6 +995,9 @@ static void cloud_tx_task(void *arg) {
                         s_current_state = AI_STATE_IDLE;
                         s_turn_ending = false;
                         break;
+                    }
+                    if (wait_bits & CLOUD_EVT_END_TURN) {
+                        s_turn_ending = true;
                     }
                 }
                 wait_ticks++;
@@ -1132,15 +1128,15 @@ void ai_cloud_prewarm_session(void) {
         return;
     }
 
-    // Rate-limit backoff: Chờ tối thiểu 2.0s sau khi đứt kết nối / hủy trước khi cho phép kết nối lại
+    // Rate-limit backoff: Chờ tối thiểu 300ms sau khi đứt kết nối / hủy trước khi cho phép kết nối lại (đủ giải phóng socket cũ)
     uint32_t now = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (s_last_disconnect_time_ms > 0 && (now - s_last_disconnect_time_ms < 2000)) {
+    if (s_last_disconnect_time_ms > 0 && (now - s_last_disconnect_time_ms < WS_RECONNECT_COOLDOWN_MS)) {
         ESP_LOGD(TAG, "WebSocket reconnect cooldown active (%lu ms remaining)...",
-                 (unsigned long)(2000 - (now - s_last_disconnect_time_ms)));
+                 (unsigned long)(WS_RECONNECT_COOLDOWN_MS - (now - s_last_disconnect_time_ms)));
         return;
     }
 
-    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (ws_client == NULL) {
             ESP_LOGI(TAG, "Initializing WebSocket connection to Gemini Live...");
             esp_websocket_client_config_t websocket_cfg = {
@@ -1151,7 +1147,7 @@ void ai_cloud_prewarm_session(void) {
                 .task_core_id_set = true,
                 .task_core_id = 0,    // Ghim luồng WebSocket cố định vào Core 0 (Nhân Mạng)
                 .task_prio = 5,
-                .network_timeout_ms = 10000,
+                .network_timeout_ms = 10000, // 10s: Chống timeout giả khi AI suy nghĩ câu dài hoặc Wi-Fi gom gói chậm
                 .reconnect_timeout_ms = 0,
                 .disable_auto_reconnect = true,
             };
