@@ -286,6 +286,11 @@ void audio_hal_apply_dc_filter(int16_t *buffer, size_t num_samples) {
     s_biquad_w2 = w2;
 }
 
+void audio_hal_reset_dc_filter(void) {
+    s_biquad_w1 = 0.0f;
+    s_biquad_w2 = 0.0f;
+}
+
 int audio_vad_get_rms(const int16_t *buffer, size_t num_samples) {
     if (num_samples == 0) return 0;
     
@@ -413,7 +418,7 @@ bool audio_hal_is_wake_recording_ready(void) {
     if (!s_is_wake_sound_playing && (s_wake_sound_start_tick == 0)) return true;
     TickType_t elapsed_ticks = xTaskGetTickCount() - s_wake_sound_start_tick;
     uint32_t elapsed_ms = (uint32_t)(elapsed_ticks * portTICK_PERIOD_MS);
-    const uint32_t total_wait_ms = 500; // 450ms Ding dứt trọn vẹn + 50ms tiêu âm phòng tuyệt đối
+    const uint32_t total_wait_ms = 480; // 450ms Ding dứt trọn vẹn + 30ms tiêu âm phòng tối thiểu
     if (elapsed_ms < total_wait_ms) {
         return false;
     }

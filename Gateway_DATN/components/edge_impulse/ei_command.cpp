@@ -89,10 +89,22 @@ bool ei_command_classify(const int16_t *audio_buffer, size_t num_samples,
     if (audio_buffer == nullptr || num_samples == 0) return false;
 
     // Chuẩn hóa đỉnh âm thanh (Peak Normalization) khớp 100% với dữ liệu huấn luyện dataset_recorder_main.c (Target Peak = 24500, Max Gain = 14.0x)
+    // Áp dụng lọc 3-point median để loại bỏ 100% gai nhiễu điện tử click/pop đơn lẻ, phản ánh đúng đỉnh giọng nói
     int16_t max_peak = 0;
-    for (size_t i = 0; i < num_samples; i++) {
-        int16_t abs_v = abs(audio_buffer[i]);
-        if (abs_v > max_peak) max_peak = abs_v;
+    if (num_samples >= 3) {
+        for (size_t i = 1; i < num_samples - 1; i++) {
+            int16_t v0 = abs(audio_buffer[i - 1]);
+            int16_t v1 = abs(audio_buffer[i]);
+            int16_t v2 = abs(audio_buffer[i + 1]);
+            int16_t med = (v0 < v1) ? ((v1 < v2) ? v1 : ((v0 < v2) ? v2 : v0))
+                                    : ((v0 < v2) ? v0 : ((v1 < v2) ? v2 : v1));
+            if (med > max_peak) max_peak = med;
+        }
+    } else {
+        for (size_t i = 0; i < num_samples; i++) {
+            int16_t abs_v = abs(audio_buffer[i]);
+            if (abs_v > max_peak) max_peak = abs_v;
+        }
     }
 
     const int16_t TARGET_PEAK = 24500;

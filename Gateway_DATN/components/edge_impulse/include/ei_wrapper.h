@@ -19,9 +19,9 @@ extern "C" {
 #define EI_WAKEWORD_AVERAGE_THRESHOLD      0.68f   // Điểm trung bình 2 lát liên tiếp >= 500ms (68.0% - Chặn đứng 'Hey Siri' 61.1%)
 #define EI_WAKEWORD_DUAL_MARGIN            0.35f   // Cách biệt tối thiểu với similar ở nhịp 2 (35.0%)
 #define EI_WAKEWORD_SIMILAR_MAX            0.10f   // Giới hạn trần similar khi chốt nhịp 2 (10.0% - Chặn từ bẫy đồng âm)
-#define EI_WAKEWORD_VETO_SIMILAR_THRESH    0.60f   // Ngưỡng kích hoạt Veto Lockout khi similar >= 60%
-#define EI_WAKEWORD_VETO_CHERRY_CEIL       0.25f   // Ngưỡng trần cherry < 25% để xác nhận chắc chắn là từ bẫy similar
-#define EI_WAKEWORD_VETO_DURATION_MS       500     // Khóa Veto 500ms (chặn 2 chu kỳ trượt 250ms tiếp theo)
+#define EI_WAKEWORD_VETO_SIMILAR_THRESH    0.38f   // Ngưỡng kích hoạt Veto Lockout khi similar >= 38%
+#define EI_WAKEWORD_VETO_CHERRY_CEIL       0.40f   // Ngưỡng trần cherry < 40% để xác nhận từ bẫy similar
+#define EI_WAKEWORD_VETO_DURATION_MS       650     // Khóa Veto 650ms (chặn triệt để chu kỳ trượt tiếp theo)
 
 bool ei_wakeword_init(void);
 void ei_wakeword_reset(void);
@@ -30,7 +30,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
                                float *out_confidence, const char **out_label);
 
 // ==========================================
-// 2. COMMAND CONTROL (6 Lệnh - Buffer RAM 1.5s, Quét 2 Lát Cắt Trong Bộ Nhớ)
+// 2. COMMAND CONTROL (6 Lệnh - Buffer RAM 1.5s, Căn Tâm Năng Lượng & Quét 3 Lát Cắt)
 // Nhãn: bat_cong_tac, bat_den, noise, tat_cong_tac, tat_den, unknown
 // ==========================================
 #define EI_COMMAND_WINDOW_SAMPLES          19200   // 1.2 giây @ 16kHz (Window size của Model 2)

@@ -97,9 +97,9 @@ static void audio_recording_task(void *arg) {
     int16_t *cmd_audio_buffer = (int16_t *)heap_caps_malloc(EI_COMMAND_BUFFER_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (!cmd_audio_buffer) cmd_audio_buffer = (int16_t *)malloc(EI_COMMAND_BUFFER_SAMPLES * sizeof(int16_t));
 
-    // 6. Buffer Pre-roll 180ms (3 chunks * 60ms = 2880 samples) lùi vừa khít giữ trọn vẹn phụ âm đầu ("b...", "t...")
-    // Cấp phát trong PSRAM để giải phóng DMA Internal SRAM cho mbedtls/esp-sha
-    #define PREROLL_CHUNKS 3
+    // 6. Buffer Pre-roll 300ms (5 chunks * 60ms = 4800 samples) lùi giữ trọn vẹn phụ âm đầu ("b...", "t...")
+    // Khớp 100% với khoảng lặng 250-300ms của thuật toán Edge Impulse Split khi cắt tập huấn luyện
+    #define PREROLL_CHUNKS 5
     #define PREROLL_BUFFER_SIZE (PREROLL_CHUNKS * STREAM_CHUNK_SAMPLES * sizeof(int16_t))
     int16_t (*s_preroll_buffer)[STREAM_CHUNK_SAMPLES] = (int16_t (*)[STREAM_CHUNK_SAMPLES])heap_caps_malloc(PREROLL_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_preroll_buffer) {
@@ -131,7 +131,7 @@ static void audio_recording_task(void *arg) {
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, " HỆ THỐNG LẮNG NGHE ĐÃ SẴN SÀNG (HYBRID DUAL-MODEL)!");
     ESP_LOGI(TAG, " - Wake Word: 'Hey Cherry' (Continuous 250ms)");
-    ESP_LOGI(TAG, " - Command Control: 6 Smart Home Labels (1.5s Buffer, 2-Slice In-Memory Scan)");
+    ESP_LOGI(TAG, " - Command Control: 6 Smart Home Labels (1.5s Buffer, 3-Slice Energy-Centered Scan)");
     ESP_LOGI(TAG, " - Cloud AI: Google Gemini Live API Streaming");
     ESP_LOGI(TAG, "==================================================");
 
@@ -223,17 +223,18 @@ static void audio_recording_task(void *arg) {
                         break; // Đang trong thời gian phát chuông Ding: đọc xả DMA để mic không dính tiếng chuông
                     }
 
-                    // Ngay khi chuông Ding vừa dứt: xả sạch DMA RX một lần duy nhất để bảo đảm dữ liệu tươi mới
+                    // Ngay khi chuông Ding vừa dứt: xả sạch DMA RX và reset bộ lọc DC để bảo đảm dữ liệu tươi mới
                     if (!wake_dma_flushed) {
                         wake_dma_flushed = true;
                         audio_hal_flush_rx();
+                        audio_hal_reset_dc_filter();
                         audio_vad_reset_trigger();
                         preroll_count = 0;
                         preroll_idx = 0;
                         if (s_preroll_buffer) {
                             memset(s_preroll_buffer, 0, PREROLL_BUFFER_SIZE);
                         }
-                        ESP_LOGI(TAG, ">>> [RECORDING OPEN] Chuông Ding đã dứt 100%% (+150ms tiêu âm phòng, xả DMA RX) -> Bắt đầu thu âm câu lệnh! <<<");
+                        ESP_LOGI(TAG, ">>> [RECORDING OPEN] Chuông Ding đã dứt (+30ms tiêu âm phòng, xả DMA RX & DC Filter) -> Bắt đầu thu âm câu lệnh! <<<");
                         break;
                     }
 
@@ -311,69 +312,121 @@ static void audio_recording_task(void *arg) {
                         }
                     }
 
-                    // 5. QUÉT 2 LÁT CẮT TRÊN BỘ NHỚ RAM (2-SLICE IN-MEMORY SCAN VỚI EARLY EXIT)
+                    // 5. CĂN TÂM NĂNG LƯỢNG (ENERGY CENTER-ALIGNMENT) & QUÉT 3 LÁT CẮT TRÊN RAM (3-SLICE SCAN VỚI EARLY EXIT)
                     if (cmd_inference_count == 0 && cmd_samples_from_speech >= EI_COMMAND_BUFFER_SAMPLES) {
                         cmd_inference_count = 1;
-                        float conf = 0.0f;
-                        const char *lbl = NULL;
 
-                        // Lát cắt 1: [0ms -> 1200ms] (cmd_audio_buffer[0 ... 19199])
-                        ESP_LOGI(TAG, ">>> [MODEL 2 - IN-MEMORY SLICE 1/2] Đủ 1.5s vào RAM -> Quét Lát 1 (0.0s - 1.2s)! <<<");
-                        bool match = ei_command_classify(&cmd_audio_buffer[0], EI_COMMAND_WINDOW_SAMPLES, &conf, &lbl);
+                        // Bước 1: Quét 25 chunks (mỗi chunk 960 mẫu = 60ms) để xác định vị trí câu lệnh thực sự trong 24.000 mẫu
+                        int floor_noise = audio_dsp_get_ambient_noise();
+                        int min_thresh = (int)(floor_noise * 2.2f);
+                        if (min_thresh < 55) min_thresh = 55;
 
-                        if (match && is_command_device_enabled(lbl)) {
-                            ESP_LOGW(TAG, "==================================================");
-                            ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS - SLICE 1/2 (EARLY EXIT)]: '%s' (Confidence: %.1f%%) <<<",
-                                     lbl, conf * 100.0f);
-                            ESP_LOGW(TAG, "==================================================");
-                            dispatch_local_mesh_command(lbl);
-#if DEBUG_LOCAL_TEST_MODE
-                            ESP_LOGW(TAG, ">>> [LOCAL TEST] Khớp lệnh '%s'! Phát lại âm thanh vừa thu ra loa <<<", lbl);
-                            audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
-                            vTaskDelay(pdMS_TO_TICKS(cmd_samples_from_speech * 1000 / 16000 + 200));
-                            audio_hal_flush_rx();
-#endif
-                            ai_cloud_cancel_turn();
-                            ei_wakeword_reset();
-                            idle_slice_counter = 0;
-                            s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
-                            break;
-                        } else if (match) {
-                            ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Bỏ qua lệnh cục bộ <<<",
-                                     lbl ? lbl : "none", conf * 100.0f);
+                        int first_speech_chunk = -1;
+                        int last_speech_chunk = -1;
+
+                        for (int k = 0; k < 25; k++) {
+                            int c_rms = audio_vad_get_rms(&cmd_audio_buffer[k * STREAM_CHUNK_SAMPLES], STREAM_CHUNK_SAMPLES);
+                            if (c_rms >= min_thresh) {
+                                if (first_speech_chunk == -1) first_speech_chunk = k;
+                                last_speech_chunk = k;
+                            }
                         }
 
-                        // Lát cắt 2: [300ms -> 1500ms] (cmd_audio_buffer[4800 ... 23999])
-                        ESP_LOGI(TAG, ">>> [MODEL 2 - IN-MEMORY SLICE 2/2] Lát 1 không khớp -> Quét Lát 2 (0.3s - 1.5s)! <<<");
-                        match = ei_command_classify(&cmd_audio_buffer[EI_COMMAND_SLICE2_OFFSET], EI_COMMAND_WINDOW_SAMPLES, &conf, &lbl);
-
-                        if (match && is_command_device_enabled(lbl)) {
-                            ESP_LOGW(TAG, "==================================================");
-                            ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS - SLICE 2/2]: '%s' (Confidence: %.1f%%) <<<",
-                                     lbl, conf * 100.0f);
-                            ESP_LOGW(TAG, "==================================================");
-                            dispatch_local_mesh_command(lbl);
-#if DEBUG_LOCAL_TEST_MODE
-                            ESP_LOGW(TAG, ">>> [LOCAL TEST] Khớp lệnh '%s'! Phát lại âm thanh vừa thu ra loa <<<", lbl);
-                            audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
-                            vTaskDelay(pdMS_TO_TICKS(cmd_samples_from_speech * 1000 / 16000 + 200));
-                            audio_hal_flush_rx();
-#endif
-                            ai_cloud_cancel_turn();
-                            ei_wakeword_reset();
-                            idle_slice_counter = 0;
-                            s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
-                            break;
-                        } else if (match) {
-                            ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Bỏ qua lệnh cục bộ <<<",
-                                     lbl ? lbl : "none", conf * 100.0f);
+                        int speech_center_sample = 12000; // Mặc định ở chính giữa buffer 1.5s
+                        if (first_speech_chunk != -1 && last_speech_chunk >= first_speech_chunk) {
+                            int speech_start_sample = first_speech_chunk * STREAM_CHUNK_SAMPLES;
+                            int speech_end_sample = (last_speech_chunk + 1) * STREAM_CHUNK_SAMPLES;
+                            speech_center_sample = (speech_start_sample + speech_end_sample) / 2;
+                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Phát hiện câu lệnh từ sample %d -> %d (%dms -> %dms, tâm: %dms, RMS Thresh: %d) <<<",
+                                     speech_start_sample, speech_end_sample,
+                                     speech_start_sample / 16, speech_end_sample / 16,
+                                     speech_center_sample / 16, min_thresh);
+                        } else {
+                            // Fallback: Ước lượng câu nói bắt đầu sau Pre-roll 300ms (sample 4800)
+                            speech_center_sample = 4800 + (EI_COMMAND_WINDOW_SAMPLES / 2); // 4800 + 9600 = 14400 (900ms)
+                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Không xác định rõ tâm năng lượng -> Dùng tâm dự phòng %dms <<<",
+                                     speech_center_sample / 16);
                         }
 
-                        // Cả 2 lát cắt đều không khớp lệnh:
+                        // Căn tâm: Khung 19,200 mẫu (1.2s) có tâm là (best_offset + 9600) -> best_offset = speech_center_sample - 9600
+                        int best_offset = speech_center_sample - (EI_COMMAND_WINDOW_SAMPLES / 2);
+                        const int MAX_OFFSET = EI_COMMAND_BUFFER_SAMPLES - EI_COMMAND_WINDOW_SAMPLES; // 24000 - 19200 = 4800 (300ms)
+                        if (best_offset < 0) best_offset = 0;
+                        if (best_offset > MAX_OFFSET) best_offset = MAX_OFFSET;
+
+                        // Tính toán 3 lát cắt mịn trên RAM:
+                        // Lát 1: Centered Slice (căn tâm năng lượng chuẩn xác nhất theo thuật toán Edge Impulse Split)
+                        int slice1_offset = best_offset;
+
+                        // Lát 2: Dịch lùi -1600 mẫu (-100ms) quanh tâm để đón câu nói sớm
+                        int slice2_offset = best_offset - 1600;
+                        if (slice2_offset < 0) {
+                            slice2_offset = (best_offset + 1600 <= MAX_OFFSET) ? (best_offset + 1600) : 0;
+                        }
+
+                        // Lát 3: Dịch tiến +1600 mẫu (+100ms) hoặc offset 3600 để bắt trọn câu nói dài
+                        int slice3_offset = best_offset + 1600;
+                        if (slice3_offset > MAX_OFFSET) {
+                            slice3_offset = (slice2_offset != 0) ? 0 : MAX_OFFSET;
+                        }
+                        if (slice3_offset == slice1_offset || slice3_offset == slice2_offset) {
+                            if (slice1_offset != MAX_OFFSET && slice2_offset != MAX_OFFSET) slice3_offset = MAX_OFFSET;
+                            else if (slice1_offset != 0 && slice2_offset != 0) slice3_offset = 0;
+                            else slice3_offset = 2400;
+                        }
+
+                        int slice_offsets[3] = { slice1_offset, slice2_offset, slice3_offset };
+                        const char *slice_names[3] = { "1/3 - Centered", "2/3 - Left Shift", "3/3 - Right Shift" };
+
+                        bool command_matched = false;
+                        float last_conf = 0.0f;
+                        const char *last_lbl = "unknown";
+
+                        for (int s = 0; s < 3; s++) {
+                            int cur_offset = slice_offsets[s];
+                            float conf = 0.0f;
+                            const char *lbl = NULL;
+
+                            ESP_LOGI(TAG, ">>> [MODEL 2 - SLICE %s] Offset: %d samples (%dms -> %dms) <<<",
+                                     slice_names[s], cur_offset, cur_offset / 16, (cur_offset + EI_COMMAND_WINDOW_SAMPLES) / 16);
+
+                            bool match = ei_command_classify(&cmd_audio_buffer[cur_offset], EI_COMMAND_WINDOW_SAMPLES, &conf, &lbl);
+                            last_conf = conf;
+                            if (lbl) last_lbl = lbl;
+
+                            if (match && is_command_device_enabled(lbl)) {
+                                ESP_LOGW(TAG, "==================================================");
+                                ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS - SLICE %s (EARLY EXIT)]: '%s' (Confidence: %.1f%%) <<<",
+                                         slice_names[s], lbl, conf * 100.0f);
+                                ESP_LOGW(TAG, "==================================================");
+                                dispatch_local_mesh_command(lbl);
+#if DEBUG_LOCAL_TEST_MODE
+                                ESP_LOGW(TAG, ">>> [LOCAL TEST] Khớp lệnh '%s'! Phát lại âm thanh vừa thu ra loa <<<", lbl);
+                                audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
+                                vTaskDelay(pdMS_TO_TICKS(cmd_samples_from_speech * 1000 / 16000 + 200));
+                                audio_hal_flush_rx();
+#endif
+                                ai_cloud_cancel_turn();
+                                ei_wakeword_reset();
+                                idle_slice_counter = 0;
+                                s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                                command_matched = true;
+                                break;
+                            } else if (match) {
+                                ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Bỏ qua lệnh cục bộ <<<",
+                                         lbl ? lbl : "none", conf * 100.0f);
+                            }
+                        }
+
+                        if (command_matched) {
+                            break;
+                        }
+
+                        // Cả 3 lát cắt đều không khớp lệnh:
 #if DEBUG_LOCAL_TEST_MODE
                         ESP_LOGW(TAG, "==================================================");
-                        ESP_LOGW(TAG, ">>> [LOCAL TEST] Cả 2 lát cắt (1.2s & 1.5s) đều không khớp ('%s': %.1f%%) -> Phát lại trọn vẹn 1.5s ra loa <<<",
-                                 lbl ? lbl : "none", conf * 100.0f);
+                        ESP_LOGW(TAG, ">>> [LOCAL TEST] Cả 3 lát cắt đều không khớp ('%s': %.1f%%) -> Phát lại trọn vẹn 1.5s ra loa <<<",
+                                 last_lbl ? last_lbl : "none", last_conf * 100.0f);
                         ESP_LOGW(TAG, "==================================================");
                         audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
                         vTaskDelay(pdMS_TO_TICKS(cmd_samples_from_speech * 1000 / 16000 + 200));
@@ -385,8 +438,8 @@ static void audio_recording_task(void *arg) {
                         break;
 #else
                         // SMART NOISE GUARD: Nếu Model 2 xác nhận là tạp âm ('noise' >= 80%) và sau đó người dùng hoàn toàn im lặng
-                        if (lbl && strcmp(lbl, "noise") == 0 && conf >= 0.80f && command_silence_chunks >= STREAM_SILENCE_TARGET) {
-                            ESP_LOGW(TAG, ">>> [SMART NOISE GUARD] Tạp âm ngoại cảnh ('noise': %.1f%%) & người dùng không nói tiếp -> Hủy lượt êm! <<<", conf * 100.0f);
+                        if (last_lbl && strcmp(last_lbl, "noise") == 0 && last_conf >= 0.80f && command_silence_chunks >= STREAM_SILENCE_TARGET) {
+                            ESP_LOGW(TAG, ">>> [SMART NOISE GUARD] Tạp âm ngoại cảnh ('noise': %.1f%%) & người dùng không nói tiếp -> Hủy lượt êm! <<<", last_conf * 100.0f);
                             ai_cloud_cancel_turn();
                             ei_wakeword_reset();
                             idle_slice_counter = 0;
@@ -394,8 +447,8 @@ static void audio_recording_task(void *arg) {
                             break;
                         }
 
-                        ESP_LOGI(TAG, ">>> [HYBRID ROUTING] Model 2 không khớp sau 2 lát cắt ('%s': %.1f%%) -> Chuyển tiếp ngay sang Gemini Live! <<<",
-                                 lbl ? lbl : "none", conf * 100.0f);
+                        ESP_LOGI(TAG, ">>> [HYBRID ROUTING] Model 2 không khớp sau 3 lát cắt ('%s': %.1f%%) -> Chuyển tiếp ngay sang Gemini Live! <<<",
+                                 last_lbl ? last_lbl : "none", last_conf * 100.0f);
 
                         if (sys_core_is_wifi_connected()) {
                             if (command_silence_chunks >= STREAM_SILENCE_TARGET) {
