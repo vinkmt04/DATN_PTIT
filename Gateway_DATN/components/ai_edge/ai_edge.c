@@ -27,6 +27,7 @@ static const char *TAG = "ai_edge";
 static TaskHandle_t audio_task_handle = NULL;
 static TaskHandle_t button_task_handle = NULL;
 static volatile ai_edge_state_t s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+static volatile int s_responding_silent_cycles = 0;
 
 static bool is_command_device_enabled(const char *cmd_label) {
     if (!cmd_label) return false;
@@ -456,6 +457,7 @@ static void audio_recording_task(void *arg) {
                                          command_silence_chunks * 60);
                                 ei_wakeword_reset();
                                 ai_cloud_end_turn();
+                                s_responding_silent_cycles = 0;
                                 s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
                                 responding_log_counter = 0;
                             } else {
@@ -497,6 +499,7 @@ static void audio_recording_task(void *arg) {
                             if (sys_core_is_wifi_connected()) {
                                 ei_wakeword_reset();
                                 ai_cloud_end_turn();
+                                s_responding_silent_cycles = 0;
                                 s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
                                 responding_log_counter = 0;
                             } else {
@@ -559,6 +562,7 @@ static void audio_recording_task(void *arg) {
                         ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói (1.0s im lặng) -> Chốt câu hỏi lên Gemini Live <<<");
                         ei_wakeword_reset();
                         ai_cloud_end_turn();
+                        s_responding_silent_cycles = 0;
                         s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
                         responding_log_counter = 0;
                         break;
@@ -569,6 +573,7 @@ static void audio_recording_task(void *arg) {
                         ESP_LOGW(TAG, "Đã đạt giới hạn tối đa 15 giây -> Tự động kết thúc câu hỏi!");
                         ei_wakeword_reset();
                         ai_cloud_end_turn();
+                        s_responding_silent_cycles = 0;
                         s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
                         responding_log_counter = 0;
                         break;
@@ -583,16 +588,38 @@ static void audio_recording_task(void *arg) {
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
                 (void)bytes_read;
 
+                bool cloud_busy = ai_cloud_is_busy();
+                bool speaker_playing = audio_hal_is_playing();
+
                 responding_log_counter++;
                 if (responding_log_counter % 25 == 0) {
-                    ESP_LOGD(TAG, "[AI_RESPONDING] Đang chờ phản hồi & phát âm thanh... (Cloud bận: %d, Loa phát: %d)",
-                             ai_cloud_is_busy(), audio_hal_is_playing());
+                    ESP_LOGD(TAG, "[AI_RESPONDING] Đang chờ phản hồi & phát âm thanh... (Cloud bận: %d, Loa phát: %d, SilentCycles: %d)",
+                             cloud_busy, speaker_playing, s_responding_silent_cycles);
+                }
+
+                // Cầu chì an toàn lớp cuối: Nếu loa im lặng liên tục > 15.0 giây (250 chu kỳ * 60ms,
+                // lớn hơn thời gian xả TX + RESPONSE_TIMEOUT_MS 8s của ai_cloud) mà Cloud vẫn bận -> Giải phóng về IDLE!
+                if (speaker_playing) {
+                    s_responding_silent_cycles = 0;
+                } else if (cloud_busy) {
+                    s_responding_silent_cycles++;
+                    if (s_responding_silent_cycles >= 250) {
+                        ESP_LOGW(TAG, ">>> [AI_RESPONDING WATCHDOG] Loa im lặng liên tục > 15.0s nhưng Cloud vẫn bận -> Cưỡng bức đóng phiên về IDLE! <<<");
+                        s_responding_silent_cycles = 0;
+                        ai_cloud_stop_session();
+                        ei_wakeword_reset();
+                        idle_slice_counter = 0;
+                        wake_dma_flushed = false;
+                        s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                        break;
+                    }
                 }
 
                 // Kiểm tra khi cả Cloud đã trả lời xong VÀ loa đã xả hết âm thanh
-                // Chế độ 1 Hỏi - 1 Đáp (Single-Turn): Đóng phiên sạch sẽ & trở về chờ 'Hey Cherry' (Kháng 100% tiếng quạt gió & tạp âm)
-                if (!ai_cloud_is_busy() && !audio_hal_is_playing()) {
+                // Chế độ 1 Hỏi - 1 Đáp (Single-Turn): Đóng phiên sạch sẽ & trở về chờ 'Hey Cherry'
+                if (!cloud_busy && !speaker_playing) {
                     ESP_LOGI(TAG, ">>> [TURN COMPLETE] AI trả lời hoàn tất & loa đã nghỉ -> Trở về lắng nghe 'Hey Cherry' <<<");
+                    s_responding_silent_cycles = 0;
                     ai_cloud_stop_session();
                     ei_wakeword_reset();
                     idle_slice_counter = 0;
@@ -656,6 +683,7 @@ static void button_trigger_task(void *arg) {
                             ESP_LOGI(TAG, ">>> BOOT BUTTON CLICK: CHỐT CÂU LỆNH NGAY LẬP TỨC <<<");
                             ei_wakeword_reset();
                             ai_cloud_end_turn();
+                            s_responding_silent_cycles = 0;
                             s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
                             break;
                         }

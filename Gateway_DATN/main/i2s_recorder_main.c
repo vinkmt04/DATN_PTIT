@@ -183,9 +183,9 @@ void init_speaker(void) {
       .gpio_cfg =
           {
               .mclk = I2S_GPIO_UNUSED,
-              .bclk = 15, // Đã chọn GPIO 15 cho chân BCLK của MAX98357
-              .ws = 16,   // Đã chọn GPIO 16 cho chân LRC của MAX98357
-              .dout = 17, // Đã chọn GPIO 17 cho chân DIN của MAX98357
+              .bclk = 16, // Đã chọn GPIO 16 cho chân BCLK của MAX98357
+              .ws = 17,   // Đã chọn GPIO 17 cho chân LRC của MAX98357
+              .dout = 15, // Đã chọn GPIO 15 cho chân DIN của MAX98357
               .din = I2S_GPIO_UNUSED,
               .invert_flags =
                   {

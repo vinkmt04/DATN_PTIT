@@ -173,9 +173,9 @@ void audio_hal_init(void) {
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
-            .bclk = 15,
-            .ws = 16,
-            .dout = 17,
+            .bclk = 16,  // CLK / BCLK -> GPIO 16
+            .ws = 17,    // LRC        -> GPIO 17
+            .dout = 15,  // DIN        -> GPIO 15
             .din = I2S_GPIO_UNUSED,
             .invert_flags = {
                 .mclk_inv = false,
@@ -199,15 +199,23 @@ void audio_hal_init(void) {
     }
     
     // Tạo RingBuffer 2MB (2048KB) trong PSRAM chứa ~45 giây âm thanh 24kHz 16-bit hấp thụ trọn vẹn truyện dài
-    tx_ringbuf = xRingbufferCreateWithCaps(2048 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    // Dự phòng tối thiểu >= 320KB (chứa > 6.5 giây) để tuyệt đối không bao giờ block luồng WebSocket TCP/TLS
+    size_t rb_size = 2048 * 1024;
+    tx_ringbuf = xRingbufferCreateWithCaps(rb_size, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     if (tx_ringbuf == NULL) {
-        ESP_LOGW(TAG, "Failed to create 2MB PSRAM ringbuf. Fallback to 1MB...");
-        tx_ringbuf = xRingbufferCreateWithCaps(1024 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+        rb_size = 1024 * 1024;
+        ESP_LOGW(TAG, "Failed to create 2MB PSRAM ringbuf. Fallback to 1024KB...");
+        tx_ringbuf = xRingbufferCreateWithCaps(rb_size, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
+    }
+    if (tx_ringbuf == NULL) {
+        rb_size = 320 * 1024;
+        ESP_LOGW(TAG, "Failed to create 1024KB PSRAM ringbuf. Fallback to 320KB...");
+        tx_ringbuf = xRingbufferCreateWithCaps(rb_size, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
         if (tx_ringbuf == NULL) return;
     }
     xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 4096, NULL, 6, NULL, 1);
     
-    ESP_LOGI(TAG, "Speaker initialized with 2MB RingBuffer in PSRAM (~45s speech absorption).");
+    ESP_LOGI(TAG, "Speaker initialized with %uKB RingBuffer in PSRAM.", (unsigned int)(rb_size / 1024));
 
     // Khởi tạo Espressif WebRTC VAD với Trigger tích hợp (Phương án A)
     // Mode 3 (Very Aggressive), 16000Hz, frame 30ms, min_speech = 60ms (nhạy hơn, bắt âm sớm), min_noise = 600ms
@@ -241,13 +249,13 @@ size_t audio_hal_record_chunk(int16_t *buffer, size_t buffer_size_bytes) {
 size_t audio_hal_play_chunk(const uint8_t *buffer, size_t buffer_size_bytes) {
     if (tx_ringbuf == NULL) return 0;
     
-    // Timeout 50ms: Không bao giờ block lâu trong luồng WebSocket task (Core 0),
+    // Timeout 25ms: Trả quyền điều khiển cực nhanh cho luồng WebSocket task (Core 0),
     // ngăn chặn 100% nguy cơ treo stack TCP/TLS gây ngắt kết nối Wi-Fi (DELBA reason 39)
-    if (xRingbufferSend(tx_ringbuf, (void *)buffer, buffer_size_bytes, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xRingbufferSend(tx_ringbuf, (void *)buffer, buffer_size_bytes, pdMS_TO_TICKS(25)) == pdTRUE) {
         buffered_bytes += buffer_size_bytes;
         return buffer_size_bytes;
     } else {
-        ESP_LOGW(TAG, "Audio Ringbuffer (2MB) saturated, safely dropped %d bytes to protect TLS stack", buffer_size_bytes);
+        ESP_LOGW(TAG, "Audio Ringbuffer saturated, safely dropped %d bytes to protect TLS stack", (int)buffer_size_bytes);
         return 0;
     }
 }

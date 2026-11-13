@@ -55,6 +55,7 @@ typedef enum {
 #define CLOUD_EVT_KEEP_ALIVE_EXP   (1 << 3) // Hết hạn 15s Keep-Alive pool
 #define CLOUD_EVT_START_TURN       (1 << 4) // Bắt đầu lượt thu âm mới
 #define CLOUD_EVT_END_TURN         (1 << 5) // Dứt câu nói, xả hết audio để gửi activityEnd
+#define CLOUD_EVT_WS_CLEANUP       (1 << 6) // Đóng sạch WebSocket bị lỗi/lệch khung mà không cắt ngang Jitter Buffer loa
 
 static volatile ai_gateway_state_t s_current_state = AI_STATE_IDLE;
 static TimerHandle_t s_session_timer = NULL;
@@ -62,6 +63,7 @@ static TimerHandle_t s_keep_alive_timer = NULL;
 static SemaphoreHandle_t ws_mutex = NULL;
 
 static esp_websocket_client_handle_t ws_client = NULL;
+static volatile bool s_ws_task_active = false;
 static volatile bool s_is_ws_connected = false;
 static volatile bool s_is_ws_connecting = false;
 static volatile bool s_is_ws_stopping = false;
@@ -79,12 +81,67 @@ static volatile bool s_mute_response_audio = false;
 static RingbufHandle_t s_tx_audio_ringbuf = NULL;
 static TaskHandle_t s_tx_task_handle = NULL;
 
-static bool expecting_first_chunk = false;
+// RingBuffer RX JSON (RINGBUF_TYPE_NOSPLIT trong PSRAM) & Consumer Task trên Core 1:
+// Tách biệt hoàn toàn luồng đọc WebSocket TLS (Core 0) khỏi luồng parse JSON / decode Base64 PCM (Core 1).
+static RingbufHandle_t s_rx_json_ringbuf = NULL;
+static TaskHandle_t s_rx_task_handle = NULL;
+static volatile bool s_rx_flush_requested = false;
+
+static volatile bool expecting_first_chunk = false;
 
 void ai_cloud_abort(void) {
     ESP_LOGW(TAG, "ai_cloud_abort() requested -> Notifying worker task...");
     if (s_tx_task_handle) {
         xTaskNotify(s_tx_task_handle, CLOUD_EVT_ABORT, eSetBits);
+    }
+}
+
+// Cầu chì phục hồi khi WebSocket đứt đột ngột / lệch khung:
+// - Hạ ngay cờ bận (s_current_state = AI_STATE_IDLE) để ai_edge không bao giờ bị treo ở AI_RESPONDING
+// - Nếu đang trong pha SPEAKING: cho phép audio_hal phát hết nốt phần âm thanh còn trong Jitter Buffer (không ngắt ngang)
+static void recover_from_ws_failure(const char *reason, bool force_close_socket) {
+    s_is_ws_connected = false;
+    s_is_ws_connecting = false;
+    s_setup_complete = false;
+    s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    if (xTaskGetCurrentTaskHandle() != s_rx_task_handle) {
+        s_ws_rx_len = 0;
+    }
+    s_rx_flush_requested = true;
+
+    if (s_current_state == AI_STATE_SPEAKING) {
+        ESP_LOGW(TAG, ">>> [WS RECOVERY] %s khi đang phát loa -> Hạ cờ bận ngay để phát hết Jitter Buffer & về IDLE! <<<", reason);
+        bool was_muted = s_mute_response_audio;
+        s_current_state = AI_STATE_IDLE;
+        s_turn_ending = false;
+        s_need_send_activity_start = false;
+        s_cmd_dispatched_in_turn = false;
+        s_mute_response_audio = false;
+        if (s_session_timer) {
+            xTimerStop(s_session_timer, 0);
+        }
+        if (!was_muted) {
+            audio_hal_force_start_playing();
+        }
+        audio_hal_set_turn_active(false);
+        if (force_close_socket && s_tx_task_handle) {
+            xTaskNotify(s_tx_task_handle, CLOUD_EVT_WS_CLEANUP, eSetBits);
+        }
+    } else if (s_current_state != AI_STATE_IDLE) {
+        ESP_LOGE(TAG, ">>> [WS RECOVERY] %s giữa lượt (state=%d) -> Abort lượt nói! <<<", reason, (int)s_current_state);
+        if (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH || s_current_state == AI_STATE_EXECUTING_TOOL) {
+            s_mute_response_audio = true; // Giữ im lặng sau khi vừa thực thi tool xong
+        }
+        s_turn_ending = false;
+        s_need_send_activity_start = false;
+        s_cmd_dispatched_in_turn = false;
+        if (s_tx_task_handle) {
+            ai_cloud_abort(); // Để CLOUD_EVT_ABORT xử lý âm báo lỗi rồi mới hạ AI_STATE_IDLE
+        } else {
+            s_current_state = AI_STATE_IDLE;
+        }
+    } else if (force_close_socket && s_tx_task_handle) {
+        xTaskNotify(s_tx_task_handle, CLOUD_EVT_WS_CLEANUP, eSetBits);
     }
 }
 
@@ -96,6 +153,17 @@ static void session_timer_cb(TimerHandle_t xTimer) {
 
 static void parse_server_message(const char *json_string) {
     if (!json_string || json_string[0] == '\0') {
+        return;
+    }
+
+    // Chốt chặn JSON (Frame Desync Guard): Mọi thông điệp hợp lệ từ Gemini Live API đều là JSON Object bắt đầu bằng '{'
+    const char *trim = json_string;
+    while (*trim == ' ' || *trim == '\t' || *trim == '\r' || *trim == '\n') {
+        trim++;
+    }
+    if (*trim != '{') {
+        ESP_LOGE(TAG, ">>> [FRAME DESYNC GUARD] Phát hiện thông điệp không phải JSON hợp lệ ('%.24s') -> Phục hồi & đóng phiên! <<<", trim);
+        recover_from_ws_failure("Invalid non-JSON message", true);
         return;
     }
 
@@ -693,9 +761,67 @@ static void send_setup_frame(void) {
     }
 }
 
+static void stop_ws_client_safe(void) {
+    esp_websocket_client_handle_t client_to_stop = NULL;
+    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        if (ws_client && (s_ws_task_active || s_is_ws_connected || s_is_ws_connecting)) {
+            s_is_ws_stopping = true;
+            client_to_stop = ws_client;
+        }
+        s_is_ws_connected = false;
+        s_is_ws_connecting = false;
+        s_setup_complete = false;
+        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        xSemaphoreGive(ws_mutex);
+    }
+
+    if (client_to_stop) {
+        // Giải phóng ws_mutex trước khi chờ esp_websocket_client_stop() để không block luồng khác
+        esp_websocket_client_stop(client_to_stop);
+        s_ws_rx_len = 0;
+        if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            s_is_ws_stopping = false;
+            s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            xSemaphoreGive(ws_mutex);
+        } else {
+            s_is_ws_stopping = false;
+        }
+    }
+}
+
+static void enqueue_rx_json_message(void) {
+    if (!s_ws_rx_buf || s_ws_rx_len == 0) {
+        s_ws_rx_len = 0;
+        return;
+    }
+
+    s_ws_rx_buf[s_ws_rx_len] = '\0';
+    size_t msg_size = s_ws_rx_len + 1;
+    s_ws_rx_len = 0;
+
+    if (!s_rx_json_ringbuf) {
+        return;
+    }
+
+    // Đẩy ngay chuỗi JSON hoàn chỉnh sang Consumer (Core 1), không giữ chân websocket_task (Core 0)
+    if (xRingbufferSend(s_rx_json_ringbuf, (void *)s_ws_rx_buf, msg_size, pdMS_TO_TICKS(15)) != pdTRUE) {
+        ESP_LOGE(TAG, "RX JSON RingBuffer full/oversized (%u bytes) -> Phục hồi & đóng phiên!",
+                 (unsigned int)msg_size);
+        recover_from_ws_failure("RX JSON RingBuffer Overflow", true);
+    }
+}
+
 static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
     switch (event_id) {
+    case WEBSOCKET_EVENT_BEGIN:
+        s_ws_task_active = true;
+        break;
+
+    case WEBSOCKET_EVENT_BEFORE_CONNECT:
+        s_is_ws_connecting = true;
+        break;
+
     case WEBSOCKET_EVENT_CONNECTED:
         ESP_LOGI(TAG, ">>> WEBSOCKET_EVENT_CONNECTED <<<");
         s_is_ws_connected = true;
@@ -705,27 +831,31 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
-        s_is_ws_connected = false;
-        s_is_ws_connecting = false;
-        s_setup_complete = false;
-        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        s_ws_rx_len = 0;
-        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
-            ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
-            ai_cloud_abort();
+        recover_from_ws_failure("WEBSOCKET_EVENT_DISCONNECTED", false);
+        break;
+
+    case WEBSOCKET_EVENT_CLOSED:
+        ESP_LOGW(TAG, "WEBSOCKET_EVENT_CLOSED");
+        recover_from_ws_failure("WEBSOCKET_EVENT_CLOSED", false);
+        break;
+
+    case WEBSOCKET_EVENT_FINISH:
+        ESP_LOGD(TAG, "WEBSOCKET_EVENT_FINISH");
+        s_ws_task_active = false;
+        if (!s_is_ws_stopping && s_current_state != AI_STATE_IDLE) {
+            recover_from_ws_failure("WEBSOCKET_EVENT_FINISH", false);
+        } else {
+            s_is_ws_connected = false;
+            s_is_ws_connecting = false;
+            s_setup_complete = false;
+            s_ws_rx_len = 0;
         }
         break;
 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
-        s_is_ws_connected = false;
-        s_is_ws_connecting = false;
-        s_setup_complete = false;
-        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
-            ESP_LOGE(TAG, "WebSocket disconnected mid-session! Aborting turn...");
-            ai_cloud_abort();
-        }
+        // Driver esp_websocket_client sẽ tự gọi abort_connection -> WEBSOCKET_EVENT_DISCONNECTED & thoát task
+        recover_from_ws_failure("WEBSOCKET_EVENT_ERROR", false);
         break;
 
     case WEBSOCKET_EVENT_DATA:
@@ -742,23 +872,16 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 }
             }
 
-            // Chốt chặn RFC 6455 (WebSocket Framing Guard):
-            // Các mã đóng hợp lệ theo chuẩn quốc tế chỉ nằm trong dải 1000 - 4999 (1000-1015 chuẩn, 3000-4999 app).
-            // Nếu close_code ngoài dải này (ví dụ 21575 = 0x5447 'TG'), đây chắc chắn là lỗi lệch khung (Frame Desync)
-            // do driver đọc nhầm chuỗi Base64 thành Header -> Bỏ qua ngay, TUYỆT ĐỐI không ngắt kết nối và không kêu lỗi!
+            // Chốt chặn RFC 6455: Dù là Close Frame chuẩn (1000-4999) hay Close Frame giả mạo do lệch khung
+            // (Invalid Code ngoài dải 1000-4999), driver esp_websocket_client đã chuyển sang WEBSOCKET_STATE_CLOSING.
+            // Bắt buộc phục hồi trạng thái & hạ cờ bận ngay để không treo ở AI_EDGE_STATE_AI_RESPONDING!
             if (close_code < 1000 || close_code > 4999) {
-                ESP_LOGW(TAG, "Bỏ qua WebSocket CLOSE Frame giả mạo do lệch khung (Invalid Code: %u, Raw: '%s')",
+                ESP_LOGW(TAG, "Phát hiện WebSocket CLOSE Frame giả mạo do lệch khung (Invalid Code: %u, Raw: '%s') -> Phục hồi & hạ cờ bận!",
                          close_code, reason_buf);
-                break;
-            }
-
-            ESP_LOGE(TAG, ">>> WS CLOSE FRAME from Google: Code %u | Reason: '%s' <<<", close_code, reason_buf);
-            s_is_ws_connected = false;
-            s_is_ws_connecting = false;
-            s_setup_complete = false;
-            s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (s_current_state == AI_STATE_RECORDING || s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_SPEAKING) {
-                ai_cloud_abort();
+                recover_from_ws_failure("Frame Desync Invalid Close Code", true);
+            } else {
+                ESP_LOGE(TAG, ">>> WS CLOSE FRAME from Google: Code %u | Reason: '%s' <<<", close_code, reason_buf);
+                recover_from_ws_failure("WS CLOSE FRAME from server", true);
             }
             break;
         }
@@ -768,22 +891,42 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             break;
         }
 
+        if ((data->op_code >= 0x03 && data->op_code <= 0x07) || data->op_code >= 0x0B) {
+            ESP_LOGW(TAG, "Phát hiện WebSocket opcode không hợp lệ (0x%02X) -> Lệch khung! Phục hồi & đóng phiên.",
+                     data->op_code);
+            recover_from_ws_failure("Invalid WS Opcode (Frame Desync)", true);
+            break;
+        }
+
         if (data->data_ptr && data->data_len > 0) {
-            // Reset timer ngay khi nhan bat ky manh du lieu Wi-Fi nao tu Google (xac nhan mang dang truyen tai)
+            // Reset timer ngay khi nhận bất kỳ mảnh dữ liệu Wi-Fi nào từ Google (xác nhận mạng đang truyền tải)
             if (s_current_state == AI_STATE_SPEAKING && s_session_timer) {
                 xTimerReset(s_session_timer, 0);
             }
             if (data->payload_offset == 0) {
-                s_ws_rx_len = 0;
-            } else if (data->payload_offset != s_ws_rx_len) {
-                static uint32_t s_last_offset_err_ms = 0;
-                uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                if (now_ms - s_last_offset_err_ms > 2000) {
-                    s_last_offset_err_ms = now_ms;
-                    ESP_LOGW(TAG, "WS payload offset mismatch! (Exp: %u, Got: %u) - Dropping frame",
-                             (unsigned int)s_ws_rx_len, (unsigned int)data->payload_offset);
+                // Chỉ reset & kiểm tra '{' khi bắt đầu message mới (không phải Continuation frame 0x00)
+                if (data->op_code != 0x00) {
+                    s_ws_rx_len = 0;
+                    if (data->op_code == 0x01 || data->op_code == 0x02) {
+                        bool valid_json_start = false;
+                        for (int i = 0; i < data->data_len && i < 32; i++) {
+                            char c = data->data_ptr[i];
+                            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+                            if (c == '{') valid_json_start = true;
+                            break;
+                        }
+                        if (!valid_json_start) {
+                            ESP_LOGE(TAG, ">>> [FRAME DESYNC GUARD] Đầu frame nhận được dữ liệu Base64/rác không phải JSON -> Hạ cờ bận & đóng phiên! <<<");
+                            recover_from_ws_failure("Frame Desync Non-JSON Start", true);
+                            break;
+                        }
+                    }
                 }
+            } else if (data->op_code != 0x00 && data->payload_offset != s_ws_rx_len) {
+                ESP_LOGW(TAG, "WS payload offset mismatch! (Exp: %u, Got: %u) -> Phục hồi & đóng phiên!",
+                         (unsigned int)s_ws_rx_len, (unsigned int)data->payload_offset);
                 s_ws_rx_len = 0;
+                recover_from_ws_failure("WS Payload Offset Mismatch", true);
                 break;
             }
             
@@ -791,24 +934,66 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
                 memcpy(s_ws_rx_buf + s_ws_rx_len, data->data_ptr, data->data_len);
                 s_ws_rx_len += data->data_len;
             } else {
-                static uint32_t s_last_overflow_err_ms = 0;
-                uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                if (now_ms - s_last_overflow_err_ms > 2000) {
-                    s_last_overflow_err_ms = now_ms;
-                    ESP_LOGE(TAG, "s_ws_rx_buf overflow! (len: %u + inc: %u > max: %u)",
-                             (unsigned int)s_ws_rx_len, (unsigned int)data->data_len, (unsigned int)WS_RX_BUF_SIZE);
-                }
+                ESP_LOGE(TAG, "s_ws_rx_buf overflow! (len: %u + inc: %u > max: %u) -> Phục hồi & đóng phiên!",
+                         (unsigned int)s_ws_rx_len, (unsigned int)data->data_len, (unsigned int)WS_RX_BUF_SIZE);
                 s_ws_rx_len = 0;
+                recover_from_ws_failure("WS RX Buffer Overflow", true);
                 break;
             }
             
-            if (s_ws_rx_len == data->payload_len) {
-                s_ws_rx_buf[s_ws_rx_len] = '\0';
-                parse_server_message(s_ws_rx_buf);
-                s_ws_rx_len = 0;
+            if (data->fin && (data->payload_offset + data->data_len >= data->payload_len)) {
+                enqueue_rx_json_message();
             }
+        } else if (data->fin && data->payload_len == 0 && s_ws_rx_len > 0 && data->op_code == 0x00) {
+            enqueue_rx_json_message();
         }
         break;
+    }
+}
+
+// Xả toàn bộ item tồn đọng trong s_rx_json_ringbuf (chỉ gọi từ cloud_rx_process_task để giữ Single-Consumer Thread Safety)
+static void drain_rx_json_ringbuf(void) {
+    if (!s_rx_json_ringbuf) {
+        return;
+    }
+    size_t dummy_size = 0;
+    void *dummy_item = NULL;
+    while ((dummy_item = xRingbufferReceive(s_rx_json_ringbuf, &dummy_size, 0)) != NULL) {
+        vRingbufferReturnItem(s_rx_json_ringbuf, dummy_item);
+    }
+}
+
+// Luồng Consumer độc lập (Core 1): Lấy từng chuỗi JSON hoàn chỉnh từ s_rx_json_ringbuf để parse & giải mã PCM Base64
+static void cloud_rx_process_task(void *arg) {
+    ESP_LOGI(TAG, "Cloud RX Process Task Started on Core %d (Decoupled JSON Parse & PCM Base64 Decode).",
+             xPortGetCoreID());
+
+    while (1) {
+        if (!s_rx_json_ringbuf) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (s_rx_flush_requested) {
+            s_rx_flush_requested = false;
+            drain_rx_json_ringbuf();
+        }
+
+        size_t item_size = 0;
+        char *item = (char *)xRingbufferReceive(s_rx_json_ringbuf, &item_size, pdMS_TO_TICKS(20));
+        if (item != NULL) {
+            if (s_rx_flush_requested) {
+                vRingbufferReturnItem(s_rx_json_ringbuf, (void *)item);
+                s_rx_flush_requested = false;
+                drain_rx_json_ringbuf();
+                continue;
+            }
+
+            if (item_size > 0 && item[item_size - 1] == '\0') {
+                parse_server_message((const char *)item);
+            }
+            vRingbufferReturnItem(s_rx_json_ringbuf, (void *)item);
+        }
     }
 }
 
@@ -824,17 +1009,25 @@ static void cloud_tx_task(void *arg) {
             (s_current_state == AI_STATE_IDLE && !s_turn_ending) ? pdMS_TO_TICKS(50) : 0);
 
         if (got_notify == pdTRUE) {
+            // Xử lý WS_CLEANUP (Đóng sạch socket bị lỗi/lệch khung mà không làm gián đoạn audio đang phát ở loa)
+            if (notify_bits & CLOUD_EVT_WS_CLEANUP) {
+                ESP_LOGW(TAG, "Worker handling CLOUD_EVT_WS_CLEANUP (Stopping broken WS cleanly without touching playback)...");
+                stop_ws_client_safe();
+                if (!(notify_bits & (CLOUD_EVT_ABORT | CLOUD_EVT_TIMEOUT | CLOUD_EVT_CANCEL | CLOUD_EVT_START_TURN))) {
+                    continue;
+                }
+            }
+
             // Xử lý ABORT (Lỗi mạng hoặc ngắt khẩn cấp)
             if (notify_bits & CLOUD_EVT_ABORT) {
                 ESP_LOGW(TAG, "Worker handling CLOUD_EVT_ABORT (Stopping WebSocket & resetting FSM)...");
                 bool was_tool = (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH || s_mute_response_audio);
-                s_current_state = AI_STATE_IDLE;
                 s_turn_ending = false;
                 s_need_send_activity_start = false;
                 s_cmd_dispatched_in_turn = false;
                 s_mute_response_audio = false;
-                ai_edge_stop_recording();
                 if (s_session_timer) xTimerStop(s_session_timer, 0);
+                s_rx_flush_requested = true;
                 if (s_tx_audio_ringbuf) {
                     size_t dummy_sz;
                     uint8_t *dummy_it;
@@ -847,18 +1040,9 @@ static void cloud_tx_task(void *arg) {
                 if (!was_tool) {
                     audio_hal_play_error_sound();
                 }
-                if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
-                        s_is_ws_stopping = true;
-                        esp_websocket_client_stop(ws_client);
-                        s_is_ws_stopping = false;
-                    }
-                    s_is_ws_connected = false;
-                    s_is_ws_connecting = false;
-                    s_setup_complete = false;
-                    s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                    xSemaphoreGive(ws_mutex);
-                }
+                s_current_state = AI_STATE_IDLE;
+                ai_edge_stop_recording();
+                stop_ws_client_safe();
                 continue;
             }
 
@@ -874,22 +1058,12 @@ static void cloud_tx_task(void *arg) {
                     s_mute_response_audio = false;
                     ai_edge_stop_recording();
                     if (s_session_timer) xTimerStop(s_session_timer, 0);
+                    s_rx_flush_requested = true;
                     audio_hal_set_turn_active(false);
                     if (!was_tool) {
                         audio_hal_play_error_sound();
                     }
-                    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                        if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
-                            s_is_ws_stopping = true;
-                            esp_websocket_client_stop(ws_client);
-                            s_is_ws_stopping = false;
-                        }
-                        s_is_ws_connected = false;
-                        s_is_ws_connecting = false;
-                        s_setup_complete = false;
-                        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                        xSemaphoreGive(ws_mutex);
-                    }
+                    stop_ws_client_safe();
                     continue;
                 }
             }
@@ -903,6 +1077,7 @@ static void cloud_tx_task(void *arg) {
                 s_cmd_dispatched_in_turn = false;
                 s_mute_response_audio = false;
                 if (s_session_timer) xTimerStop(s_session_timer, 0);
+                s_rx_flush_requested = true;
                 if (s_tx_audio_ringbuf) {
                     size_t dummy_sz;
                     uint8_t *dummy_it;
@@ -910,18 +1085,7 @@ static void cloud_tx_task(void *arg) {
                         vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
                     }
                 }
-                if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                    if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
-                        s_is_ws_stopping = true;
-                        esp_websocket_client_stop(ws_client);
-                        s_is_ws_stopping = false;
-                    }
-                    s_is_ws_connected = false;
-                    s_is_ws_connecting = false;
-                    s_setup_complete = false;
-                    s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                    xSemaphoreGive(ws_mutex);
-                }
+                stop_ws_client_safe();
                 continue;
             }
 
@@ -929,18 +1093,7 @@ static void cloud_tx_task(void *arg) {
             if (notify_bits & CLOUD_EVT_KEEP_ALIVE_EXP) {
                 if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
                     ESP_LOGI(TAG, ">>> [KEEP-ALIVE EXPIRED] Hết 15s không có câu lệnh mới -> Đóng WebSocket an toàn từ Worker Task. <<<");
-                    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                        if (ws_client && (s_is_ws_connected || s_is_ws_connecting)) {
-                            s_is_ws_stopping = true;
-                            esp_websocket_client_stop(ws_client);
-                            s_is_ws_stopping = false;
-                        }
-                        s_is_ws_connected = false;
-                        s_is_ws_connecting = false;
-                        s_setup_complete = false;
-                        s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-                        xSemaphoreGive(ws_mutex);
-                    }
+                    stop_ws_client_safe();
                     continue;
                 }
             }
@@ -984,7 +1137,7 @@ static void cloud_tx_task(void *arg) {
                    (s_current_state == AI_STATE_RECORDING || s_turn_ending)) {
                 // [ACTIVE RETRY]: Nếu chưa kết nối và chưa trong tiến trình connecting (ví dụ vừa thoát Cooldown 300ms)
                 // -> Tự động phát động kết nối lại ngay lập tức!
-                if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping) {
+                if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping && !s_ws_task_active) {
                     ai_cloud_prewarm_session();
                 }
 
@@ -1142,22 +1295,32 @@ void ai_cloud_prewarm_session(void) {
             esp_websocket_client_config_t websocket_cfg = {
                 .uri = GEMINI_WS_URL,
                 .crt_bundle_attach = esp_crt_bundle_attach,
-                .buffer_size = 16384, // 16KB: Tiết kiệm 16KB Internal SRAM cho phần cứng DMA AES
+                .buffer_size = 24576, // 24KB (>16KB threshold -> cấp phát vào PSRAM, đọc trọn vẹn JSON Base64 chunk không phân mảnh)
                 .task_stack = 8192,
                 .task_core_id_set = true,
                 .task_core_id = 0,    // Ghim luồng WebSocket cố định vào Core 0 (Nhân Mạng)
                 .task_prio = 5,
-                .network_timeout_ms = 10000, // 10s: Chống timeout giả khi AI suy nghĩ câu dài hoặc Wi-Fi gom gói chậm
+                .network_timeout_ms = 20000, // 20s: Chống EAGAIN timeout cắt ngang frame đang truyền dở
                 .reconnect_timeout_ms = 0,
-                .disable_auto_reconnect = true,
+                .disable_auto_reconnect = true, // ai_cloud tự quản lý prewarm + 15s keep-alive, không chạy ngầm tự nối lại khi IDLE
+                .keep_alive_enable = true,
+                .keep_alive_idle = 10,
+                .keep_alive_interval = 5,
+                .keep_alive_count = 3,
             };
             ws_client = esp_websocket_client_init(&websocket_cfg);
             esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)ws_client);
             s_is_ws_connecting = true;
-            esp_websocket_client_start(ws_client);
+            esp_err_t err = esp_websocket_client_start(ws_client);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "esp_websocket_client_start failed: 0x%x", err);
+                s_is_ws_connecting = false;
+            }
         } else if (s_is_ws_connected && s_setup_complete) {
             ESP_LOGI(TAG, ">>> [KEEP-ALIVE POOL HIT] WebSocket đã kết nối & Setup sẵn sàng (0ms độ trễ TLS)! <<<");
-        } else if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping) {
+        } else if (s_ws_task_active) {
+            ESP_LOGD(TAG, "WebSocket task đang hoàn tất đóng/kết nối, chờ hoàn thành...");
+        } else if (!s_is_ws_stopping) {
             ESP_LOGI(TAG, "Starting WebSocket in background...");
             s_is_ws_connecting = true;
             esp_err_t err = esp_websocket_client_start(ws_client);
@@ -1189,8 +1352,18 @@ void ai_cloud_init(void) {
         s_tx_audio_ringbuf = xRingbufferCreateWithCaps(128 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     }
 
-    // Tạo luồng phát âm thanh mạng độc lập & FSM Worker (Core 0, Priority 5, Stack 8KB)
+    // Khởi tạo RX JSON RingBuffer (RINGBUF_TYPE_NOSPLIT) trong PSRAM cho kiến trúc Producer-Consumer
+    // Ưu tiên 512KB để chứa được frame tối đa ~256KB (khớp WS_RX_BUF_SIZE) và nhiều frame liên tiếp, fallback 256KB
+    s_rx_json_ringbuf = xRingbufferCreateWithCaps(512 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    if (!s_rx_json_ringbuf) {
+        ESP_LOGW(TAG, "Failed to create 512KB RX JSON RingBuffer in PSRAM! Fallback to 256KB...");
+        s_rx_json_ringbuf = xRingbufferCreateWithCaps(256 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    }
+
+    // Tạo luồng truyền âm thanh mạng độc lập & FSM Worker (Core 0, Priority 5, Stack 8KB)
     xTaskCreatePinnedToCore(cloud_tx_task, "cloud_tx_task", 8192, NULL, 5, &s_tx_task_handle, 0);
+    // Tạo luồng Consumer parse JSON & decode Base64 PCM (Core 1, Priority 5 - dưới audio_play_task Prio 6, Stack 8KB)
+    xTaskCreatePinnedToCore(cloud_rx_process_task, "cloud_rx_task", 8192, NULL, 5, &s_rx_task_handle, 1);
 
     s_session_timer = xTimerCreate("ai_session_tmr", pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS), pdFALSE, (void *)0, session_timer_cb);
     s_keep_alive_timer = xTimerCreate("ai_ws_keep_alive", pdMS_TO_TICKS(WS_KEEP_ALIVE_TIMEOUT_MS), pdFALSE, (void *)0, ws_keep_alive_timer_cb);

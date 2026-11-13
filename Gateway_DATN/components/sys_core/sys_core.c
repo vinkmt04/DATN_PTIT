@@ -60,7 +60,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
                 break;
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_is_connected = false;
         if (s_is_provisioned) {
@@ -163,6 +166,7 @@ void sys_core_init(void) {
         wifi_prov_mgr_deinit();
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     }
     
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
