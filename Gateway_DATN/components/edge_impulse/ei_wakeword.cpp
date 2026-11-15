@@ -23,6 +23,10 @@ static int16_t s_slice_peaks[4] = {0, 0, 0, 0};
 static int s_peak_idx = 0;
 static float s_smooth_gain = 4.0f;
 
+// Lịch sử đỉnh âm thanh sau khuếch đại của 4 lát cắt gần nhất (4 * 250ms = 1000ms khớp cửa sổ model)
+static int16_t s_recent_boosted_peaks[4] = {0, 0, 0, 0};
+static int s_boosted_peak_idx = 0;
+
 static int get_wakeword_audio_signal_data(size_t offset, size_t length, float *out_ptr) {
     for (size_t i = 0; i < length; i++) {
         out_ptr[i] = (float)s_boosted_slice_buffer[offset + i];
@@ -38,6 +42,8 @@ bool ei_wakeword_init(void) {
     memset(s_slice_peaks, 0, sizeof(s_slice_peaks));
     s_peak_idx = 0;
     s_smooth_gain = 4.0f;
+    memset(s_recent_boosted_peaks, 0, sizeof(s_recent_boosted_peaks));
+    s_boosted_peak_idx = 0;
     memset(s_boosted_slice_buffer, 0, sizeof(s_boosted_slice_buffer));
 
     ESP_LOGI(TAG, "Wake Word Engine Ready -> Project ID: %lu | Window: %lu samples (%lums) | Slice: %lu samples (%lums)",
@@ -60,6 +66,8 @@ void ei_wakeword_reset(void) {
     memset(s_slice_peaks, 0, sizeof(s_slice_peaks));
     s_peak_idx = 0;
     s_smooth_gain = 4.0f;
+    memset(s_recent_boosted_peaks, 0, sizeof(s_recent_boosted_peaks));
+    s_boosted_peak_idx = 0;
     ESP_LOGD(TAG, "Wake Word rolling buffer & state reset.");
 }
 
@@ -103,13 +111,15 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
 
     const int16_t TARGET_PEAK = 24500;
     float target_gain = 4.0f; // Mức khuếch đại cơ sở khi im lặng / sàn ồn
-    if (window_peak > 150) {
+    if (window_peak > 280) {
         target_gain = (float)TARGET_PEAK / (float)window_peak;
         if (target_gain > 14.0f) target_gain = 14.0f; // Giới hạn trần 14.0x (+23 dB) khớp dataset_recorder.c
         if (target_gain < 1.0f) target_gain = 1.0f;
+        s_smooth_gain = 0.7f * s_smooth_gain + 0.3f * target_gain;
+    } else {
+        target_gain = 4.0f;
+        s_smooth_gain = 4.0f;
     }
-    // Làm mượt nhẹ hệ số gain tránh giật bước nhảy giữa các lát
-    s_smooth_gain = 0.7f * s_smooth_gain + 0.3f * target_gain;
     float gain = s_smooth_gain;
 
     int16_t boosted_peak = 0;
@@ -120,6 +130,16 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         s_boosted_slice_buffer[i] = (int16_t)val;
         int16_t abs_b = abs(s_boosted_slice_buffer[i]);
         if (abs_b > boosted_peak) boosted_peak = abs_b;
+    }
+
+    // Cập nhật lịch sử đỉnh âm thanh sau khuếch đại của 4 lát gần nhất (1000ms khớp cửa sổ model)
+    s_recent_boosted_peaks[s_boosted_peak_idx] = boosted_peak;
+    s_boosted_peak_idx = (s_boosted_peak_idx + 1) % 4;
+
+    int16_t max_recent_raw_peak = window_peak;
+    int16_t max_recent_boosted_peak = 0;
+    for (int p = 0; p < 4; p++) {
+        if (s_recent_boosted_peaks[p] > max_recent_boosted_peak) max_recent_boosted_peak = s_recent_boosted_peaks[p];
     }
 
     signal_t signal;
@@ -202,6 +222,21 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
     }
 
     // 3. KIỂM TRA KÍCH HOẠT HYBRID (Chỉ thực thi khi now_ms >= s_veto_until_ms):
+
+    // CHỐT CHẶN BIÊN ĐỘ GIỌNG NÓI TỐI THIỂU (ACOUSTIC PEAK GATE):
+    // Giọng người thật sự (kể cả nói nhỏ) luôn phải đạt: max_recent_raw_peak >= EI_WAKEWORD_MIN_RAW_PEAK VÀ max_recent_boosted_peak >= EI_WAKEWORD_MIN_BOOSTED_PEAK
+    bool has_speech_energy = (max_recent_raw_peak >= EI_WAKEWORD_MIN_RAW_PEAK) &&
+                             (max_recent_boosted_peak >= EI_WAKEWORD_MIN_BOOSTED_PEAK);
+
+    if (!has_speech_energy) {
+        if (hey_cherry_score >= EI_WAKEWORD_PEAK_THRESHOLD ||
+            (s_prev_hey_cherry_score >= EI_WAKEWORD_CANDIDATE_THRESHOLD && hey_cherry_score >= EI_WAKEWORD_CANDIDATE_THRESHOLD)) {
+            ESP_LOGW(TAG, ">>> [ENERGY GATE BLOCKED] Bỏ qua kích hoạt giả khi im lặng (hey_cherry: %.1f%% | RawPk=%d, min=%d | BoostedPk=%d, min=%d) <<<",
+                     hey_cherry_score * 100.0f, max_recent_raw_peak, EI_WAKEWORD_MIN_RAW_PEAK, max_recent_boosted_peak, EI_WAKEWORD_MIN_BOOSTED_PEAK);
+        }
+        s_prev_hey_cherry_score = 0.0f;
+        return false;
+    }
 
     // Nhánh 1 (Peak Trigger - Bắt tức thì câu nói nằm trọn tâm cửa sổ):
     // Phân tầng kiểm tra độ tinh khiết (purity) để chặn đứng "Hey Siri" vọt 75-90%:

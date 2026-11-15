@@ -128,6 +128,7 @@ static void audio_recording_task(void *arg) {
     int s_consecutive_speech = 0;
     int idle_slice_counter = 0;
     int responding_log_counter = 0;
+    int prev_wake_rms = 0;
 
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, " HỆ THỐNG LẮNG NGHE ĐÃ SẴN SÀNG (HYBRID DUAL-MODEL)!");
@@ -151,21 +152,38 @@ static void audio_recording_task(void *arg) {
                     audio_hal_apply_dc_filter(wake_slice_buffer, wake_slice_size);
 
                     int rms = audio_vad_get_rms(wake_slice_buffer, wake_slice_size);
-                    audio_dsp_update_ambient_noise(rms);
+                    int ambient = audio_dsp_get_ambient_noise();
+                    int max_rms_2slices = (rms > prev_wake_rms) ? rms : prev_wake_rms;
 
                     idle_slice_counter++;
                     // In nhịp tim định kỳ mỗi ~3 giây (12 lát * 250ms)
                     if (idle_slice_counter % 12 == 0) {
                         ESP_LOGI(TAG, "[IDLE_WAKEWORD] Đang lắng nghe 'Hey Cherry'... (Mic RMS: %d, Sàn ồn: %d)",
-                                 rms, audio_dsp_get_ambient_noise());
+                                 rms, ambient);
                     }
 
                     // Chạy nhận diện Wake Word
                     bool detected = ei_wakeword_process_slice(wake_slice_buffer, wake_slice_size, &confidence, &label);
 
+                    // Chỉ gọi audio_dsp_update_ambient_noise(rms) khi lát cắt KHÔNG phải là tiếng nói
+                    // (confidence < 0.30f và rms < ambient * 2), tránh việc người dùng đang nói làm tăng vọt chỉ số sàn ồn
+                    if (confidence < 0.30f && rms < ambient * 2) {
+                        audio_dsp_update_ambient_noise(rms);
+                    }
+
+                    // Chốt chặn SNR / RMS: Chỉ chấp nhận detected == true khi max_rms_2slices >= (ambient + 8) VÀ max_rms_2slices >= 24
                     if (detected) {
+                        if (max_rms_2slices < (ambient + 8) || max_rms_2slices < 24) {
+                            ESP_LOGW(TAG, ">>> [RMS GATE BLOCKED] Bỏ qua kích hoạt giả khi RMS thấp (Score: %.1f%%, RMS: %d, Max2Slices: %d < Sàn ồn: %d+8 hoặc < 24) <<<",
+                                     confidence * 100.0f, rms, max_rms_2slices, ambient);
+                            detected = false;
+                        }
+                    }
+
+                    if (detected) {
+                        prev_wake_rms = 0;
                         ESP_LOGI(TAG, "**************************************************");
-                        ESP_LOGI(TAG, ">>> PHÁT HIỆN TỪ KHÓA 'HEY CHERRY'! (Score: %.1f%%, RMS: %d) <<<", confidence * 100.0f, rms);
+                        ESP_LOGI(TAG, ">>> PHÁT HIỆN TỪ KHÓA 'HEY CHERRY'! (Score: %.1f%%, RMS: %d, Max2Slices: %d) <<<", confidence * 100.0f, rms, max_rms_2slices);
                         ESP_LOGI(TAG, "**************************************************");
 
                         // 1. Kích hoạt kết nối WebSocket ngầm (Pre-warm) nếu có Wi-Fi (Tắt khi test cô lập để tối ưu 100% tài nguyên)
@@ -198,6 +216,8 @@ static void audio_recording_task(void *arg) {
 
                         // 4. Chuyển sang lắng nghe câu lệnh (thu âm mở trước khi Ding kết thúc 100ms)
                         s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
+                    } else {
+                        prev_wake_rms = rms;
                     }
                 } else {
                     ESP_LOGW(TAG, "Mic read mismatch: %u != %u", (unsigned int)bytes_read, (unsigned int)bytes_to_read);
@@ -208,6 +228,7 @@ static void audio_recording_task(void *arg) {
             }
 
             case AI_EDGE_STATE_COMMAND_LISTENING: {
+                prev_wake_rms = 0;
                 // Đọc từng chunk 60ms (960 mẫu = 1920 bytes) để VAD chính xác từng mili-giây
                 size_t bytes_to_read = STREAM_CHUNK_SAMPLES * sizeof(int16_t);
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
@@ -523,6 +544,7 @@ static void audio_recording_task(void *arg) {
             }
 
             case AI_EDGE_STATE_STREAMING_SPEECH: {
+                prev_wake_rms = 0;
                 // Đọc chunk 60ms từ mic (960 mẫu)
                 size_t bytes_to_read = STREAM_CHUNK_SAMPLES * sizeof(int16_t);
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
@@ -583,6 +605,7 @@ static void audio_recording_task(void *arg) {
             }
 
             case AI_EDGE_STATE_AI_RESPONDING: {
+                prev_wake_rms = 0;
                 // Xả sạch DMA mic bằng các chunk nhỏ 60ms để âm thanh dội từ loa không bị tồn đọng
                 size_t bytes_to_read = STREAM_CHUNK_SAMPLES * sizeof(int16_t);
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
