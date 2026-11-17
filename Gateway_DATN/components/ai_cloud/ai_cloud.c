@@ -18,8 +18,14 @@ extern void ai_edge_stop_recording(void);
 
 static const char *TAG = "ai_cloud";
 
+#if __has_include("app_secrets.h")
+#include "app_secrets.h"
+#endif
+
 // Live API (WebSockets) Configuration
-#define GEMINI_API_KEY "...."
+#ifndef GEMINI_API_KEY
+#define GEMINI_API_KEY "YOUR_GEMINI_API_KEY"
+#endif
 #define GEMINI_WS_URL "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=" GEMINI_API_KEY
 
 // Kích thước tĩnh cho bộ đệm Base64 và JSON (cấp phát 1 lần trong PSRAM)

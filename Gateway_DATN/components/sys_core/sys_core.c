@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "driver/gpio.h"
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
@@ -17,11 +18,19 @@ static const char *TAG = "sys_core";
 
 #define PROV_SECURITY WIFI_PROV_SECURITY_1
 #define PROV_POP "12345678" // Mật khẩu cấu hình (Proof of Possession)
+#if __has_include("app_secrets.h")
+#include "app_secrets.h"
+#endif
+
 #define MAXIMUM_RETRY 5
 #define BOOT_BUTTON_GPIO 0
 
-#define DEFAULT_WIFI_SSID "FULL A+"
-#define DEFAULT_WIFI_PASS "matkhaugi"
+#ifndef DEFAULT_WIFI_SSID
+#define DEFAULT_WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+#ifndef DEFAULT_WIFI_PASS
+#define DEFAULT_WIFI_PASS "YOUR_WIFI_PASS"
+#endif
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
@@ -30,6 +39,31 @@ static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static bool s_is_connected = false;
 static bool s_is_provisioned = false;
+static TimerHandle_t s_reconnect_timer = NULL;
+static sys_core_is_busy_cb_t s_voice_busy_cb = NULL;
+
+#define WIFI_RECONNECT_INTERVAL_MS 15000 // Thử kết nối lại mỗi 15 giây ở chế độ nền
+
+void sys_core_set_voice_busy_check(sys_core_is_busy_cb_t cb) {
+    s_voice_busy_cb = cb;
+}
+
+static void wifi_reconnect_timer_cb(TimerHandle_t xTimer) {
+    (void)xTimer;
+    if (s_is_connected) {
+        if (s_reconnect_timer) xTimerStop(s_reconnect_timer, 0);
+        return;
+    }
+
+    // Ưu tiên giọng nói: Nếu người dùng đang ra lệnh Offline (thu âm / suy luận) thì hoãn lượt quét
+    if (s_voice_busy_cb && s_voice_busy_cb()) {
+        ESP_LOGD(TAG, "[WIFI_RECONNECT] Hoãn quét Wi-Fi vì hệ thống giọng nói đang bận...");
+        return;
+    }
+
+    ESP_LOGI(TAG, ">>> [WIFI_RECONNECT] Định kỳ 15s: Đang thử kết nối lại Wi-Fi trong nền... <<<");
+    esp_wifi_connect();
+}
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                           int32_t event_id, void* event_data)
@@ -66,26 +100,25 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         esp_wifi_set_ps(WIFI_PS_NONE);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_is_connected = false;
-        if (s_is_provisioned) {
-            ESP_LOGW(TAG, "Wi-Fi disconnected. Reconnecting to AP in 1s...");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
-        } else {
-            if (s_retry_num < MAXIMUM_RETRY) {
-                esp_wifi_connect();
-                s_retry_num++;
-                ESP_LOGI(TAG, "retry to connect to the AP (%d/%d)", s_retry_num, MAXIMUM_RETRY);
-            } else {
-                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            }
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason: %d). Sẽ tự động kết nối lại mỗi 15s trong nền.", disc ? disc->reason : 0);
+
+        // Khởi động timer định kỳ 15s trong nền (Non-blocking, KHÔNG gọi vTaskDelay trong event loop!)
+        if (s_reconnect_timer) {
+            xTimerStart(s_reconnect_timer, 0);
         }
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, ">>> [WIFI CONNECTED] Đã nhận địa chỉ IP: " IPSTR " <<<", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         s_is_connected = true;
         // Tắt hoàn toàn Modem Sleep của Wi-Fi để đảm bảo độ trễ thấp nhất và không bao giờ rớt gói tin WebSocket audio
         esp_wifi_set_ps(WIFI_PS_NONE);
+        if (s_reconnect_timer) {
+            xTimerStop(s_reconnect_timer, 0);
+        }
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -168,8 +201,37 @@ void sys_core_init(void) {
         ESP_ERROR_CHECK(esp_wifi_start());
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     }
-    
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+
+    // Khởi tạo Software Timer kết nối lại Wi-Fi trong nền (chu kỳ 15s, auto-reload)
+    if (!s_reconnect_timer) {
+        s_reconnect_timer = xTimerCreate("wifi_reconn_tmr",
+                                          pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS),
+                                          pdTRUE, // Auto-reload
+                                          NULL,
+                                          wifi_reconnect_timer_cb);
+    }
+
+    // Chờ tối đa 3.5 giây để kết nối Wi-Fi lúc khởi động (Sweet-Spot Boot Timeout):
+    // - Nếu có mạng (bình thường mất 1.5s - 2.0s): Trả về ngay lập tức để kịp phiên Online.
+    // - Nếu mất mạng / router tắt: Không bị treo kẹt, unblock sau 3.5s để khởi động toàn bộ Mic, Loa, Mesh, Edge AI chạy Offline trơn tru!
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(3500));
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "==================================================");
+        ESP_LOGI(TAG, ">>> [BOOT ONLINE] Kết nối Wi-Fi thành công lúc khởi động! <<<");
+        ESP_LOGI(TAG, "==================================================");
+    } else {
+        ESP_LOGW(TAG, "==================================================");
+        ESP_LOGW(TAG, ">>> [BOOT OFFLINE] Không có Wi-Fi sau 3.5s -> Khởi động chế độ OFFLINE! <<<");
+        ESP_LOGW(TAG, ">>> Mic, Loa, Mesh Controller và Edge AI sẵn sàng 100%% không cần Internet <<<");
+        ESP_LOGW(TAG, ">>> Luồng kết nối Wi-Fi sẽ tự động thử lại mỗi 15s ở chế độ nền <<<");
+        ESP_LOGW(TAG, "==================================================");
+        if (s_reconnect_timer) {
+            xTimerStart(s_reconnect_timer, 0);
+        }
+    }
 }
 
 bool sys_core_is_wifi_connected(void) {

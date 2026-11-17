@@ -22,8 +22,8 @@ extern "C" {
 #define EI_WAKEWORD_VETO_SIMILAR_THRESH    0.38f   // Ngưỡng kích hoạt Veto Lockout khi similar >= 38%
 #define EI_WAKEWORD_VETO_CHERRY_CEIL       0.40f   // Ngưỡng trần cherry < 40% để xác nhận từ bẫy similar
 #define EI_WAKEWORD_VETO_DURATION_MS       650     // Khóa Veto 650ms (chặn triệt để chu kỳ trượt tiếp theo)
-#define EI_WAKEWORD_MIN_RAW_PEAK           280     // Ngưỡng đỉnh biên độ thô tối thiểu của giọng nói (>= 280)
-#define EI_WAKEWORD_MIN_BOOSTED_PEAK       3000    // Ngưỡng đỉnh sau khuếch đại tối thiểu của giọng nói (>= 3000)
+#define EI_WAKEWORD_MIN_RAW_PEAK           380     // Ngưỡng đỉnh biên độ thô tối thiểu của giọng nói (>= 380)
+#define EI_WAKEWORD_MIN_BOOSTED_PEAK       5500    // Ngưỡng đỉnh sau khuếch đại tối thiểu của giọng nói (>= 5500)
 
 bool ei_wakeword_init(void);
 void ei_wakeword_reset(void);

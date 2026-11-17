@@ -16,6 +16,7 @@ static const char *TAG = "ei_wakeword";
 
 static int16_t s_boosted_slice_buffer[EI_WAKEWORD_SLICE_SAMPLES];
 static float s_prev_hey_cherry_score = 0.0f;
+static float s_prev_similar_score = 0.0f;
 static int64_t s_veto_until_ms = 0;
 
 // Bộ đệm lưu đỉnh âm thanh của 4 lát cắt gần nhất (4 * 250ms = 1000ms) để tính Window-Peak chuẩn hóa
@@ -38,6 +39,7 @@ bool ei_wakeword_init(void) {
     ESP_LOGI(TAG, "Initializing Model 1: 'Hey Cherry' Wake Word Engine (Continuous 250ms)...");
     run_classifier_init(&ModelWakeWord::ei_default_impulse);
     s_prev_hey_cherry_score = 0.0f;
+    s_prev_similar_score = 0.0f;
     s_veto_until_ms = 0;
     memset(s_slice_peaks, 0, sizeof(s_slice_peaks));
     s_peak_idx = 0;
@@ -62,6 +64,7 @@ size_t ei_wakeword_get_slice_size(void) {
 void ei_wakeword_reset(void) {
     run_classifier_init(&ModelWakeWord::ei_default_impulse);
     s_prev_hey_cherry_score = 0.0f;
+    s_prev_similar_score = 0.0f;
     s_veto_until_ms = 0;
     memset(s_slice_peaks, 0, sizeof(s_slice_peaks));
     s_peak_idx = 0;
@@ -111,14 +114,19 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
 
     const int16_t TARGET_PEAK = 24500;
     float target_gain = 4.0f; // Mức khuếch đại cơ sở khi im lặng / sàn ồn
-    if (window_peak > 280) {
+    if (window_peak > 350) {
         target_gain = (float)TARGET_PEAK / (float)window_peak;
         if (target_gain > 14.0f) target_gain = 14.0f; // Giới hạn trần 14.0x (+23 dB) khớp dataset_recorder.c
         if (target_gain < 1.0f) target_gain = 1.0f;
-        s_smooth_gain = 0.7f * s_smooth_gain + 0.3f * target_gain;
+        // Fast attack khi bắt đầu có giọng nói để nhanh chóng đạt mức khuếch đại chuẩn (tránh làm tụt boosted peak)
+        if (target_gain > s_smooth_gain) {
+            s_smooth_gain = 0.4f * s_smooth_gain + 0.6f * target_gain;
+        } else {
+            s_smooth_gain = 0.7f * s_smooth_gain + 0.3f * target_gain;
+        }
     } else {
         target_gain = 4.0f;
-        s_smooth_gain = 4.0f;
+        s_smooth_gain = 4.0f; // Tuyệt đối không bơm gain lên 10-14x khi im lặng / sàn ồn tĩnh (window_peak <= 350)
     }
     float gain = s_smooth_gain;
 
@@ -206,6 +214,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         (similar_score >= 0.60f)) {
         s_veto_until_ms = now_ms + EI_WAKEWORD_VETO_DURATION_MS;
         s_prev_hey_cherry_score = 0.0f; // BẮT BUỘC: Reset ngay tích lũy để không cộng dồn sang nhịp sau
+        s_prev_similar_score = 0.0f;
         ESP_LOGW(TAG, ">>> [VETO LOCK] Phát hiện dấu hiệu từ đồng âm (similar: %.1f%%, cherry: %.1f%%) -> Khóa %dms! <<<",
                  similar_score * 100.0f, hey_cherry_score * 100.0f, EI_WAKEWORD_VETO_DURATION_MS);
         return false;
@@ -218,6 +227,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
                      hey_cherry_score * 100.0f, (long long)(s_veto_until_ms - now_ms));
         }
         s_prev_hey_cherry_score = 0.0f;
+        s_prev_similar_score = 0.0f;
         return false;
     }
 
@@ -235,6 +245,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
                      hey_cherry_score * 100.0f, max_recent_raw_peak, EI_WAKEWORD_MIN_RAW_PEAK, max_recent_boosted_peak, EI_WAKEWORD_MIN_BOOSTED_PEAK);
         }
         s_prev_hey_cherry_score = 0.0f;
+        s_prev_similar_score = 0.0f;
         return false;
     }
 
@@ -260,6 +271,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         ESP_LOGW(TAG, ">>> [PEAK TRIGGER] WAKE WORD DETECTED! Score: %.1f%% (similar: %.1f%%, unknown: %.1f%%) <<<",
                  hey_cherry_score * 100.0f, similar_score * 100.0f, unknown_score * 100.0f);
         s_prev_hey_cherry_score = 0.0f;
+        s_prev_similar_score = 0.0f;
         ei_wakeword_reset();
         return true;
     }
@@ -272,6 +284,8 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         bool is_dual_trigger = (avg_score >= EI_WAKEWORD_AVERAGE_THRESHOLD) &&
                                ((hey_cherry_score - similar_score) >= EI_WAKEWORD_DUAL_MARGIN) &&
                                (similar_score < EI_WAKEWORD_SIMILAR_MAX) &&
+                               (similar_score <= 0.08f) &&
+                               (s_prev_similar_score <= 0.12f) &&
                                (hey_cherry_score > unknown_score);
 
         if (is_dual_trigger) {
@@ -279,6 +293,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
                      hey_cherry_score * 100.0f, s_prev_hey_cherry_score * 100.0f, avg_score * 100.0f, similar_score * 100.0f);
             if (out_confidence) *out_confidence = avg_score;
             s_prev_hey_cherry_score = 0.0f;
+            s_prev_similar_score = 0.0f;
             ei_wakeword_reset();
             return true;
         }
@@ -286,5 +301,6 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
 
     // 4. CẬP NHẬT CHO CHU KỲ 250MS TIẾP THEO:
     s_prev_hey_cherry_score = hey_cherry_score;
+    s_prev_similar_score = similar_score;
     return false;
 }

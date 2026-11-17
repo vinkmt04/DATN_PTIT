@@ -171,11 +171,13 @@ static void audio_recording_task(void *arg) {
                         audio_dsp_update_ambient_noise(rms);
                     }
 
-                    // Chốt chặn SNR / RMS: Chỉ chấp nhận detected == true khi max_rms_2slices >= (ambient + 8) VÀ max_rms_2slices >= 24
+                    // Chốt chặn SNR Gate thích ứng theo nhiễu nền:
+                    // Yêu cầu max_rms_2slices >= 40 VÀ max_rms_2slices >= (int)(ambient * 1.3f) (tăng 30% so với sàn ồn)
                     if (detected) {
-                        if (max_rms_2slices < (ambient + 8) || max_rms_2slices < 24) {
-                            ESP_LOGW(TAG, ">>> [RMS GATE BLOCKED] Bỏ qua kích hoạt giả khi RMS thấp (Score: %.1f%%, RMS: %d, Max2Slices: %d < Sàn ồn: %d+8 hoặc < 24) <<<",
-                                     confidence * 100.0f, rms, max_rms_2slices, ambient);
+                        int min_snr_rms = (int)(ambient * 1.3f);
+                        if (max_rms_2slices < 40 || max_rms_2slices < min_snr_rms) {
+                            ESP_LOGW(TAG, ">>> [SNR GATE BLOCKED] Bỏ qua kích hoạt giả (Score: %.1f%%, RMS: %d, Max2Slices: %d < 40 hoặc < Sàn ồn x1.3: %d) <<<",
+                                     confidence * 100.0f, rms, max_rms_2slices, min_snr_rms);
                             detected = false;
                         }
                     }
@@ -334,35 +336,86 @@ static void audio_recording_task(void *arg) {
                         }
                     }
 
-                    // 5. CĂN TÂM NĂNG LƯỢNG (ENERGY CENTER-ALIGNMENT) & QUÉT 3 LÁT CẮT TRÊN RAM (3-SLICE SCAN VỚI EARLY EXIT)
+                    // 5. CĂN TÂM NĂNG LƯỢNG (ENERGY CENTER-ALIGNMENT) & PHÂN BIỆT CÂU PHỨC VS LỆNH ĐƠN (RELATIVE ENVELOPE DROP)
                     if (cmd_inference_count == 0 && cmd_samples_from_speech >= EI_COMMAND_BUFFER_SAMPLES) {
                         cmd_inference_count = 1;
 
-                        // Bước 1: Quét 25 chunks (mỗi chunk 960 mẫu = 60ms) để xác định vị trí câu lệnh thực sự trong 24.000 mẫu
-                        int floor_noise = audio_dsp_get_ambient_noise();
-                        int min_thresh = (int)(floor_noise * 2.2f);
-                        if (min_thresh < 55) min_thresh = 55;
-
-                        int first_speech_chunk = -1;
-                        int last_speech_chunk = -1;
-
+                        // Bước 1: Tính mảng chunk_rms[25] cho từng đoạn 60ms (960 mẫu) trong cmd_audio_buffer (24.000 mẫu = 1.5s)
+                        int chunk_rms[25];
+                        int max_speech_rms = 0;
                         for (int k = 0; k < 25; k++) {
-                            int c_rms = audio_vad_get_rms(&cmd_audio_buffer[k * STREAM_CHUNK_SAMPLES], STREAM_CHUNK_SAMPLES);
-                            if (c_rms >= min_thresh) {
-                                if (first_speech_chunk == -1) first_speech_chunk = k;
-                                last_speech_chunk = k;
+                            chunk_rms[k] = audio_vad_get_rms(&cmd_audio_buffer[k * STREAM_CHUNK_SAMPLES], STREAM_CHUNK_SAMPLES);
+                            if (chunk_rms[k] > max_speech_rms) {
+                                max_speech_rms = chunk_rms[k];
                             }
                         }
 
+                        // Bước 2: Xác định ngưỡng năng lượng giọng nói thực sự của người dùng (tách biệt khỏi tiếng ồn phòng)
+                        int ambient_noise = audio_dsp_get_ambient_noise();
+                        int min_ambient_gate = ambient_noise * 2 + 20;
+                        int rel_peak_gate = (int)(max_speech_rms * 0.32f);
+                        int user_voice_thresh = (min_ambient_gate > rel_peak_gate) ? min_ambient_gate : rel_peak_gate;
+
+                        // Bước 3: Đếm tổng chunk giọng nói, chunk đuôi (300ms cuối: 20..24), và tính độ trải dài câu nói (speech_span_chunks)
+                        int first_speech_chunk = -1;
+                        int last_speech_chunk = -1;
+                        int total_user_chunks = 0;
+                        int tail_active_chunks = 0;
+
+                        for (int k = 0; k < 25; k++) {
+                            if (chunk_rms[k] >= user_voice_thresh) {
+                                if (first_speech_chunk == -1) first_speech_chunk = k;
+                                last_speech_chunk = k;
+                                total_user_chunks++;
+                                if (k >= 20) {
+                                    tail_active_chunks++;
+                                }
+                            }
+                        }
+
+                        int speech_span_chunks = (first_speech_chunk != -1) ? (last_speech_chunk - first_speech_chunk + 1) : 0;
+
+                        // Bước 4: Kiểm tra điều kiện Câu phức / Câu dài (Chuyển thẳng sang Gemini Live, KHÔNG chạy Model 2):
+                        // A1: Người dùng vẫn đang phát âm ở cuối khung 1.5s ((tail >= 2 && total >= 8) || mép cuối chunk 23 hoặc 24 có tiếng)
+                        bool cond_a1 = (tail_active_chunks >= 2 && total_user_chunks >= 8) ||
+                                       (chunk_rms[23] >= user_voice_thresh || chunk_rms[24] >= user_voice_thresh);
+                        // A2: Độ trải dài của câu nói vượt quá độ dài lệnh 2-3 âm tiết (>= 17 chunks ~ 1.02s)
+                        bool cond_a2 = (speech_span_chunks >= 17);
+                        // A3: Tổng số chunk năng lượng cao quá nhiều (>= 15 chunks)
+                        bool cond_a3 = (total_user_chunks >= 15);
+
+                        if (cond_a1 || cond_a2 || cond_a3) {
+                            ESP_LOGI(TAG, ">>> [COMPLEX SENTENCE DETECTED] Phát hiện câu nói dài/tiếp diễn (TailActive: %d/5, Span: %d chunks, TotalActive: %d, MaxRMS: %d, Thresh: %d) -> Bỏ qua Model 2, chuyển thẳng sang Gemini Live! <<<",
+                                     tail_active_chunks, speech_span_chunks, total_user_chunks, max_speech_rms, user_voice_thresh);
+
+                            if (sys_core_is_wifi_connected()) {
+                                s_edge_state = AI_EDGE_STATE_STREAMING_SPEECH;
+                                streaming_counter = 0;
+                                silence_counter = command_silence_chunks;
+                                s_consecutive_speech = 2;
+                                speech_chunks_total = command_speech_chunks;
+                            } else {
+                                ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
+                                audio_hal_play_error_sound();
+                                ai_cloud_stop_session();
+                                ei_wakeword_reset();
+                                idle_slice_counter = 0;
+                                s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                            }
+                            break;
+                        }
+
+                        // Bước 5: Căn tâm câu nói (Auto-Center Window) vào giữa khung 19.200 mẫu (1.2s)
                         int speech_center_sample = 12000; // Mặc định ở chính giữa buffer 1.5s
                         if (first_speech_chunk != -1 && last_speech_chunk >= first_speech_chunk) {
                             int speech_start_sample = first_speech_chunk * STREAM_CHUNK_SAMPLES;
                             int speech_end_sample = (last_speech_chunk + 1) * STREAM_CHUNK_SAMPLES;
                             speech_center_sample = (speech_start_sample + speech_end_sample) / 2;
-                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Phát hiện câu lệnh từ sample %d -> %d (%dms -> %dms, tâm: %dms, RMS Thresh: %d) <<<",
+                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Lệnh ngắn dứt câu (Tail: %d/5, Span: %d chunks, Total: %d). Phát hiện từ sample %d -> %d (%dms -> %dms, tâm: %dms, Thresh: %d, MaxRMS: %d) <<<",
+                                     tail_active_chunks, speech_span_chunks, total_user_chunks,
                                      speech_start_sample, speech_end_sample,
                                      speech_start_sample / 16, speech_end_sample / 16,
-                                     speech_center_sample / 16, min_thresh);
+                                     speech_center_sample / 16, user_voice_thresh, max_speech_rms);
                         } else {
                             // Fallback: Ước lượng câu nói bắt đầu sau Pre-roll 300ms (sample 4800)
                             speech_center_sample = 4800 + (EI_COMMAND_WINDOW_SAMPLES / 2); // 4800 + 9600 = 14400 (900ms)
@@ -417,6 +470,14 @@ static void audio_recording_task(void *arg) {
                             if (lbl) last_lbl = lbl;
 
                             if (match && is_command_device_enabled(lbl)) {
+                                // Syllable Span Guard: Kiểm tra độ khớp độ dài âm tiết đối với 2 lệnh 2 âm tiết ('bat_den', 'tat_den')
+                                bool is_two_syllable_cmd = (lbl && (strcmp(lbl, "bat_den") == 0 || strcmp(lbl, "tat_den") == 0));
+                                if (is_two_syllable_cmd && speech_span_chunks >= 13 && conf < 0.86f) {
+                                    ESP_LOGW(TAG, ">>> [SPAN MISMATCH] Câu nói dài %d chunks nhưng khớp lệnh 2 âm tiết '%s' với điểm thấp (%.1f%% < 86%%) -> Bỏ qua lát cắt này! <<<",
+                                             speech_span_chunks, lbl, conf * 100.0f);
+                                    continue; // Tiếp tục kiểm tra lát cắt tiếp theo (ví dụ Right Shift có thể khớp 'bat_cong_tac')
+                                }
+
                                 ESP_LOGW(TAG, "==================================================");
                                 ESP_LOGW(TAG, ">>> [LOCAL COMMAND SUCCESS - SLICE %s (EARLY EXIT)]: '%s' (Confidence: %.1f%%) <<<",
                                          slice_names[s], lbl, conf * 100.0f);
@@ -732,6 +793,9 @@ static void button_trigger_task(void *arg) {
 void ai_edge_init(void) {
     ESP_LOGI(TAG, "Initializing Edge AI (Dual-Model Edge Impulse + Hybrid Cloud Routing)");
     
+    // Đăng ký kiểm tra trạng thái bận với sys_core để hoãn quét Wi-Fi khi đang tương tác giọng nói
+    sys_core_set_voice_busy_check(ai_edge_is_busy);
+
     xTaskCreatePinnedToCore(button_trigger_task, "button_task", 4096, NULL, 5, &button_task_handle, 1);
     // Stack 16KB đảm bảo an toàn tuyệt đối cho TFLite Micro inference
     xTaskCreatePinnedToCore(audio_recording_task, "audio_task", 16384, NULL, 5, &audio_task_handle, 1);
@@ -748,6 +812,10 @@ void ai_edge_stop_recording(void) {
 bool ai_edge_is_recording(void) {
     return (s_edge_state == AI_EDGE_STATE_COMMAND_LISTENING || 
             s_edge_state == AI_EDGE_STATE_STREAMING_SPEECH);
+}
+
+bool ai_edge_is_busy(void) {
+    return (s_edge_state != AI_EDGE_STATE_IDLE_WAKEWORD);
 }
 
 ai_edge_state_t ai_edge_get_state(void) {

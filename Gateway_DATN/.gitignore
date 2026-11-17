@@ -84,3 +84,7 @@ dataset_tools/
 .vscode/
 build/
 model_edge_ai/
+
+# Secret API keys and credentials
+**/app_secrets.h
+app_secrets.h
