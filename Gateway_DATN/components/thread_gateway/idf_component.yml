@@ -1,0 +1,5 @@
+## IDF Component Manager Manifest File for thread_gateway
+dependencies:
+  espressif/mdns: "^1.0.3"
+  idf:
+    version: ">=5.0"

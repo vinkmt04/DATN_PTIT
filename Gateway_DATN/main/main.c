@@ -25,6 +25,9 @@ void app_main(void)
     // Initialize core and wait for Wi-Fi
     sys_core_init();
     
+    // Initialize UI Display (ST7789V 2.8" TFT + XPT2046 Touch + LVGL v8)
+    ui_display_init();
+
     // Initialize Audio
     audio_hal_init();
     
@@ -38,6 +41,9 @@ void app_main(void)
 
     // Initialize Edge AI (Gatekeeper)
     ai_edge_init();
+
+    // Link UI Touch Dismiss to ai_edge_abort
+    ui_display_set_abort_callback(ai_edge_abort);
 
     ESP_LOGI(TAG, "Initialization complete. Edge AI is listening in background.");
 

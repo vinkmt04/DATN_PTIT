@@ -15,6 +15,7 @@ typedef enum {
 
 void ai_edge_init(void);
 void ai_edge_stop_recording(void);
+void ai_edge_abort(void);
 bool ai_edge_is_recording(void);
 bool ai_edge_is_busy(void);
 ai_edge_state_t ai_edge_get_state(void);

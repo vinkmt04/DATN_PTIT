@@ -1,2 +1,20 @@
-idf_component_register(SRCS "ui_display.c"
-                       INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS 
+        "ui_display.c"
+        "st7789v_driver.c"
+        "xpt2046_driver.c"
+        "ui_screen_idle.c"
+        "ui_screen_dashboard.c"
+        "ui_voice_overlay.c"
+        "ui_font_vn_14.c"
+    INCLUDE_DIRS "."
+    REQUIRES 
+        esp_lcd 
+        driver 
+        freertos 
+        esp_timer 
+        mesh_controller 
+        iot_cloud 
+        sys_core 
+        lvgl
+)

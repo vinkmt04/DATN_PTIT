@@ -216,6 +216,8 @@ void iot_cloud_init(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = THINGSBOARD_BROKER_URI,
         .credentials.username = THINGSBOARD_ACCESS_TOKEN,
+        .task.stack_size = 4096,
+        .task.priority = 3,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);

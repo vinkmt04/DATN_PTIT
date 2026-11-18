@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "ei_wrapper.h"
 #include "mesh_controller.h"
+#include "ui_display.h"
 #include <string.h>
 
 static const char *TAG = "ai_edge";
@@ -197,6 +198,7 @@ static void audio_recording_task(void *arg) {
 
                         // 2. Phát âm thanh báo thức (Ding-ding trọn vẹn ~450ms)
                         audio_hal_play_wake_sound();
+                        ui_display_show_voice_overlay();
 
                         // 3. Reset các bộ đệm và biến trạng thái câu lệnh
                         cmd_inference_count = 0;
@@ -239,6 +241,7 @@ static void audio_recording_task(void *arg) {
                     audio_hal_apply_dc_filter(stream_chunk_buffer, STREAM_CHUNK_SAMPLES);
 
                     int rms = audio_vad_get_rms(stream_chunk_buffer, STREAM_CHUNK_SAMPLES);
+                    ui_display_update_audio_rms((uint16_t)rms);
                     int floor = audio_dsp_get_ambient_noise();
 
                     // 1. Quản lý thời điểm bắt đầu thu âm:
@@ -483,6 +486,7 @@ static void audio_recording_task(void *arg) {
                                          slice_names[s], lbl, conf * 100.0f);
                                 ESP_LOGW(TAG, "==================================================");
                                 dispatch_local_mesh_command(lbl);
+                                ui_display_notify_command_executed(lbl, 45);
 #if DEBUG_LOCAL_TEST_MODE
                                 ESP_LOGW(TAG, ">>> [LOCAL TEST] Khớp lệnh '%s'! Phát lại âm thanh vừa thu ra loa <<<", lbl);
                                 audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
@@ -613,6 +617,7 @@ static void audio_recording_task(void *arg) {
                 if (bytes_read > 0) {
                     int rms = 0;
                     bool has_voice = audio_vad_is_speech_chunk(stream_chunk_buffer, bytes_read / sizeof(int16_t), &rms);
+                    ui_display_update_audio_rms((uint16_t)rms);
 
                     // Gửi chunk PCM lên WebSocket RingBuffer
                     ai_cloud_send_audio_chunk((uint8_t *)stream_chunk_buffer, bytes_read);
@@ -675,6 +680,10 @@ static void audio_recording_task(void *arg) {
                 bool cloud_busy = ai_cloud_is_busy();
                 bool speaker_playing = audio_hal_is_playing();
 
+                if (cloud_busy || speaker_playing) {
+                    ui_display_notify_cloud_speaking();
+                }
+
                 responding_log_counter++;
                 if (responding_log_counter % 25 == 0) {
                     ESP_LOGD(TAG, "[AI_RESPONDING] Đang chờ phản hồi & phát âm thanh... (Cloud bận: %d, Loa phát: %d, SilentCycles: %d)",
@@ -703,6 +712,7 @@ static void audio_recording_task(void *arg) {
                 // Chế độ 1 Hỏi - 1 Đáp (Single-Turn): Đóng phiên sạch sẽ & trở về chờ 'Hey Cherry'
                 if (!cloud_busy && !speaker_playing) {
                     ESP_LOGI(TAG, ">>> [TURN COMPLETE] AI trả lời hoàn tất & loa đã nghỉ -> Trở về lắng nghe 'Hey Cherry' <<<");
+                    ui_display_hide_voice_overlay();
                     s_responding_silent_cycles = 0;
                     ai_cloud_stop_session();
                     ei_wakeword_reset();
@@ -806,6 +816,18 @@ void ai_edge_stop_recording(void) {
         ESP_LOGI(TAG, "Dừng ghi âm khẩn cấp (Hủy bởi Cloud/Socket Error).");
         ei_wakeword_reset();
         s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+        ui_display_hide_voice_overlay();
+    }
+}
+
+void ai_edge_abort(void) {
+    if (s_edge_state != AI_EDGE_STATE_IDLE_WAKEWORD) {
+        ESP_LOGI(TAG, "Huỷ phiên tương tác giọng nói (Abort requested by Touch/Button)");
+        ai_cloud_stop_session();
+        audio_hal_stop_playback();
+        ei_wakeword_reset();
+        s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+        ui_display_hide_voice_overlay();
     }
 }
 

@@ -7,6 +7,8 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "esp_sntp.h"
+#include <time.h>
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "driver/gpio.h"
@@ -119,6 +121,17 @@ static void event_handler(void* arg, esp_event_base_t event_base,
             xTimerStop(s_reconnect_timer, 0);
         }
         xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+
+        // Khởi động đồng bộ giờ SNTP (Múi giờ GMT+7 Việt Nam)
+        if (!esp_sntp_enabled()) {
+            esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_init();
+            setenv("TZ", "ICT-7", 1);
+            tzset();
+            ESP_LOGI(TAG, "SNTP Started: Syncing network time to GMT+7...");
+        }
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -236,4 +249,44 @@ void sys_core_init(void) {
 
 bool sys_core_is_wifi_connected(void) {
     return s_is_connected;
+}
+
+void sys_core_get_ip_str(char *out_str, size_t max_len) {
+    if (!out_str || max_len == 0) return;
+    if (!s_is_connected) {
+        snprintf(out_str, max_len, "Offline");
+        return;
+    }
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+            snprintf(out_str, max_len, IPSTR, IP2STR(&ip_info.ip));
+            return;
+        }
+    }
+    snprintf(out_str, max_len, "192.168.?.?");
+}
+
+int8_t sys_core_get_wifi_rssi(void) {
+    if (!s_is_connected) return -100;
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        return ap_info.rssi;
+    }
+    return -100;
+}
+
+void sys_core_get_wifi_ssid(char *out_str, size_t max_len) {
+    if (!out_str || max_len == 0) return;
+    if (!s_is_connected) {
+        snprintf(out_str, max_len, "Disconnected");
+        return;
+    }
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        snprintf(out_str, max_len, "%s", (char*)ap_info.ssid);
+        return;
+    }
+    snprintf(out_str, max_len, "Connected");
 }

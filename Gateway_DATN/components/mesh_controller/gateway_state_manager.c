@@ -7,13 +7,19 @@
 static const char *TAG = "gateway_state";
 
 static gateway_device_state_t s_device_state = {
+    .relay_node_online = true,          // Mặc định ban đầu bật kết nối để hiển thị
+    .dimmer_node_online = true,
+    .sensor_node_online = true,
+    .mesh_node_count = 3,
     .dimmer_on = false,
     .dimmer_brightness = 0,
     .dimmer_last_brightness = 80,
     .relay_on = false,
-    .temperature = 0.0f,
-    .humidity = 0.0f,
-    .sensor_valid = false,
+    .power_watts = 0.0f,
+    .temperature = 28.5f,
+    .humidity = 65.0f,
+    .light_lux = 320,
+    .sensor_valid = true,
 };
 
 static SemaphoreHandle_t s_state_mutex = NULL;
@@ -93,6 +99,58 @@ void gateway_state_set_sensor(float temperature, float humidity) {
     }
 
     ESP_LOGI(TAG, "Sensor DHT11 Updated: Temp=%.1f°C, Humidity=%.1f%%", temperature, humidity);
+    if (s_change_cb) {
+        s_change_cb(&copy);
+    }
+}
+
+void gateway_state_set_node_presence(bool relay_online, bool dimmer_online, bool sensor_online) {
+    gateway_device_state_t copy;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_device_state.relay_node_online = relay_online;
+        s_device_state.dimmer_node_online = dimmer_online;
+        s_device_state.sensor_node_online = sensor_online;
+        memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
+        xSemaphoreGive(s_state_mutex);
+    }
+    ESP_LOGI(TAG, "Mesh Node Presence: Relay=%d, Dimmer=%d, Sensor=%d",
+             relay_online, dimmer_online, sensor_online);
+    if (s_change_cb) {
+        s_change_cb(&copy);
+    }
+}
+
+void gateway_state_set_mesh_count(uint8_t count) {
+    gateway_device_state_t copy;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_device_state.mesh_node_count = count;
+        memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
+        xSemaphoreGive(s_state_mutex);
+    }
+    if (s_change_cb) {
+        s_change_cb(&copy);
+    }
+}
+
+void gateway_state_set_power(float watts) {
+    gateway_device_state_t copy;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_device_state.power_watts = watts;
+        memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
+        xSemaphoreGive(s_state_mutex);
+    }
+    if (s_change_cb) {
+        s_change_cb(&copy);
+    }
+}
+
+void gateway_state_set_light(uint16_t lux) {
+    gateway_device_state_t copy;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_device_state.light_lux = lux;
+        memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
+        xSemaphoreGive(s_state_mutex);
+    }
     if (s_change_cb) {
         s_change_cb(&copy);
     }

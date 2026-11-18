@@ -199,12 +199,15 @@ void mesh_controller_set_dimmer(bool on, uint8_t brightness) {
         char cmd[64];
         snprintf(cmd, sizeof(cmd), "CMD:DIMMER:SET:%u", brightness);
         mesh_controller_send_command(cmd);
+        gateway_state_set_dimmer(true, brightness);
     } else {
         mesh_controller_send_command("CMD:DIMMER:OFF");
+        gateway_state_set_dimmer(false, 0);
     }
 }
 
 void mesh_controller_set_relay(bool on) {
+    gateway_state_set_relay(on);
     if (on) {
         mesh_controller_send_command("CMD:RELAY:ON");
     } else {
