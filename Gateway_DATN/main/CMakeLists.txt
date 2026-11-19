@@ -9,4 +9,4 @@ set(APP_SOURCE "main.c")
 
 idf_component_register(SRCS "${APP_SOURCE}"
                        INCLUDE_DIRS "."
-                       REQUIRES sys_core audio_hal mesh_controller thread_gateway ai_cloud ai_edge esp_http_server esp_netif iot_cloud ui_display i2s_examples_common)
+                       REQUIRES sys_core audio_hal mesh_controller thread_gateway ai_cloud ai_edge esp_http_server esp_netif iot_cloud ui_display i2s_examples_common mdns)

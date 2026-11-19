@@ -132,8 +132,8 @@ void audio_hal_init(void) {
 
     // --- FROM init_microphone() ---
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    rx_chan_cfg.dma_desc_num = 16;
-    rx_chan_cfg.dma_frame_num = 1000; // 16 * 1000 = 16000 samples = 1.0s hardware DMA buffer chống tràn khi chạy inference!
+    rx_chan_cfg.dma_desc_num = 6;
+    rx_chan_cfg.dma_frame_num = 240; // 6 * 240 = 1440 samples (~90ms hardware DMA, tiết kiệm tối đa Internal DMA SRAM)
     ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_handle));
 
     i2s_std_config_t rx_std_cfg = {
@@ -159,8 +159,8 @@ void audio_hal_init(void) {
 
     // --- FROM init_speaker() ---
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    tx_chan_cfg.dma_desc_num = 16;
-    tx_chan_cfg.dma_frame_num = 480; // 16 * 480 = 7680 samples = 320ms hardware DMA buffer cushion
+    tx_chan_cfg.dma_desc_num = 6;
+    tx_chan_cfg.dma_frame_num = 240; // 6 * 240 = 1440 samples (~60ms hardware DMA cushion, đệm chính nằm ở 2MB PSRAM RingBuffer)
     tx_chan_cfg.auto_clear = true;   // Tự động clear buffer xuất số 0 khi cạn dữ liệu, triệt tiêu 100% tiếng rè cơ học!
     esp_err_t err = i2s_new_channel(&tx_chan_cfg, &tx_handle, NULL);
     if (err != ESP_OK) {

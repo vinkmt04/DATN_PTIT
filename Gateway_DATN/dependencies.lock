@@ -146,6 +146,6 @@ direct_dependencies:
 - i2s_examples_common
 - idf
 - lvgl/lvgl
-manifest_hash: 82b9641d8ef53f75c0f4e1ef379bda0740427737670a9d04487fb2e32422960f
+manifest_hash: 8d5bb1fdd6c357a14a7c68030b8b1b7d21325b7311a84315da1d68b955e634e7
 target: esp32s3
 version: 2.0.0

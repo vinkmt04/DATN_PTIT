@@ -67,6 +67,11 @@ static void wifi_reconnect_timer_cb(TimerHandle_t xTimer) {
     esp_wifi_connect();
 }
 
+static void time_sync_notification_cb(struct timeval *tv) {
+    (void)tv;
+    ESP_LOGI(TAG, ">>> [SNTP SYNC SUCCESS] Thời gian hệ thống đã được cập nhật tức thì GMT+7! <<<");
+}
+
 static void event_handler(void* arg, esp_event_base_t event_base,
                           int32_t event_id, void* event_data)
 {
@@ -122,15 +127,18 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         }
         xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
 
-        // Khởi động đồng bộ giờ SNTP (Múi giờ GMT+7 Việt Nam)
+        // Khởi động đồng bộ giờ SNTP tức thì (Múi giờ GMT+7 Việt Nam)
         if (!esp_sntp_enabled()) {
             esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-            esp_sntp_setservername(0, "pool.ntp.org");
-            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+            esp_sntp_setservername(0, "vn.pool.ntp.org");
+            esp_sntp_setservername(1, "asia.pool.ntp.org");
+            esp_sntp_setservername(2, "time.google.com");
+            esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
             esp_sntp_init();
             setenv("TZ", "ICT-7", 1);
             tzset();
-            ESP_LOGI(TAG, "SNTP Started: Syncing network time to GMT+7...");
+            ESP_LOGI(TAG, "SNTP Started (IMMED mode): Syncing network time to GMT+7 via VN/Asia/Google NTP...");
         }
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }

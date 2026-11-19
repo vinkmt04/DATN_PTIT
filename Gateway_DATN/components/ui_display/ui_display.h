@@ -21,7 +21,7 @@ extern "C" {
 #define UI_LCD_V_RES                    240
 
 // Thời gian không thao tác để tự động về Màn hình Chờ (Idle Screen)
-#define UI_IDLE_TIMEOUT_SECONDS         30
+#define UI_IDLE_TIMEOUT_SECONDS         90
 
 // Định nghĩa các chân LCD ST7789V (SPI2_HOST DMA) - Cụm Header J1 (Trái)
 #define LCD_PIN_SCLK                    12
@@ -65,8 +65,13 @@ typedef void (*ui_display_abort_cb_t)(void);
 void ui_display_set_abort_callback(ui_display_abort_cb_t cb);
 void ui_display_trigger_abort(void);
 
+#include "thread_commissioner.h"
+
 // Lấy trạng thái màn hình hiện tại đang là Idle (true) hay Dashboard (false)
 bool ui_display_is_idle(void);
+
+// Báo thiết bị Thread mới phát hiện để hiện trên popup phê duyệt
+void ui_display_notify_discovery(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi);
 
 // Đánh thức màn hình từ Idle lên Dashboard (100% đèn nền)
 void ui_display_wake_up(void);

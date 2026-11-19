@@ -44,6 +44,14 @@ typedef void (*gateway_state_change_cb_t)(const gateway_device_state_t *new_stat
 // Khởi tạo State Manager
 void gateway_state_manager_init(void);
 
+// Lấy số lượng Node Thread Mesh đang thực tế hoạt động
+uint8_t gateway_state_get_active_node_count(void);
+
+// Kiểm tra trạng thái trực tuyến của từng thiết bị
+bool gateway_state_is_relay_online(void);
+bool gateway_state_is_dimmer_online(void);
+bool gateway_state_is_sensor_online(void);
+
 // Lấy bản sao trạng thái an toàn (Thread-Safe)
 void gateway_state_get(gateway_device_state_t *out_state);
 

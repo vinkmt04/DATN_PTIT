@@ -22,24 +22,26 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Starting Voice Gateway (ESP32-S3)");
 
-    // Initialize core and wait for Wi-Fi
-    sys_core_init();
-    
-    // Initialize UI Display (ST7789V 2.8" TFT + XPT2046 Touch + LVGL v8)
+    // 1. Khởi tạo Audio Hardware (I2S DMA) trước tiên khi SRAM nội bộ còn nguyên vẹn 100%
+    audio_hal_init();
+
+    // Khởi tạo Gateway State Manager sớm để UI và các module luôn có trạng thái an toàn
+    gateway_state_manager_init();
+
+    // 2. Khởi tạo Màn hình ST7789V (SPI DMA + LVGL double-buffer)
     ui_display_init();
 
-    // Initialize Audio
-    audio_hal_init();
-    
-    // Initialize Mesh UART Controller
+    // 3. Khởi tạo Wi-Fi, NVS & Event Loop
+    sys_core_init();
+
+    // 4. Khởi tạo Mesh Controller (OpenThread Border Router Host)
     mesh_controller_init();
     
-    // Initialize ThingsBoard IoT Cloud
+    // 5. Khởi tạo Cloud & Trợ lý thông minh
     iot_cloud_init();
-    
     ai_cloud_init();
 
-    // Initialize Edge AI (Gatekeeper)
+    // 6. Khởi tạo Edge AI (Gatekeeper listening)
     ai_edge_init();
 
     // Link UI Touch Dismiss to ai_edge_abort

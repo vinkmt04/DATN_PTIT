@@ -14,6 +14,7 @@ idf_component_register(
         freertos 
         esp_timer 
         mesh_controller 
+        thread_gateway
         iot_cloud 
         sys_core 
         lvgl

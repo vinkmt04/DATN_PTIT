@@ -9,6 +9,7 @@
 #include "sys_core.h"
 #include "iot_cloud.h"
 #include "gateway_state_manager.h"
+#include "thread_commissioner.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -41,6 +42,7 @@ typedef enum {
     UI_EVT_VOICE_RMS,
     UI_EVT_COMMAND_DONE,
     UI_EVT_CLOUD_SPEAKING,
+    UI_EVT_DISCOVERY_DEVICE,
 } ui_event_type_t;
 
 typedef struct {
@@ -52,6 +54,12 @@ typedef struct {
             char cmd_name[32];
             uint32_t latency;
         } cmd;
+        struct {
+            commissioner_dev_type_t type;
+            char name[32];
+            char id_str[32];
+            int8_t rssi;
+        } discovery;
     } data;
 } ui_event_msg_t;
 
@@ -121,6 +129,15 @@ static void ui_display_task(void *pvParameters) {
     ESP_LOGI(TAG, "GUI Main Task started on Core 0 (Priority 4)");
     gateway_state_register_callback(on_gateway_state_callback);
 
+    // Khoi tao trang thai Dashboard ban dau tu State Manager
+    gateway_device_state_t init_state;
+    memset(&init_state, 0, sizeof(init_state));
+    gateway_state_get(&init_state);
+    if (xSemaphoreTake(s_gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        ui_screen_dashboard_update_state(&init_state);
+        xSemaphoreGive(s_gui_mutex);
+    }
+
     s_last_interaction_us = esp_timer_get_time();
     int sec_counter = 0;
 
@@ -161,6 +178,20 @@ static void ui_display_task(void *pvParameters) {
                         st7789v_set_backlight(100);
                         ui_voice_overlay_set_status("Gemini Live đang trả lời...", UI_COLOR_SIRI_PURPLE);
                         break;
+                    case UI_EVT_DISCOVERY_DEVICE:
+                        st7789v_set_backlight(100);
+                        if (s_is_idle) {
+                            s_is_idle = false;
+                            lv_scr_load(s_scr_dash);
+                        }
+                        ui_screen_dashboard_on_device_discovered(
+                            (commissioner_dev_type_t)msg.data.discovery.type,
+                            msg.data.discovery.name,
+                            msg.data.discovery.id_str,
+                            msg.data.discovery.rssi
+                        );
+                        s_last_interaction_us = esp_timer_get_time();
+                        break;
                 }
                 xSemaphoreGive(s_gui_mutex);
             }
@@ -187,22 +218,23 @@ static void ui_display_task(void *pvParameters) {
             int8_t rssi = sys_core_get_wifi_rssi();
             bool wifi_ok = sys_core_is_wifi_connected();
             bool cloud_ok = iot_cloud_is_connected();
+            uint8_t mesh_count = gateway_state_get_active_node_count();
 
             if (xSemaphoreTake(s_gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Cập nhật giờ và thông số mạng
                 ui_screen_idle_update_time(&timeinfo);
-                ui_screen_idle_update_status(wifi_ok, cloud_ok, 3);
+                ui_screen_idle_update_status(wifi_ok, cloud_ok, mesh_count);
                 ui_screen_dashboard_update_time(&timeinfo);
                 ui_screen_dashboard_update_network(wifi_ok, ip_str, rssi, cloud_ok);
 
-                // Kiểm tra Idle Timeout: 30 giây không chạm và không có voice
+                // Kiểm tra Idle Timeout: 90 giây không chạm và không có voice
                 int64_t now_us = esp_timer_get_time();
                 if (!s_is_idle && !ui_voice_overlay_is_visible()) {
                     if ((now_us - s_last_interaction_us) > ((int64_t)UI_IDLE_TIMEOUT_SECONDS * 1000000LL)) {
                         s_is_idle = true;
                         lv_scr_load(s_scr_idle);
                         st7789v_set_backlight(30); // Giảm đèn nền xuống 30% để tiết kiệm điện
-                        ESP_LOGI(TAG, "UI: 30s Timeout -> Chuyen sang man hinh Cho (Idle Screen) & Dimming 30%%");
+                        ESP_LOGI(TAG, "UI: 90s Timeout -> Chuyen sang man hinh Cho (Idle Screen) & Dimming 30%%");
                     }
                 }
                 xSemaphoreGive(s_gui_mutex);
@@ -222,8 +254,10 @@ void ui_display_init(void) {
     // 1. Khởi tạo LVGL
     lv_init();
 
-    // Đăng ký Font Tiếng Việt có dấu làm fallback cho Montserrat 14
-    ((lv_font_t *)&lv_font_montserrat_14)->fallback = &ui_font_vn_14;
+    // Lưu ý: ui_font_vn_14 đã được cấu hình .fallback = &lv_font_montserrat_14 trong ui_font_vn_14.c
+    // Tuyệt đối không gán ngược lv_font_montserrat_14.fallback = &ui_font_vn_14 vì sẽ tạo vòng lặp vô tận (Circular Fallback)
+    // khiến hàm lv_font_get_glyph_dsc treo cứng khi gặp ký tự thiếu (ví dụ '\n'), gây trigger Task Watchdog Timer.
+    ((lv_font_t *)&lv_font_montserrat_14)->fallback = NULL;
 
     // 2. Khởi tạo phần cứng màn hình ST7789V
     esp_err_t ret = st7789v_driver_init(&s_panel_handle, &s_io_handle);
@@ -290,6 +324,9 @@ void ui_display_init(void) {
     lv_scr_load(s_scr_idle);
     st7789v_set_backlight(100); // Khởi động 100% trước, sau 30s tự giảm xuống 30%
 
+    // Đăng ký callback khi Commissioner phát hiện thiết bị mới
+    thread_commissioner_set_discovery_callback(ui_display_notify_discovery);
+
     // 7. Tạo GUI Task trên Core 0 (độ ưu tiên 4)
     xTaskCreatePinnedToCore(ui_display_task, "ui_display_task", 6144, NULL, 4, NULL, 0);
 
@@ -349,4 +386,23 @@ void ui_display_trigger_abort(void) {
     if (s_abort_cb) {
         s_abort_cb();
     }
+}
+
+void ui_display_notify_discovery(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi) {
+    if (!s_ui_event_queue) return;
+    ui_event_msg_t msg;
+    msg.type = UI_EVT_DISCOVERY_DEVICE;
+    msg.data.discovery.type = type;
+    if (name) {
+        snprintf(msg.data.discovery.name, sizeof(msg.data.discovery.name), "%s", name);
+    } else {
+        msg.data.discovery.name[0] = '\0';
+    }
+    if (id_str) {
+        snprintf(msg.data.discovery.id_str, sizeof(msg.data.discovery.id_str), "%s", id_str);
+    } else {
+        msg.data.discovery.id_str[0] = '\0';
+    }
+    msg.data.discovery.rssi = rssi;
+    xQueueSend(s_ui_event_queue, &msg, 0);
 }

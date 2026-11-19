@@ -2,6 +2,7 @@
 
 #include "lvgl.h"
 #include "gateway_state_manager.h"
+#include "thread_commissioner.h"
 #include <time.h>
 #include <stdbool.h>
 
@@ -23,6 +24,9 @@ void ui_screen_dashboard_update_network(bool wifi_ok, const char *ip_str, int8_t
 
 // Chọn Tab hiển thị (0: Thiết bị, 1: Môi trường, 2: Hệ thống)
 void ui_screen_dashboard_select_tab(uint16_t tab_idx);
+
+// Thông báo thiết bị Thread mới được phát hiện chờ phê duyệt
+void ui_screen_dashboard_on_device_discovered(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi);
 
 #ifdef __cplusplus
 }
