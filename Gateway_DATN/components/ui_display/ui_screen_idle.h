@@ -18,7 +18,7 @@ void ui_screen_idle_update_time(const struct tm *timeinfo);
 void ui_screen_idle_update_sensors(float temp, float hum, bool valid);
 
 // Cập nhật các icon trạng thái mạng thu nhỏ
-void ui_screen_idle_update_status(bool wifi_ok, bool cloud_ok, uint8_t mesh_nodes);
+void ui_screen_idle_update_status(bool wifi_ok, bool cloud_ok, uint8_t online_nodes, uint8_t total_nodes);
 
 #ifdef __cplusplus
 }

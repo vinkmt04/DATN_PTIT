@@ -37,6 +37,7 @@ esp_err_t actuator_set_brightness(int percent);
 esp_err_t actuator_read_relay(void);
 esp_err_t actuator_read_brightness(void);
 esp_err_t actuator_get_snapshot(actuator_device_t device, actuator_snapshot_t *out);
+esp_err_t actuator_send_unpair(actuator_device_t device);
 void      actuator_client_set_callback(actuator_callback_t cb);
 
 #ifdef __cplusplus

@@ -76,8 +76,10 @@ static lv_obj_t *s_lbl_disc_name = NULL;
 static lv_obj_t *s_lbl_disc_info = NULL;
 static lv_obj_t *s_btn_approve = NULL;
 static lv_obj_t *s_btn_modal_cancel = NULL;
+static lv_obj_t *s_lbl_modal_cancel = NULL;
 static lv_timer_t *s_commissioning_timer = NULL;
 static int s_countdown_val = 60;
+static bool s_waiting_pairing = false;
 static char s_discovered_id_str[32] = {0};
 
 // Modal xác nhận gỡ bỏ thiết bị
@@ -86,6 +88,12 @@ static lv_obj_t *s_lbl_del_msg = NULL;
 static char s_del_target_id[32] = {0};
 
 // Trạng thái cục bộ phản hồi cảm ứng tức thì
+static bool s_relay_registered_local = false;
+static bool s_dimmer_registered_local = false;
+static bool s_sensor_registered_local = false;
+static bool s_relay_online_local = false;
+static bool s_dimmer_online_local = false;
+static bool s_sensor_online_local = false;
 static bool s_relay_state_local = false;
 static bool s_dimmer_state_local = false;
 static uint8_t s_dimmer_bri_local = 80;
@@ -98,57 +106,88 @@ static bool s_suppress_events = false;
 // CẬP NHẬT GIAO DIỆN TRỰC QUAN THIẾT BỊ
 // =============================================================================
 
-static void update_relay_ui(bool is_on) {
+static void update_relay_ui(bool is_online, bool is_on) {
     if (!s_card_relay) return;
-    if (is_on) {
-        lv_obj_set_style_bg_color(s_card_relay, lv_color_hex(0xF0FDF4), 0);
-        lv_obj_set_style_border_color(s_card_relay, UI_COLOR_ACCENT_GREEN, 0);
-        lv_obj_set_style_border_width(s_card_relay, 2, 0);
-
-        lv_obj_set_style_bg_color(s_icon_relay_btn, UI_COLOR_ACCENT_GREEN, 0);
-        lv_obj_set_style_text_color(s_icon_relay, lv_color_white(), 0);
-
-        lv_label_set_text(s_lbl_relay_state, "Bật");
-        lv_obj_set_style_text_color(s_lbl_relay_state, UI_COLOR_ACCENT_GREEN, 0);
-    } else {
-        lv_obj_set_style_bg_color(s_card_relay, UI_COLOR_CARD_BG, 0);
-        lv_obj_set_style_border_color(s_card_relay, UI_COLOR_CARD_BORDER, 0);
+    if (!is_online) {
+        // Mờ xám khi Offline
+        lv_obj_set_style_opa(s_card_relay, LV_OPA_60, 0);
+        lv_obj_set_style_bg_color(s_card_relay, lv_color_hex(0xF3F4F6), 0);
+        lv_obj_set_style_border_color(s_card_relay, lv_color_hex(0xD1D5DB), 0);
         lv_obj_set_style_border_width(s_card_relay, 1, 0);
 
-        lv_obj_set_style_bg_color(s_icon_relay_btn, lv_color_hex(0xF2F2F7), 0);
-        lv_obj_set_style_text_color(s_icon_relay, UI_COLOR_TEXT_MUTED, 0);
+        lv_obj_set_style_bg_color(s_icon_relay_btn, lv_color_hex(0xE5E7EB), 0);
+        lv_obj_set_style_text_color(s_icon_relay, lv_color_hex(0x9CA3AF), 0);
 
-        lv_label_set_text(s_lbl_relay_state, "Tắt");
-        lv_obj_set_style_text_color(s_lbl_relay_state, UI_COLOR_TEXT_MUTED, 0);
+        lv_label_set_text(s_lbl_relay_state, "Offline");
+        lv_obj_set_style_text_color(s_lbl_relay_state, lv_color_hex(0x9CA3AF), 0);
+    } else {
+        lv_obj_set_style_opa(s_card_relay, LV_OPA_COVER, 0);
+        if (is_on) {
+            lv_obj_set_style_bg_color(s_card_relay, lv_color_hex(0xF0FDF4), 0);
+            lv_obj_set_style_border_color(s_card_relay, UI_COLOR_ACCENT_GREEN, 0);
+            lv_obj_set_style_border_width(s_card_relay, 2, 0);
+
+            lv_obj_set_style_bg_color(s_icon_relay_btn, UI_COLOR_ACCENT_GREEN, 0);
+            lv_obj_set_style_text_color(s_icon_relay, lv_color_white(), 0);
+
+            lv_label_set_text(s_lbl_relay_state, "Bật");
+            lv_obj_set_style_text_color(s_lbl_relay_state, UI_COLOR_ACCENT_GREEN, 0);
+        } else {
+            lv_obj_set_style_bg_color(s_card_relay, UI_COLOR_CARD_BG, 0);
+            lv_obj_set_style_border_color(s_card_relay, UI_COLOR_CARD_BORDER, 0);
+            lv_obj_set_style_border_width(s_card_relay, 1, 0);
+
+            lv_obj_set_style_bg_color(s_icon_relay_btn, lv_color_hex(0xF2F2F7), 0);
+            lv_obj_set_style_text_color(s_icon_relay, UI_COLOR_TEXT_MUTED, 0);
+
+            lv_label_set_text(s_lbl_relay_state, "Tắt");
+            lv_obj_set_style_text_color(s_lbl_relay_state, UI_COLOR_TEXT_MUTED, 0);
+        }
     }
 }
 
-static void update_dimmer_ui(bool is_on, uint8_t brightness) {
+static void update_dimmer_ui(bool is_online, bool is_on, uint8_t brightness) {
     if (!s_card_dimmer) return;
-    if (is_on) {
-        lv_obj_set_style_bg_color(s_card_dimmer, lv_color_hex(0xFFFBEB), 0);
-        lv_obj_set_style_border_color(s_card_dimmer, UI_COLOR_LIGHT_WARM, 0);
-        lv_obj_set_style_border_width(s_card_dimmer, 2, 0);
-
-        lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xFEF3C7), 0);
-        lv_obj_set_style_bg_color(s_bulb_head, UI_COLOR_LIGHT_WARM, 0);
-        lv_obj_set_style_bg_color(s_bulb_base, lv_color_hex(0x92400E), 0);
-
-        char dim_buf[16];
-        snprintf(dim_buf, sizeof(dim_buf), "%u%%", brightness);
-        lv_label_set_text(s_lbl_dimmer_val, dim_buf);
-        lv_obj_set_style_text_color(s_lbl_dimmer_val, UI_COLOR_LIGHT_WARM, 0);
-    } else {
-        lv_obj_set_style_bg_color(s_card_dimmer, UI_COLOR_CARD_BG, 0);
-        lv_obj_set_style_border_color(s_card_dimmer, UI_COLOR_CARD_BORDER, 0);
+    if (!is_online) {
+        // Mờ xám khi Offline
+        lv_obj_set_style_opa(s_card_dimmer, LV_OPA_60, 0);
+        lv_obj_set_style_bg_color(s_card_dimmer, lv_color_hex(0xF3F4F6), 0);
+        lv_obj_set_style_border_color(s_card_dimmer, lv_color_hex(0xD1D5DB), 0);
         lv_obj_set_style_border_width(s_card_dimmer, 1, 0);
 
-        lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xF2F2F7), 0);
+        lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xE5E7EB), 0);
         lv_obj_set_style_bg_color(s_bulb_head, lv_color_hex(0xD1D5DB), 0);
         lv_obj_set_style_bg_color(s_bulb_base, lv_color_hex(0x9CA3AF), 0);
 
-        lv_label_set_text(s_lbl_dimmer_val, "Tắt");
-        lv_obj_set_style_text_color(s_lbl_dimmer_val, UI_COLOR_TEXT_MUTED, 0);
+        lv_label_set_text(s_lbl_dimmer_val, "Offline");
+        lv_obj_set_style_text_color(s_lbl_dimmer_val, lv_color_hex(0x9CA3AF), 0);
+    } else {
+        lv_obj_set_style_opa(s_card_dimmer, LV_OPA_COVER, 0);
+        if (is_on) {
+            lv_obj_set_style_bg_color(s_card_dimmer, lv_color_hex(0xFFFBEB), 0);
+            lv_obj_set_style_border_color(s_card_dimmer, UI_COLOR_LIGHT_WARM, 0);
+            lv_obj_set_style_border_width(s_card_dimmer, 2, 0);
+
+            lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xFEF3C7), 0);
+            lv_obj_set_style_bg_color(s_bulb_head, UI_COLOR_LIGHT_WARM, 0);
+            lv_obj_set_style_bg_color(s_bulb_base, lv_color_hex(0x92400E), 0);
+
+            char dim_buf[16];
+            snprintf(dim_buf, sizeof(dim_buf), "%u%%", brightness);
+            lv_label_set_text(s_lbl_dimmer_val, dim_buf);
+            lv_obj_set_style_text_color(s_lbl_dimmer_val, UI_COLOR_LIGHT_WARM, 0);
+        } else {
+            lv_obj_set_style_bg_color(s_card_dimmer, UI_COLOR_CARD_BG, 0);
+            lv_obj_set_style_border_color(s_card_dimmer, UI_COLOR_CARD_BORDER, 0);
+            lv_obj_set_style_border_width(s_card_dimmer, 1, 0);
+
+            lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xF2F2F7), 0);
+            lv_obj_set_style_bg_color(s_bulb_head, lv_color_hex(0xD1D5DB), 0);
+            lv_obj_set_style_bg_color(s_bulb_base, lv_color_hex(0x9CA3AF), 0);
+
+            lv_label_set_text(s_lbl_dimmer_val, "Tắt");
+            lv_obj_set_style_text_color(s_lbl_dimmer_val, UI_COLOR_TEXT_MUTED, 0);
+        }
     }
     lv_slider_set_value(s_slider_dimmer, brightness, LV_ANIM_OFF);
 }
@@ -157,14 +196,8 @@ static void update_dimmer_ui(bool is_on, uint8_t brightness) {
 // COMMISSIONING MODAL (QUY TRÌNH QUÉT & PHÊ DUYỆT THIẾT BỊ)
 // =============================================================================
 
-static void modal_auto_close_cb(lv_timer_t *tmr) {
-    if (s_modal_backdrop) {
-        lv_obj_add_flag(s_modal_backdrop, LV_OBJ_FLAG_HIDDEN);
-    }
-    lv_timer_del(tmr);
-}
-
 static void commissioning_timer_cb(lv_timer_t *tmr) {
+    (void)tmr;
     s_countdown_val--;
     if (s_countdown_val <= 0) {
         thread_commissioner_stop();
@@ -187,18 +220,54 @@ static void commissioning_timer_cb(lv_timer_t *tmr) {
     }
 }
 
+static void close_commissioning_modal(void) {
+    s_waiting_pairing = false;
+    if (s_commissioning_timer) {
+        lv_timer_del(s_commissioning_timer);
+        s_commissioning_timer = NULL;
+    }
+    thread_commissioner_stop();
+    if (s_modal_backdrop) {
+        lv_obj_add_flag(s_modal_backdrop, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_lbl_modal_title) {
+        lv_obj_set_style_text_color(s_lbl_modal_title, UI_COLOR_TEXT_MAIN, 0);
+    }
+    if (s_btn_modal_cancel) {
+        lv_obj_set_style_bg_color(s_btn_modal_cancel, lv_color_hex(0xE5E5EA), 0);
+    }
+    if (s_lbl_modal_cancel) {
+        lv_label_set_text(s_lbl_modal_cancel, "Hủy");
+        lv_obj_set_style_text_color(s_lbl_modal_cancel, UI_COLOR_TEXT_MAIN, 0);
+    }
+    ESP_LOGI(TAG, "UI: Đóng modal Commissioner");
+}
+
 static void open_commissioning_modal(void) {
     if (!s_modal_backdrop) return;
 
+    s_waiting_pairing = false;
     s_countdown_val = 60;
     lv_label_set_text(s_lbl_modal_title, "Thêm thiết bị Thread");
+    lv_obj_set_style_text_color(s_lbl_modal_title, UI_COLOR_TEXT_MAIN, 0);
+
     lv_label_set_text(s_lbl_modal_countdown, "Đang tìm thiết bị... 60s");
     lv_label_set_text(s_lbl_modal_sub, "Nhấn giữ nút cấu hình trên thiết bị...");
+    lv_obj_set_style_text_color(s_lbl_modal_sub, UI_COLOR_TEXT_MUTED, 0);
 
     lv_obj_clear_flag(s_spinner_scan, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_lbl_modal_countdown, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_lbl_modal_sub, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_cont_discovered, LV_OBJ_FLAG_HIDDEN);
+
+    if (s_btn_modal_cancel) {
+        lv_obj_clear_flag(s_btn_modal_cancel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_btn_modal_cancel, lv_color_hex(0xE5E5EA), 0);
+    }
+    if (s_lbl_modal_cancel) {
+        lv_label_set_text(s_lbl_modal_cancel, "Hủy");
+        lv_obj_set_style_text_color(s_lbl_modal_cancel, UI_COLOR_TEXT_MAIN, 0);
+    }
 
     lv_obj_clear_flag(s_modal_backdrop, LV_OBJ_FLAG_HIDDEN);
 
@@ -211,37 +280,102 @@ static void open_commissioning_modal(void) {
     ESP_LOGI(TAG, "UI: Bật Commissioner tìm kiếm thiết bị Thread trong 60s");
 }
 
-static void close_commissioning_modal(void) {
+static void btn_modal_cancel_event_cb(lv_event_t *e) {
+    (void)e;
+    close_commissioning_modal();
+    gateway_device_state_t cur_st;
+    gateway_state_get(&cur_st);
+    ui_screen_dashboard_update_state(&cur_st);
+}
+
+void ui_screen_dashboard_on_pairing_result(bool success) {
+    if (!s_modal_backdrop || lv_obj_has_flag(s_modal_backdrop, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    s_waiting_pairing = false;
     if (s_commissioning_timer) {
         lv_timer_del(s_commissioning_timer);
         s_commissioning_timer = NULL;
     }
     thread_commissioner_stop();
-    if (s_modal_backdrop) {
-        lv_obj_add_flag(s_modal_backdrop, LV_OBJ_FLAG_HIDDEN);
+
+    if (s_spinner_scan) lv_obj_add_flag(s_spinner_scan, LV_OBJ_FLAG_HIDDEN);
+    if (s_lbl_modal_countdown) lv_obj_add_flag(s_lbl_modal_countdown, LV_OBJ_FLAG_HIDDEN);
+    if (s_cont_discovered) lv_obj_add_flag(s_cont_discovered, LV_OBJ_FLAG_HIDDEN);
+    if (s_lbl_modal_sub) lv_obj_clear_flag(s_lbl_modal_sub, LV_OBJ_FLAG_HIDDEN);
+
+    if (success) {
+        if (strlen(s_discovered_id_str) > 0) {
+            gateway_state_set_device_registered(s_discovered_id_str, true);
+        }
+        if (s_lbl_modal_title) {
+            lv_label_set_text(s_lbl_modal_title, "Thêm thiết bị thành công!");
+            lv_obj_set_style_text_color(s_lbl_modal_title, UI_COLOR_ACCENT_GREEN, 0);
+        }
+        if (s_lbl_modal_sub) {
+            lv_label_set_text(s_lbl_modal_sub, "Thiết bị đã kết nối an toàn vào mạng Thread.");
+            lv_obj_set_style_text_color(s_lbl_modal_sub, UI_COLOR_TEXT_MAIN, 0);
+        }
+        if (s_btn_modal_cancel) {
+            lv_obj_clear_flag(s_btn_modal_cancel, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_btn_modal_cancel, UI_COLOR_ACCENT_GREEN, 0);
+        }
+        if (s_lbl_modal_cancel) {
+            lv_label_set_text(s_lbl_modal_cancel, "OK");
+            lv_obj_set_style_text_color(s_lbl_modal_cancel, lv_color_white(), 0);
+        }
+        ESP_LOGI(TAG, "UI: Ghép nối thiết bị THÀNH CÔNG! Chờ người dùng ấn [OK]");
+    } else {
+        if (s_lbl_modal_title) {
+            lv_label_set_text(s_lbl_modal_title, "Thêm thiết bị thất bại");
+            lv_obj_set_style_text_color(s_lbl_modal_title, UI_COLOR_ACCENT_RED, 0);
+        }
+        if (s_lbl_modal_sub) {
+            lv_label_set_text(s_lbl_modal_sub, "Không nhận được phản hồi từ thiết bị.");
+            lv_obj_set_style_text_color(s_lbl_modal_sub, UI_COLOR_TEXT_MUTED, 0);
+        }
+        if (s_btn_modal_cancel) {
+            lv_obj_clear_flag(s_btn_modal_cancel, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_btn_modal_cancel, lv_color_hex(0xE5E5EA), 0);
+        }
+        if (s_lbl_modal_cancel) {
+            lv_label_set_text(s_lbl_modal_cancel, "Đóng");
+            lv_obj_set_style_text_color(s_lbl_modal_cancel, UI_COLOR_TEXT_MAIN, 0);
+        }
+        ESP_LOGW(TAG, "UI: Ghép nối thiết bị THẤT BẠI hoặc HẾT HẠN");
     }
-    ESP_LOGI(TAG, "UI: Đóng modal Commissioner");
 }
 
-static void btn_modal_cancel_event_cb(lv_event_t *e) {
-    close_commissioning_modal();
+static void commissioning_pairing_timeout_cb(lv_timer_t *tmr) {
+    (void)tmr;
+    ui_screen_dashboard_on_pairing_result(false);
 }
 
 static void btn_approve_event_cb(lv_event_t *e) {
+    (void)e;
     if (strlen(s_discovered_id_str) == 0) return;
 
     ESP_LOGI(TAG, "UI: Người dùng chấp nhận thiết bị: '%s'", s_discovered_id_str);
     thread_commissioner_approve_device(s_discovered_id_str);
 
-    lv_label_set_text(s_lbl_modal_title, "Đã chấp thuận kết nối!");
-    lv_label_set_text(s_lbl_disc_info, "Đang hoàn tất gia nhập mạng Thread...");
+    s_waiting_pairing = true;
+    lv_label_set_text(s_lbl_modal_title, "Đang kết nối thiết bị...");
+    lv_obj_set_style_text_color(s_lbl_modal_title, UI_COLOR_TEXT_MAIN, 0);
+
+    lv_label_set_text(s_lbl_modal_countdown, "Đang đồng bộ mạng & cấu hình bảo mật...");
+    lv_label_set_text(s_lbl_modal_sub, "Vui lòng giữ thiết bị gần Gateway...");
+
+    lv_obj_clear_flag(s_spinner_scan, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_lbl_modal_countdown, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_lbl_modal_sub, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cont_discovered, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_btn_modal_cancel, LV_OBJ_FLAG_HIDDEN);
 
     if (s_commissioning_timer) {
         lv_timer_del(s_commissioning_timer);
         s_commissioning_timer = NULL;
     }
-
-    lv_timer_create(modal_auto_close_cb, 1200, NULL);
+    s_commissioning_timer = lv_timer_create(commissioning_pairing_timeout_cb, 25000, NULL);
 }
 
 void ui_screen_dashboard_on_device_discovered(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi) {
@@ -318,9 +452,28 @@ static void show_sensor_warning_toast(void) {
     ESP_LOGI(TAG, "UI: Hiển thị cảnh báo chưa kết nối cảm biến DHT11");
 }
 
-static void card_env_click_cb(lv_event_t *e) {
-    if (!s_sensor_valid_local) {
-        show_sensor_warning_toast();
+static void show_delete_confirm_modal(const char *target_id, const char *dev_name) {
+    if (!target_id) return;
+    strncpy(s_del_target_id, target_id, sizeof(s_del_target_id) - 1);
+    if (!s_modal_del_backdrop || !s_lbl_del_msg) return;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Bạn có chắc muốn xóa\n%s khỏi mạng Thread?", dev_name);
+    lv_label_set_text(s_lbl_del_msg, msg);
+    lv_obj_clear_flag(s_modal_del_backdrop, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void card_sensor_event_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_LONG_PRESSED) {
+        if (s_sensor_registered_local) {
+            show_delete_confirm_modal("sensor-01", "Cảm biến DHT11");
+        } else {
+            show_sensor_warning_toast();
+        }
+    } else if (code == LV_EVENT_SHORT_CLICKED) {
+        if (!s_sensor_valid_local) {
+            show_sensor_warning_toast();
+        }
     }
 }
 
@@ -344,26 +497,25 @@ static void btn_add_dev_event_cb(lv_event_t *e) {
     open_commissioning_modal();
 }
 
-static void show_delete_confirm_modal(const char *target_id, const char *dev_name) {
-    if (!target_id) return;
-    strncpy(s_del_target_id, target_id, sizeof(s_del_target_id) - 1);
-    if (!s_modal_del_backdrop || !s_lbl_del_msg) return;
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Bạn có chắc muốn xóa\n%s khỏi mạng Thread?", dev_name);
-    lv_label_set_text(s_lbl_del_msg, msg);
-    lv_obj_clear_flag(s_modal_del_backdrop, LV_OBJ_FLAG_HIDDEN);
-}
-
 static void btn_del_confirm_cb(lv_event_t *e) {
     (void)e;
     if (strlen(s_del_target_id) > 0) {
         ESP_LOGI(TAG, "UI: User confirmed delete device: %s", s_del_target_id);
         thread_gateway_remove_device(s_del_target_id);
         if (strstr(s_del_target_id, "relay") != NULL) {
+            gateway_state_set_device_registered("relay", false);
             gateway_state_set_node_presence(false, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
         } else if (strstr(s_del_target_id, "dimmer") != NULL) {
+            gateway_state_set_device_registered("dimmer", false);
             gateway_state_set_node_presence(gateway_state_is_relay_online(), false, gateway_state_is_sensor_online());
+        } else if (strstr(s_del_target_id, "sensor") != NULL) {
+            gateway_state_set_device_registered("sensor", false);
+            gateway_state_set_node_presence(gateway_state_is_relay_online(), gateway_state_is_dimmer_online(), false);
         }
+        // Cập nhật lại giao diện ngay lập tức
+        gateway_device_state_t cur_st;
+        gateway_state_get(&cur_st);
+        ui_screen_dashboard_update_state(&cur_st);
     }
     if (s_modal_del_backdrop) {
         lv_obj_add_flag(s_modal_del_backdrop, LV_OBJ_FLAG_HIDDEN);
@@ -381,15 +533,19 @@ static void relay_toggle_event_cb(lv_event_t *e) {
     if (s_suppress_events) return;
     s_relay_state_local = !s_relay_state_local;
     ESP_LOGI(TAG, "Touch UI: Công tắc -> %s", s_relay_state_local ? "ON" : "OFF");
-    update_relay_ui(s_relay_state_local);
+    update_relay_ui(s_relay_online_local, s_relay_state_local);
     mesh_controller_set_relay(s_relay_state_local);
 }
 
 static void card_relay_event_cb(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_LONG_PRESSED) {
-        show_delete_confirm_modal("relay-01", "Công tắc");
-    } else if (code == LV_EVENT_CLICKED) {
+        show_delete_confirm_modal("relay-01", "Công tắc Relay");
+    } else if (code == LV_EVENT_SHORT_CLICKED) {
+        if (!s_relay_online_local) {
+            ESP_LOGW(TAG, "Touch UI: Relay đang Offline, chặn thao tác chạm");
+            return;
+        }
         relay_toggle_event_cb(e);
     }
 }
@@ -397,36 +553,60 @@ static void card_relay_event_cb(lv_event_t *e) {
 static void dimmer_toggle_event_cb(lv_event_t *e) {
     if (s_suppress_events) return;
     s_dimmer_state_local = !s_dimmer_state_local;
-    if (s_dimmer_state_local && s_dimmer_bri_local == 0) {
-        s_dimmer_bri_local = 80;
+    if (s_dimmer_state_local) {
+        gateway_device_state_t st;
+        gateway_state_get(&st);
+        uint8_t target_bri = st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80;
+        s_dimmer_bri_local = target_bri;
+        ESP_LOGI(TAG, "Touch UI: Đèn -> ON (%u%%)", target_bri);
+        update_dimmer_ui(s_dimmer_online_local, true, target_bri);
+        mesh_controller_set_dimmer(true, target_bri);
+    } else {
+        ESP_LOGI(TAG, "Touch UI: Đèn -> OFF (0%%)");
+        update_dimmer_ui(s_dimmer_online_local, false, 0);
+        mesh_controller_set_dimmer(false, 0);
     }
-    uint8_t bri = s_dimmer_state_local ? s_dimmer_bri_local : 0;
-    ESP_LOGI(TAG, "Touch UI: Đèn -> %s (%u%%)", s_dimmer_state_local ? "ON" : "OFF", bri);
-    update_dimmer_ui(s_dimmer_state_local, s_dimmer_bri_local);
-    mesh_controller_set_dimmer(s_dimmer_state_local, bri);
 }
 
 static void card_dimmer_event_cb(lv_event_t *e) {
+    lv_obj_t *target = lv_event_get_target(e);
+    // Bỏ qua nếu thao tác trên Slider hoặc các thành phần của Slider
+    if (target == s_slider_dimmer || lv_obj_get_parent(target) == s_slider_dimmer) {
+        return;
+    }
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_LONG_PRESSED) {
-        show_delete_confirm_modal("dimmer-01", "Đèn");
-    } else if (code == LV_EVENT_CLICKED) {
+        show_delete_confirm_modal("dimmer-01", "Đèn chiếu sáng");
+    } else if (code == LV_EVENT_SHORT_CLICKED) {
+        if (!s_dimmer_online_local) {
+            ESP_LOGW(TAG, "Touch UI: Dimmer đang Offline, chặn thao tác chạm");
+            return;
+        }
         dimmer_toggle_event_cb(e);
     }
 }
 
 static void dimmer_slider_event_cb(lv_event_t *e) {
     if (s_suppress_events) return;
+    if (!s_dimmer_online_local) {
+        // Khóa slider khi Dimmer offline
+        return;
+    }
+    lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *slider = lv_event_get_target(e);
     int32_t val = lv_slider_get_value(slider);
     bool is_on = (val > 0);
-    s_dimmer_state_local = is_on;
-    if (is_on) {
-        s_dimmer_bri_local = (uint8_t)val;
-    }
-    update_dimmer_ui(is_on, (uint8_t)val);
 
-    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        // Cập nhật giao diện mượt mà theo ngón tay (không gửi mạng)
+        s_dimmer_state_local = is_on;
+        if (is_on) {
+            s_dimmer_bri_local = (uint8_t)val;
+        }
+        update_dimmer_ui(s_dimmer_online_local, is_on, (uint8_t)val);
+    } else if (code == LV_EVENT_RELEASED) {
+        // Chỉ gửi lệnh CoAP Mesh & ThingsBoard MQTT một lần duy nhất khi nhấc ngón tay!
+        ESP_LOGI(TAG, "Touch UI: Thả thanh trượt Đèn -> %u%%", (unsigned)val);
         mesh_controller_set_dimmer(is_on, (uint8_t)val);
     }
 }
@@ -677,8 +857,8 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_label_set_text(s_lbl_dimmer_title, "Đèn");
 
     s_slider_dimmer = lv_slider_create(s_card_dimmer);
-    lv_obj_set_size(s_slider_dimmer, 108, 8);
-    lv_obj_align(s_slider_dimmer, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_set_size(s_slider_dimmer, 116, 14);
+    lv_obj_align(s_slider_dimmer, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_slider_set_range(s_slider_dimmer, 0, 100);
     lv_obj_set_style_pad_hor(s_slider_dimmer, 3, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_slider_dimmer, lv_color_hex(0xE5E5EA), LV_PART_MAIN);
@@ -686,8 +866,8 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_bg_color(s_slider_dimmer, lv_color_white(), LV_PART_KNOB);
     lv_obj_set_style_border_color(s_slider_dimmer, UI_COLOR_LIGHT_WARM, LV_PART_KNOB);
     lv_obj_set_style_border_width(s_slider_dimmer, 2, LV_PART_KNOB);
-    lv_obj_set_style_pad_all(s_slider_dimmer, 1, LV_PART_KNOB);
-    lv_obj_add_event_cb(s_slider_dimmer, dimmer_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_set_style_pad_all(s_slider_dimmer, 6, LV_PART_KNOB);
+    lv_obj_add_event_cb(s_slider_dimmer, dimmer_slider_event_cb, LV_EVENT_ALL, NULL);
 
     // ==================== Card 3: Thẻ '+ Thêm thiết bị' ====================
     s_card_add_dev = lv_obj_create(s_tab_devices);
@@ -727,7 +907,7 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_pad_all(s_card_temp, 12, 0);
     lv_obj_clear_flag(s_card_temp, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_card_temp, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_card_temp, card_env_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_card_temp, card_sensor_event_cb, LV_EVENT_ALL, NULL);
 
     lv_obj_t *t_hdr_cont = lv_obj_create(s_card_temp);
     lv_obj_set_size(t_hdr_cont, 120, 24);
@@ -776,7 +956,7 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_pad_all(s_card_hum, 12, 0);
     lv_obj_clear_flag(s_card_hum, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_card_hum, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_card_hum, card_env_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_card_hum, card_sensor_event_cb, LV_EVENT_ALL, NULL);
 
     lv_obj_t *h_hdr_cont = lv_obj_create(s_card_hum);
     lv_obj_set_size(h_hdr_cont, 120, 24);
@@ -836,7 +1016,7 @@ lv_obj_t* ui_screen_dashboard_init(void) {
 
     s_lbl_sys_ip = lv_label_create(card_sys);
     lv_obj_align(s_lbl_sys_ip, LV_ALIGN_TOP_LEFT, 4, 0);
-    lv_obj_set_style_text_font(s_lbl_sys_ip, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_sys_ip, &ui_font_vn_14, 0);
     lv_label_set_text(s_lbl_sys_ip, "IP: 192.168.?.?");
 
     s_lbl_sys_cloud = lv_label_create(card_sys);
@@ -936,7 +1116,7 @@ lv_obj_t* ui_screen_dashboard_init(void) {
 
     s_lbl_disc_info = lv_label_create(s_cont_discovered);
     lv_obj_align(s_lbl_disc_info, LV_ALIGN_TOP_LEFT, 36, 26);
-    lv_obj_set_style_text_font(s_lbl_disc_info, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_lbl_disc_info, &ui_font_vn_14, 0); // Dung font tieng Viet ui_font_vn_14 de hien thi chuan "Mạng:"
     lv_obj_set_style_text_color(s_lbl_disc_info, UI_COLOR_TEXT_MUTED, 0);
     lv_label_set_text(s_lbl_disc_info, "ID: ? • -45dBm");
 
@@ -962,11 +1142,11 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_radius(s_btn_modal_cancel, UI_RADIUS_BUTTON, 0);
     lv_obj_add_event_cb(s_btn_modal_cancel, btn_modal_cancel_event_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *lbl_cancel = lv_label_create(s_btn_modal_cancel);
-    lv_obj_center(lbl_cancel);
-    lv_obj_set_style_text_font(lbl_cancel, &ui_font_vn_14, 0);
-    lv_obj_set_style_text_color(lbl_cancel, UI_COLOR_TEXT_MAIN, 0);
-    lv_label_set_text(lbl_cancel, "Hủy");
+    s_lbl_modal_cancel = lv_label_create(s_btn_modal_cancel);
+    lv_obj_center(s_lbl_modal_cancel);
+    lv_obj_set_style_text_font(s_lbl_modal_cancel, &ui_font_vn_14, 0);
+    lv_obj_set_style_text_color(s_lbl_modal_cancel, UI_COLOR_TEXT_MAIN, 0);
+    lv_label_set_text(s_lbl_modal_cancel, "Hủy");
 
     // =========================================================================
     // 4. DEVICE DELETION CONFIRMATION MODAL (Hộp thoại xác nhận gỡ bỏ)
@@ -1032,9 +1212,6 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     return s_screen_dash;
 }
 
-static int64_t s_relay_online_time_us = 0;
-static int64_t s_dimmer_online_time_us = 0;
-
 static void place_card_in_grid_slot(lv_obj_t *card, int slot) {
     if (!card) return;
     lv_obj_clear_flag(card, LV_OBJ_FLAG_HIDDEN);
@@ -1057,27 +1234,27 @@ void ui_screen_dashboard_update_state(const gateway_device_state_t *state) {
     if (!state || !s_screen_dash) return;
     s_suppress_events = true;
 
+    s_relay_registered_local = state->relay_registered;
+    s_dimmer_registered_local = state->dimmer_registered;
+    s_sensor_registered_local = state->sensor_registered;
+
+    s_relay_online_local = state->relay_node_online;
+    s_dimmer_online_local = state->dimmer_node_online;
+    s_sensor_online_local = state->sensor_node_online;
+
     s_relay_state_local = state->relay_on;
     s_dimmer_state_local = state->dimmer_on;
     s_dimmer_bri_local = state->dimmer_brightness;
     s_sensor_valid_local = (state->sensor_node_online && state->sensor_valid);
 
-    // 1. Quản lý hiển thị bố cục Tab Thiết bị (Empty State vs Dynamic 2-Column Grid)
-    bool has_relay  = state->relay_node_online;
-    bool has_dimmer = state->dimmer_node_online;
-
-    // Cập nhật timestamp online để xác định thứ tự thời gian xuất hiện trong lưới
-    if (has_relay) {
-        if (s_relay_online_time_us == 0) s_relay_online_time_us = esp_timer_get_time();
-    } else {
-        s_relay_online_time_us = 0;
+    // Nếu đang trong quá trình chờ ghép nối mà có thiết bị mới online -> kích hoạt thành công!
+    if (s_waiting_pairing && (state->relay_node_online || state->dimmer_node_online || state->sensor_node_online)) {
+        ui_screen_dashboard_on_pairing_result(true);
     }
 
-    if (has_dimmer) {
-        if (s_dimmer_online_time_us == 0) s_dimmer_online_time_us = esp_timer_get_time();
-    } else {
-        s_dimmer_online_time_us = 0;
-    }
+    // 1. Quản lý hiển thị bố cục Tab Thiết bị (Dựa trên thiết bị đã đăng ký trong mạng)
+    bool has_relay  = state->relay_registered;
+    bool has_dimmer = state->dimmer_registered;
 
     if (!has_relay && !has_dimmer) {
         // Chưa có thiết bị nào -> Hiển thị Empty State
@@ -1090,22 +1267,14 @@ void ui_screen_dashboard_update_state(const gateway_device_state_t *state) {
 
         int next_slot = 0;
         if (has_relay && has_dimmer) {
-            // Cả 2 đều online: Thiết bị online trước ở ô 0 (Trái), thiết bị sau ở ô 1 (Phải)
-            if (s_relay_online_time_us <= s_dimmer_online_time_us) {
-                place_card_in_grid_slot(s_card_relay, 0);
-                place_card_in_grid_slot(s_card_dimmer, 1);
-            } else {
-                place_card_in_grid_slot(s_card_dimmer, 0);
-                place_card_in_grid_slot(s_card_relay, 1);
-            }
+            place_card_in_grid_slot(s_card_relay, 0);
+            place_card_in_grid_slot(s_card_dimmer, 1);
             next_slot = 2; // Thẻ [+ Thêm thiết bị] xếp ở dòng 2 bên Trái
         } else if (has_relay) {
-            // Chỉ có Relay: Tự động ở ô 0 (Trái), không căn giữa
             place_card_in_grid_slot(s_card_relay, 0);
             lv_obj_add_flag(s_card_dimmer, LV_OBJ_FLAG_HIDDEN);
             next_slot = 1; // Thẻ [+ Thêm thiết bị] xếp ở ô 1 (Phải)
         } else {
-            // Chỉ có Dimmer: Tự động ở ô 0 (Trái), không căn giữa
             place_card_in_grid_slot(s_card_dimmer, 0);
             lv_obj_add_flag(s_card_relay, LV_OBJ_FLAG_HIDDEN);
             next_slot = 1; // Thẻ [+ Thêm thiết bị] xếp ở ô 1 (Phải)
@@ -1114,12 +1283,12 @@ void ui_screen_dashboard_update_state(const gateway_device_state_t *state) {
         // Đặt thẻ [+ Thêm thiết bị] luôn ở vị trí trống tiếp theo
         place_card_in_grid_slot(s_card_add_dev, next_slot);
 
-        update_relay_ui(state->relay_on);
-        update_dimmer_ui(state->dimmer_on, state->dimmer_brightness);
+        update_relay_ui(state->relay_node_online, state->relay_on);
+        update_dimmer_ui(state->dimmer_node_online, state->dimmer_on, state->dimmer_brightness);
     }
 
     // 2. Cập nhật Môi trường DHT11 (2 Thẻ Card đối xứng)
-    if (s_sensor_valid_local) {
+    if (state->sensor_registered && s_sensor_valid_local) {
         lv_obj_set_style_opa(s_card_temp, LV_OPA_COVER, 0);
         lv_obj_set_style_opa(s_card_hum, LV_OPA_COVER, 0);
 
@@ -1135,12 +1304,16 @@ void ui_screen_dashboard_update_state(const gateway_device_state_t *state) {
         lv_label_set_text(s_lbl_hum_val, "-- %");
     }
 
-    // 3. Header & System Mesh Count
-    uint8_t total_active = (has_relay ? 1 : 0) + (has_dimmer ? 1 : 0) + (state->sensor_node_online ? 1 : 0);
+    // 3. Header & System Mesh Count (Định dạng chuẩn "Mạng: X/Y kết nối" hoặc "Mạng: 0 thiết bị")
+    uint8_t total_reg = (has_relay ? 1 : 0) + (has_dimmer ? 1 : 0) + (state->sensor_registered ? 1 : 0);
+    uint8_t total_online = (state->relay_node_online ? 1 : 0) + (state->dimmer_node_online ? 1 : 0) + (state->sensor_node_online ? 1 : 0);
     char mesh_buf[32];
-    snprintf(mesh_buf, sizeof(mesh_buf), "Mạng: %u nút", total_active);
+    if (total_reg == 0) {
+        snprintf(mesh_buf, sizeof(mesh_buf), "Mạng: 0 thiết bị");
+    } else {
+        snprintf(mesh_buf, sizeof(mesh_buf), "Mạng: %u/%u kết nối", total_online, total_reg);
+    }
     lv_label_set_text(s_lbl_header_mesh, mesh_buf);
-    snprintf(mesh_buf, sizeof(mesh_buf), "Mạng Thread: %u nút", total_active);
     lv_label_set_text(s_lbl_sys_mesh, mesh_buf);
 
     s_suppress_events = false;

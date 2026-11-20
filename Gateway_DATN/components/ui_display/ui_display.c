@@ -43,6 +43,7 @@ typedef enum {
     UI_EVT_COMMAND_DONE,
     UI_EVT_CLOUD_SPEAKING,
     UI_EVT_DISCOVERY_DEVICE,
+    UI_EVT_PAIRING_RESULT,
 } ui_event_type_t;
 
 typedef struct {
@@ -60,6 +61,10 @@ typedef struct {
             char id_str[32];
             int8_t rssi;
         } discovery;
+        struct {
+            bool success;
+            char id_str[32];
+        } pair_result;
     } data;
 } ui_event_msg_t;
 
@@ -192,6 +197,10 @@ static void ui_display_task(void *pvParameters) {
                         );
                         s_last_interaction_us = esp_timer_get_time();
                         break;
+                    case UI_EVT_PAIRING_RESULT:
+                        ui_screen_dashboard_on_pairing_result(msg.data.pair_result.success);
+                        s_last_interaction_us = esp_timer_get_time();
+                        break;
                 }
                 xSemaphoreGive(s_gui_mutex);
             }
@@ -218,12 +227,13 @@ static void ui_display_task(void *pvParameters) {
             int8_t rssi = sys_core_get_wifi_rssi();
             bool wifi_ok = sys_core_is_wifi_connected();
             bool cloud_ok = iot_cloud_is_connected();
-            uint8_t mesh_count = gateway_state_get_active_node_count();
+            uint8_t online_nodes = gateway_state_get_active_node_count();
+            uint8_t total_nodes = gateway_state_get_registered_node_count();
 
             if (xSemaphoreTake(s_gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Cập nhật giờ và thông số mạng
                 ui_screen_idle_update_time(&timeinfo);
-                ui_screen_idle_update_status(wifi_ok, cloud_ok, mesh_count);
+                ui_screen_idle_update_status(wifi_ok, cloud_ok, online_nodes, total_nodes);
                 ui_screen_dashboard_update_time(&timeinfo);
                 ui_screen_dashboard_update_network(wifi_ok, ip_str, rssi, cloud_ok);
 
@@ -304,6 +314,7 @@ void ui_display_init(void) {
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = lvgl_touch_read_cb;
+    indev_drv.long_press_time = 1500; // Nhấn giữ 1.5s để kích hoạt xóa thiết bị
     lv_indev_drv_register(&indev_drv);
 
     // 5. Cấu hình định thời 5ms cho LVGL Tick bằng esp_timer
@@ -324,8 +335,9 @@ void ui_display_init(void) {
     lv_scr_load(s_scr_idle);
     st7789v_set_backlight(100); // Khởi động 100% trước, sau 30s tự giảm xuống 30%
 
-    // Đăng ký callback khi Commissioner phát hiện thiết bị mới
+    // Đăng ký callback khi Commissioner phát hiện thiết bị mới hoặc hoàn tất ghép nối
     thread_commissioner_set_discovery_callback(ui_display_notify_discovery);
+    thread_commissioner_set_pair_result_callback(ui_display_notify_pair_result);
 
     // 7. Tạo GUI Task trên Core 0 (độ ưu tiên 4)
     xTaskCreatePinnedToCore(ui_display_task, "ui_display_task", 6144, NULL, 4, NULL, 0);
@@ -404,5 +416,18 @@ void ui_display_notify_discovery(commissioner_dev_type_t type, const char *name,
         msg.data.discovery.id_str[0] = '\0';
     }
     msg.data.discovery.rssi = rssi;
+    xQueueSend(s_ui_event_queue, &msg, 0);
+}
+
+void ui_display_notify_pair_result(bool success, const char *id_str) {
+    if (!s_ui_event_queue) return;
+    ui_event_msg_t msg;
+    msg.type = UI_EVT_PAIRING_RESULT;
+    msg.data.pair_result.success = success;
+    if (id_str) {
+        snprintf(msg.data.pair_result.id_str, sizeof(msg.data.pair_result.id_str), "%s", id_str);
+    } else {
+        msg.data.pair_result.id_str[0] = '\0';
+    }
     xQueueSend(s_ui_event_queue, &msg, 0);
 }

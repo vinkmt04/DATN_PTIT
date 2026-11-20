@@ -35,11 +35,17 @@
 static bool                        s_scanning = false;
 static uint32_t                    s_remaining_sec = 0;
 static TimerHandle_t               s_countdown_timer = NULL;
-static commissioner_discovery_cb_t s_discovery_cb = NULL;
+static commissioner_discovery_cb_t   s_discovery_cb = NULL;
+static commissioner_pair_result_cb_t s_pair_result_cb = NULL;
 
 void thread_commissioner_set_discovery_callback(commissioner_discovery_cb_t cb)
 {
     s_discovery_cb = cb;
+}
+
+void thread_commissioner_set_pair_result_callback(commissioner_pair_result_cb_t cb)
+{
+    s_pair_result_cb = cb;
 }
 
 bool thread_commissioner_is_scanning(void)
@@ -114,6 +120,11 @@ static void commissioner_joiner_event_cb(otCommissionerJoinerEvent aEvent,
     // Khi một Joiner hoàn tất, kết thúc hoặc bị xoá khỏi danh sách (sau khi ghép nối thành công),
     // Tự động tái kích hoạt Wildcard Joiner để không bị khoá mạng đối với các Node tiếp theo!
     if (aEvent == OT_COMMISSIONER_JOINER_FINALIZE || aEvent == OT_COMMISSIONER_JOINER_END || aEvent == OT_COMMISSIONER_JOINER_REMOVED) {
+        if (aEvent == OT_COMMISSIONER_JOINER_FINALIZE || aEvent == OT_COMMISSIONER_JOINER_END) {
+            if (s_pair_result_cb != NULL) {
+                s_pair_result_cb(true, id_str);
+            }
+        }
         otInstance *instance = esp_openthread_get_instance();
         if (instance != NULL && otCommissionerGetState(instance) == OT_COMMISSIONER_STATE_ACTIVE) {
             otError re_err = otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, 86400);

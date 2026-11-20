@@ -16,6 +16,11 @@ extern "C" {
 #define GATEWAY_ENABLE_DHT11    1   // 1: Cảm biến DHT11 (Nhiệt độ/Độ ẩm), 0: Chưa kết nối/Tắt
 
 typedef struct {
+    // Trạng thái đã đăng ký / ghép nối trong hệ thống (Persisted in NVS)
+    bool relay_registered;          // true: Đã ghép nối trong hệ thống, false: Chưa có/Đã xóa
+    bool dimmer_registered;         // true: Đã ghép nối trong hệ thống, false: Chưa có/Đã xóa
+    bool sensor_registered;         // true: Đã ghép nối trong hệ thống, false: Chưa có/Đã xóa
+
     // Trạng thái trực tuyến của từng Node Thread Mesh (Presence Awareness)
     bool relay_node_online;         // true: Node Relay đang có mặt trong Mesh, false: Mất kết nối/Offline
     bool dimmer_node_online;        // true: Node Đèn Dimmer đang có mặt trong Mesh, false: Mất kết nối/Offline
@@ -43,6 +48,17 @@ typedef void (*gateway_state_change_cb_t)(const gateway_device_state_t *new_stat
 
 // Khởi tạo State Manager
 void gateway_state_manager_init(void);
+
+// Lấy số lượng Node Thread Mesh đã đăng ký trong hệ thống
+uint8_t gateway_state_get_registered_node_count(void);
+
+// Kiểm tra thiết bị đã đăng ký trong hệ thống hay chưa
+bool gateway_state_is_relay_registered(void);
+bool gateway_state_is_dimmer_registered(void);
+bool gateway_state_is_sensor_registered(void);
+
+// Đặt trạng thái đăng ký / xóa thiết bị khỏi hệ thống
+void gateway_state_set_device_registered(const char *dev_type, bool registered);
 
 // Lấy số lượng Node Thread Mesh đang thực tế hoạt động
 uint8_t gateway_state_get_active_node_count(void);

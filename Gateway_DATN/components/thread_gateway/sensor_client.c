@@ -130,7 +130,7 @@ static void sensor_response_handler(void *context,
 static otError sensor_send_get_locked(otInstance *instance)
 {
     otMessageInfo message_info = {0};
-    if (!device_registry_find_locked(instance, "sensor-01", "_sensor._udp", &message_info.mPeerAddr, &message_info.mPeerPort)) {
+    if (device_registry_find_sensor_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort) != ESP_OK) {
         return OT_ERROR_NOT_FOUND;
     }
 
@@ -294,4 +294,38 @@ esp_err_t sensor_client_get_snapshot(sensor_client_data_t *out)
 {
     if (out == NULL || s_snapshot_queue == NULL) return ESP_ERR_INVALID_ARG;
     return (xQueuePeek(s_snapshot_queue, out, 0) == pdTRUE) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t sensor_send_unpair(void)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        esp_openthread_lock_release();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    otMessageInfo message_info = {0};
+    if (device_registry_find_sensor_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort) != ESP_OK) {
+        esp_openthread_lock_release();
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    otMessage *msg = otCoapNewMessage(instance, NULL);
+    if (msg == NULL) {
+        esp_openthread_lock_release();
+        return ESP_ERR_NO_MEM;
+    }
+
+    otCoapMessageInit(msg, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
+    otCoapMessageAppendUriPathOptions(msg, "unpair");
+    otError err = otCoapSendRequest(instance, msg, &message_info, NULL, NULL);
+    if (err != OT_ERROR_NONE) {
+        otMessageFree(msg);
+    }
+    esp_openthread_lock_release();
+    ESP_LOGI(TAG, "Sent CoAP POST /unpair to Sensor node (err=%d)", (int)err);
+    return (err == OT_ERROR_NONE) ? ESP_OK : ESP_FAIL;
 }

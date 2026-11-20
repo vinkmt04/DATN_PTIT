@@ -54,6 +54,9 @@ void thread_gateway_set_sensor_callback(sensor_callback_t cb);
  */
 void thread_gateway_set_actuator_callback(actuator_callback_t cb);
 
+typedef void (*thread_report_callback_t)(const char *payload);
+void thread_gateway_set_report_callback(thread_report_callback_t cb);
+
 /**
  * @brief Go bo thiet bi khoi mang Thread va xoa khoi bang dang ky NVS.
  */

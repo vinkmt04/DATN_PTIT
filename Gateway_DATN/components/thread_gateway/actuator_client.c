@@ -149,13 +149,13 @@ static otError actuator_send_request_locked(otInstance *instance, const actuator
     otMessageInfo message_info = {0};
 
     if (cmd->device == ACTUATOR_RELAY) {
-        if (!device_registry_find_locked(instance, "relay-01", "_relay._udp", &message_info.mPeerAddr, &message_info.mPeerPort)) {
-            ESP_LOGW(TAG, "RELAY_NOT_DISCOVERED: relay-01 not in SRP Server");
+        if (device_registry_find_relay_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort) != ESP_OK) {
+            ESP_LOGW(TAG, "RELAY_NOT_DISCOVERED: relay not in SRP Server or Cache");
             return OT_ERROR_NOT_FOUND;
         }
     } else if (cmd->device == ACTUATOR_DIMMER) {
-        if (!device_registry_find_locked(instance, "dimmer-test-01", "_dimmer._udp", &message_info.mPeerAddr, &message_info.mPeerPort)) {
-            ESP_LOGW(TAG, "DIMMER_NOT_DISCOVERED: dimmer-test-01 not in SRP Server");
+        if (device_registry_find_dimmer_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort) != ESP_OK) {
+            ESP_LOGW(TAG, "DIMMER_NOT_DISCOVERED: dimmer not in SRP Server or Cache");
             return OT_ERROR_NOT_FOUND;
         }
     } else {
@@ -399,4 +399,45 @@ esp_err_t actuator_get_snapshot(actuator_device_t device, actuator_snapshot_t *o
     *out = (device == ACTUATOR_RELAY) ? s_relay_snapshot : s_dimmer_snapshot;
     xSemaphoreGive(s_snapshot_mutex);
     return ESP_OK;
+}
+
+esp_err_t actuator_send_unpair(actuator_device_t device)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        esp_openthread_lock_release();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    otMessageInfo message_info = {0};
+    esp_err_t find_err = ESP_ERR_NOT_FOUND;
+    if (device == ACTUATOR_RELAY) {
+        find_err = device_registry_find_relay_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort);
+    } else if (device == ACTUATOR_DIMMER) {
+        find_err = device_registry_find_dimmer_locked(instance, &message_info.mPeerAddr, &message_info.mPeerPort);
+    }
+
+    if (find_err != ESP_OK) {
+        esp_openthread_lock_release();
+        return find_err;
+    }
+
+    otMessage *msg = otCoapNewMessage(instance, NULL);
+    if (msg == NULL) {
+        esp_openthread_lock_release();
+        return ESP_ERR_NO_MEM;
+    }
+
+    otCoapMessageInit(msg, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
+    otCoapMessageAppendUriPathOptions(msg, "unpair");
+    otError err = otCoapSendRequest(instance, msg, &message_info, NULL, NULL);
+    if (err != OT_ERROR_NONE) {
+        otMessageFree(msg);
+    }
+    esp_openthread_lock_release();
+    ESP_LOGI(TAG, "Sent CoAP POST /unpair to actuator device %d (err=%d)", device, (int)err);
+    return (err == OT_ERROR_NONE) ? ESP_OK : ESP_FAIL;
 }

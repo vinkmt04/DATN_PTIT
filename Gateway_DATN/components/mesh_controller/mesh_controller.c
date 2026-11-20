@@ -15,6 +15,7 @@ static void on_thread_sensor_snapshot(const sensor_client_data_t *data) {
     if (!data) return;
 
     if (data->has_valid_sample && (data->state == SENSOR_STATE_GOOD)) {
+        gateway_state_set_device_registered("sensor", true);
         gateway_state_set_sensor(data->temperature_c, data->humidity_pct);
         gateway_state_set_node_presence(
             gateway_state_is_relay_online(),
@@ -42,14 +43,28 @@ static void on_thread_actuator_event(actuator_device_t device, actuator_status_t
 
     if (device == ACTUATOR_RELAY) {
         bool on = (confirmed_value == 1);
+        gateway_state_set_device_registered("relay", true);
         gateway_state_set_relay(on);
         gateway_state_set_node_presence(true, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
         ESP_LOGI(TAG, "Relay state confirmed from Thread Mesh: %s", on ? "ON" : "OFF");
     } else if (device == ACTUATOR_DIMMER) {
         bool on = (confirmed_value > 0);
+        gateway_state_set_device_registered("dimmer", true);
         gateway_state_set_dimmer(on, (uint8_t)confirmed_value);
         gateway_state_set_node_presence(gateway_state_is_relay_online(), true, gateway_state_is_sensor_online());
         ESP_LOGI(TAG, "Dimmer brightness confirmed from Thread Mesh: %d%%", confirmed_value);
+    }
+}
+
+// Callback nhan ban tin bao cao trang thai tu dong tu cac Node (Vi du: Nut nhan vat ly tren Relay)
+static void on_thread_report(const char *payload) {
+    if (!payload) return;
+    if (strncmp(payload, "relay:", 6) == 0) {
+        bool on = (payload[6] == '1' || strcasecmp(payload + 6, "ON") == 0);
+        ESP_LOGI(TAG, "Node Relay reported state: %s -> Syncing Gateway State & Cloud", on ? "ON" : "OFF");
+        gateway_state_set_device_registered("relay", true);
+        gateway_state_set_relay(on);
+        gateway_state_set_node_presence(true, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
     }
 }
 
@@ -63,6 +78,10 @@ static void mesh_monitor_task(void *pvParameters) {
         bool dimmer_on = thread_gateway_is_dimmer_online();
         bool sensor_on = thread_gateway_is_sensor_online();
         uint8_t count  = thread_gateway_get_node_count();
+
+        if (relay_on)  gateway_state_set_device_registered("relay", true);
+        if (dimmer_on) gateway_state_set_device_registered("dimmer", true);
+        if (sensor_on) gateway_state_set_device_registered("sensor", true);
 
         gateway_state_set_node_presence(relay_on, dimmer_on, sensor_on);
         gateway_state_set_mesh_count(count);
@@ -85,6 +104,7 @@ void mesh_controller_init(void) {
     // 3. Dang ky callback nhan du lieu cam bien va thiet bi chap hanh
     thread_gateway_set_sensor_callback(on_thread_sensor_snapshot);
     thread_gateway_set_actuator_callback(on_thread_actuator_event);
+    thread_gateway_set_report_callback(on_thread_report);
 
     // 4. Tao Task giam sat dinh ky su hien dien cua cac node trong Mesh
     xTaskCreate(mesh_monitor_task, "mesh_mon_task", 3072, NULL, 3, NULL);

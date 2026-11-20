@@ -34,6 +34,7 @@ typedef void (*sensor_callback_t)(const sensor_client_data_t *data);
 
 esp_err_t sensor_client_start(void);
 esp_err_t sensor_client_get_snapshot(sensor_client_data_t *out);
+esp_err_t sensor_send_unpair(void);
 void      sensor_client_set_callback(sensor_callback_t cb);
 
 #ifdef __cplusplus

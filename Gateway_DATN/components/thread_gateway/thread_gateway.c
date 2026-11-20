@@ -73,6 +73,33 @@ static void rcp_reset_failure_cb(void)
     vTaskDelete(NULL);
 }
 
+static otCoapResource s_report_resource;
+static thread_report_callback_t s_report_cb = NULL;
+
+void thread_gateway_set_report_callback(thread_report_callback_t cb)
+{
+    s_report_cb = cb;
+}
+
+static void report_request_handler(void *aContext, otMessage *aMessage,
+                                   const otMessageInfo *aMessageInfo)
+{
+    (void)aContext;
+    (void)aMessageInfo;
+    char payload[64] = {0};
+    uint16_t offset = otMessageGetOffset(aMessage);
+    uint16_t length = otMessageGetLength(aMessage) - offset;
+    if (length > 0 && length < sizeof(payload)) {
+        otMessageRead(aMessage, offset, payload, length);
+        payload[length] = '\0';
+    }
+    ESP_LOGI(TAG, "Gateway CoAP received /report: '%s'", payload);
+
+    if (s_report_cb != NULL) {
+        s_report_cb(payload);
+    }
+}
+
 static esp_err_t thread_coap_server_start(void)
 {
     if (!esp_openthread_lock_acquire(portMAX_DELAY)) {
@@ -84,13 +111,32 @@ static esp_err_t thread_coap_server_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     otError err = otCoapStart(instance, 5683);
+    if (err == OT_ERROR_NONE || err == OT_ERROR_ALREADY) {
+        memset(&s_report_resource, 0, sizeof(s_report_resource));
+        s_report_resource.mUriPath = "report";
+        s_report_resource.mHandler = report_request_handler;
+        otCoapAddResource(instance, &s_report_resource);
+    }
     esp_openthread_lock_release();
     if (err != OT_ERROR_NONE && err != OT_ERROR_ALREADY) {
         ESP_LOGE(TAG, "otCoapStart failed: %d", (int)err);
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Gateway CoAP server ready on port 5683");
+    ESP_LOGI(TAG, "Gateway CoAP server ready on port 5683 (URI: /report)");
     return ESP_OK;
+}
+
+static void gateway_ot_state_changed_cb(otChangedFlags flags, void *context)
+{
+    otInstance *instance = (otInstance *)context;
+    if (flags & OT_CHANGED_THREAD_ROLE) {
+        otDeviceRole role = otThreadGetDeviceRole(instance);
+        ESP_LOGI(TAG, "OpenThread Gateway role changed to: %d (%s)", (int)role, otThreadDeviceRoleToString(role));
+        if (role == OT_DEVICE_ROLE_CHILD) {
+            ESP_LOGI(TAG, "Gateway attached as Child -> upgrading to Router...");
+            otThreadBecomeRouter(instance);
+        }
+    }
 }
 
 static void ot_task_worker(void *aContext)
@@ -134,6 +180,10 @@ static void ot_task_worker(void *aContext)
 
         otBorderAgentSetEnabled(instance, true);
         ESP_LOGI(TAG, "OpenThread Border Agent enabled (UDP port %u)", (unsigned)otBorderAgentGetUdpPort(instance));
+
+        // Thiết lập trọng số Leader (128 > default 64) để Gateway ưu tiên vai trò Leader/Router
+        otThreadSetLocalLeaderWeight(instance, 128);
+        otSetStateChangedCallback(instance, gateway_ot_state_changed_cb, instance);
 
         if (otDatasetIsCommissioned(instance)) {
             ESP_LOGI(TAG, "Restoring existing Thread network dataset from NVS...");
@@ -340,5 +390,20 @@ void thread_gateway_set_actuator_callback(actuator_callback_t cb)
 esp_err_t thread_gateway_remove_device(const char *dev_id_str)
 {
     if (dev_id_str == NULL) return ESP_ERR_INVALID_ARG;
+    ESP_LOGW(TAG, ">>> Removing device [%s] from Thread Gateway <<<", dev_id_str);
+
+    // 1. Gui lenh CoAP POST /unpair de yeu cau Node tu xoa dataset va restart
+    if (strstr(dev_id_str, "relay") != NULL) {
+        actuator_send_unpair(ACTUATOR_RELAY);
+    } else if (strstr(dev_id_str, "dimmer") != NULL) {
+        actuator_send_unpair(ACTUATOR_DIMMER);
+    } else if (strstr(dev_id_str, "sensor") != NULL) {
+        sensor_send_unpair();
+    }
+
+    // 2. Xoa khoi NVS IP Cache
+    device_registry_clear_cache(dev_id_str);
+
+    // 3. Xoa khoi Commissioner approved registry
     return thread_commissioner_remove_device(dev_id_str);
 }

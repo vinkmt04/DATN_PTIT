@@ -210,7 +210,7 @@ lv_obj_t* ui_screen_idle_init(void) {
     lv_obj_align(s_lbl_idle_mesh, LV_ALIGN_CENTER, 0, 38);
     lv_obj_set_style_text_color(s_lbl_idle_mesh, UI_COLOR_STANDBY_MUTED, 0);
     lv_obj_set_style_text_font(s_lbl_idle_mesh, &ui_font_vn_14, 0);
-    lv_label_set_text(s_lbl_idle_mesh, "Mạng: 3 thiết bị");
+    lv_label_set_text(s_lbl_idle_mesh, "Mạng: 0 thiết bị");
 
     // =========================================================================
     // 4. PILL MÔI TRƯỜNG PHÁT QUANG (Căn giữa hoàn hảo bằng Flexbox)
@@ -329,7 +329,7 @@ void ui_screen_idle_update_sensors(float temp, float hum, bool valid) {
     lv_label_set_text(s_lbl_idle_hum, h_buf);
 }
 
-void ui_screen_idle_update_status(bool wifi_ok, bool cloud_ok, uint8_t mesh_nodes) {
+void ui_screen_idle_update_status(bool wifi_ok, bool cloud_ok, uint8_t online_nodes, uint8_t total_nodes) {
     if (s_icon_idle_wifi && s_slash_idle_wifi) {
         if (wifi_ok) {
             lv_obj_set_style_text_color(s_icon_idle_wifi, UI_COLOR_WEATHER_MOON, 0);
@@ -341,7 +341,11 @@ void ui_screen_idle_update_status(bool wifi_ok, bool cloud_ok, uint8_t mesh_node
     }
     if (s_lbl_idle_mesh) {
         char buf[32];
-        snprintf(buf, sizeof(buf), "Mạng: %u thiết bị", mesh_nodes);
+        if (total_nodes == 0) {
+            snprintf(buf, sizeof(buf), "Mạng: 0 thiết bị");
+        } else {
+            snprintf(buf, sizeof(buf), "Mạng: %u/%u kết nối", online_nodes, total_nodes);
+        }
         lv_label_set_text(s_lbl_idle_mesh, buf);
     }
 }

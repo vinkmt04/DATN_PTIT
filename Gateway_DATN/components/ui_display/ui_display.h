@@ -73,6 +73,9 @@ bool ui_display_is_idle(void);
 // Báo thiết bị Thread mới phát hiện để hiện trên popup phê duyệt
 void ui_display_notify_discovery(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi);
 
+// Báo kết quả ghép nối thiết bị Thread (thành công/thất bại)
+void ui_display_notify_pair_result(bool success, const char *id_str);
+
 // Đánh thức màn hình từ Idle lên Dashboard (100% đèn nền)
 void ui_display_wake_up(void);
 
