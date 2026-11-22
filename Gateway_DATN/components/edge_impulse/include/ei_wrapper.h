@@ -19,11 +19,11 @@ extern "C" {
 #define EI_WAKEWORD_AVERAGE_THRESHOLD      0.68f   // Điểm trung bình 2 lát liên tiếp >= 500ms (68.0% - Chặn đứng 'Hey Siri' 61.1%)
 #define EI_WAKEWORD_DUAL_MARGIN            0.35f   // Cách biệt tối thiểu với similar ở nhịp 2 (35.0%)
 #define EI_WAKEWORD_SIMILAR_MAX            0.10f   // Giới hạn trần similar khi chốt nhịp 2 (10.0% - Chặn từ bẫy đồng âm)
-#define EI_WAKEWORD_VETO_SIMILAR_THRESH    0.38f   // Ngưỡng kích hoạt Veto Lockout khi similar >= 38%
+#define EI_WAKEWORD_VETO_SIMILAR_THRESH    0.55f   // Ngưỡng kích hoạt Veto Lockout khi similar >= 55%
 #define EI_WAKEWORD_VETO_CHERRY_CEIL       0.40f   // Ngưỡng trần cherry < 40% để xác nhận từ bẫy similar
-#define EI_WAKEWORD_VETO_DURATION_MS       650     // Khóa Veto 650ms (chặn triệt để chu kỳ trượt tiếp theo)
-#define EI_WAKEWORD_MIN_RAW_PEAK           380     // Ngưỡng đỉnh biên độ thô tối thiểu của giọng nói (>= 380)
-#define EI_WAKEWORD_MIN_BOOSTED_PEAK       5500    // Ngưỡng đỉnh sau khuếch đại tối thiểu của giọng nói (>= 5500)
+#define EI_WAKEWORD_VETO_DURATION_MS       350     // Khóa Veto 350ms (giảm từ 650ms để không khóa nhầm khi nói Hey Cherry)
+#define EI_WAKEWORD_MIN_RAW_PEAK           160     // Ngưỡng đỉnh biên độ thô tối thiểu của giọng nói (>= 160, bắt nhạy giọng nói tự nhiên)
+#define EI_WAKEWORD_MIN_BOOSTED_PEAK       2000    // Ngưỡng đỉnh sau khuếch đại tối thiểu (>= 2000)
 
 bool ei_wakeword_init(void);
 void ei_wakeword_reset(void);

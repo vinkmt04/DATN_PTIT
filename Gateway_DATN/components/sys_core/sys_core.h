@@ -8,8 +8,11 @@
 extern "C" {
 #endif
 
-// Khởi tạo các hệ thống cốt lõi: NVS, Event Loop, Wi-Fi.
-// Chặn (block) cho đến khi lấy được IP nếu wait_for_ip = true.
+// Khởi tạo nền tảng phần cứng & mạng sớm (NVS, Event Loop, Netif, mDNS)
+// Đảm bảo chạy trước khi OpenThread hoặc Wi-Fi cần đính kèm netif
+void sys_core_platform_init(void);
+
+// Khởi tạo các hệ thống cốt lõi: Wi-Fi STA / SoftAP Provisioning
 void sys_core_init(void);
 
 // Kiểm tra trạng thái Wi-Fi
@@ -30,6 +33,9 @@ int8_t sys_core_get_wifi_rssi(void);
 
 // Lấy tên Wi-Fi (SSID) đang kết nối
 void sys_core_get_wifi_ssid(char *out_str, size_t max_len);
+
+// In thông số phân bổ DRAM và Octal PSRAM chi tiết
+void sys_core_print_memory_stats(const char *phase_tag);
 
 #ifdef __cplusplus
 }

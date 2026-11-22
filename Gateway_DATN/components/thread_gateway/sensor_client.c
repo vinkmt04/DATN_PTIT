@@ -1,9 +1,8 @@
 /*
  * SENSOR CLIENT MODULE - thread_gateway
  *
- * Dinh ky gui CoAP GET den Sensor Node qua SRP ("sensor-01"):
- *   _sensor._udp /sensor
- * Nhan, phan tich JSON va cap nhat du lieu nhiet do / do am cho gateway_state_manager.
+ * Tiếp nhận và xử lý dữ liệu đo lường DHT11 từ Sensor Node qua Thread Mesh.
+ * Hỗ trợ lưu trữ Snapshot an toàn và gửi CoAP GET dự phòng khi không nhận được Push Report.
  */
 
 #include <stdbool.h>
@@ -18,6 +17,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 
@@ -32,7 +32,7 @@
 
 #define TAG                 "SENSOR_CLIENT"
 #define SENSOR_URI          "sensor"
-#define SENSOR_POLL_MS      10000
+#define SENSOR_WATCHDOG_MS  20000  // Gửi CoAP GET nếu quá 20s không nhận được bản tin push từ sensor
 #define SENSOR_PAYLOAD_MAX  512
 #define SENSOR_NODE_ID      "sensor_01"
 
@@ -202,6 +202,7 @@ static void sensor_process_response(const sensor_event_t *event)
         s_sensor_data.stale = (j_stale && cJSON_IsBool(j_stale)) ? cJSON_IsTrue(j_stale) : false;
         s_sensor_data.state = s_sensor_data.stale ? SENSOR_STATE_STALE : SENSOR_STATE_GOOD;
         strncpy(s_sensor_data.node_id, SENSOR_NODE_ID, sizeof(s_sensor_data.node_id) - 1);
+        device_registry_record_activity("sensor");
 
         ESP_LOGI(TAG, "SENSOR_RX: temp=%.1f C, hum=%.1f %%, seq=%" PRIu32,
                  s_sensor_data.temperature_c, s_sensor_data.humidity_pct, s_sensor_data.sample_seq);
@@ -224,15 +225,27 @@ static void sensor_poll_task(void *pvParameters)
     }
 
     bool request_pending = false;
-    TickType_t last_poll_tick = xTaskGetTickCount() - pdMS_TO_TICKS(SENSOR_POLL_MS);
+
+    // Chờ 2 giây sau khi Thread stack sẵn sàng, chủ động lấy mẫu đầu tiên ngay lập tức
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    if (device_registry_is_registered("sensor")) {
+        if (esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+            otDeviceRole role = otThreadGetDeviceRole(instance);
+            if (role >= OT_DEVICE_ROLE_CHILD) {
+                sensor_send_get_locked(instance);
+                request_pending = true;
+            }
+            esp_openthread_lock_release();
+        }
+    }
 
     while (1) {
-        TickType_t now_tick = xTaskGetTickCount();
-        TickType_t elapsed_ticks = now_tick - last_poll_tick;
-        TickType_t poll_period_ticks = pdMS_TO_TICKS(SENSOR_POLL_MS);
+        vTaskDelay(pdMS_TO_TICKS(3000)); // Kiểm tra chu kỳ 3 giây để phát hiện nhanh
 
-        if (elapsed_ticks >= poll_period_ticks) {
-            last_poll_tick = now_tick;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        // Gửi CoAP GET nếu Node Sensor đã đăng ký VÀ chưa có dữ liệu hoặc quá 20s không có bản tin push
+        if (device_registry_is_registered("sensor") &&
+            (s_sensor_data.last_rx_time_ms == 0 || (now_ms - s_sensor_data.last_rx_time_ms > SENSOR_WATCHDOG_MS))) {
 
             if (!request_pending) {
                 if (esp_openthread_lock_acquire(portMAX_DELAY)) {
@@ -251,15 +264,8 @@ static void sensor_poll_task(void *pvParameters)
             }
         }
 
-        now_tick = xTaskGetTickCount();
-        elapsed_ticks = now_tick - last_poll_tick;
-        TickType_t wait_ticks = (elapsed_ticks < poll_period_ticks) ? (poll_period_ticks - elapsed_ticks) : 0;
-        if (wait_ticks > pdMS_TO_TICKS(1000)) {
-            wait_ticks = pdMS_TO_TICKS(1000);
-        }
-
         sensor_event_t event;
-        if (xQueueReceive(s_sensor_queue, &event, wait_ticks) == pdTRUE) {
+        if (xQueueReceive(s_sensor_queue, &event, pdMS_TO_TICKS(500)) == pdTRUE) {
             request_pending = false;
             sensor_process_response(&event);
 
@@ -268,6 +274,24 @@ static void sensor_poll_task(void *pvParameters)
             }
         }
     }
+}
+
+esp_err_t sensor_client_poll_now(void)
+{
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) return ESP_ERR_INVALID_STATE;
+
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    otDeviceRole role = otThreadGetDeviceRole(instance);
+    esp_err_t ret = ESP_FAIL;
+    if (role >= OT_DEVICE_ROLE_CHILD) {
+        otError err = sensor_send_get_locked(instance);
+        ret = (err == OT_ERROR_NONE) ? ESP_OK : ESP_FAIL;
+    }
+    esp_openthread_lock_release();
+    return ret;
 }
 
 esp_err_t sensor_client_start(void)
@@ -286,7 +310,7 @@ esp_err_t sensor_client_start(void)
 
     xQueueOverwrite(s_snapshot_queue, &s_sensor_data);
 
-    BaseType_t ret = xTaskCreate(sensor_poll_task, "sensor_poll", 4096, NULL, 4, NULL);
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(sensor_poll_task, "sensor_watchdog", 4096, NULL, 4, NULL, 0, MALLOC_CAP_SPIRAM);
     return (ret == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 

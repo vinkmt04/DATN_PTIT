@@ -132,8 +132,8 @@ void audio_hal_init(void) {
 
     // --- FROM init_microphone() ---
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    rx_chan_cfg.dma_desc_num = 6;
-    rx_chan_cfg.dma_frame_num = 240; // 6 * 240 = 1440 samples (~90ms hardware DMA, tiết kiệm tối đa Internal DMA SRAM)
+    rx_chan_cfg.dma_desc_num = 16;
+    rx_chan_cfg.dma_frame_num = 500; // 16 * 500 = 8000 samples = 500ms hardware DMA buffer (chống tràn hoàn toàn trong 206ms inference)
     ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_handle));
 
     i2s_std_config_t rx_std_cfg = {
@@ -213,15 +213,15 @@ void audio_hal_init(void) {
         tx_ringbuf = xRingbufferCreateWithCaps(rb_size, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
         if (tx_ringbuf == NULL) return;
     }
-    xTaskCreatePinnedToCore(audio_playback_task, "audio_play_task", 4096, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCoreWithCaps(audio_playback_task, "audio_play_task", 4096, NULL, 6, NULL, 1, MALLOC_CAP_SPIRAM);
     
     ESP_LOGI(TAG, "Speaker initialized with %uKB RingBuffer in PSRAM.", (unsigned int)(rb_size / 1024));
 
     // Khởi tạo Espressif WebRTC VAD với Trigger tích hợp (Phương án A)
-    // Mode 3 (Very Aggressive), 16000Hz, frame 30ms, min_speech = 60ms (nhạy hơn, bắt âm sớm), min_noise = 600ms
-    s_vad_inst = vad_create_with_param(VAD_MODE_3, 16000, 30, 60, 600);
+    // Mode 3 (Very Aggressive), 16000Hz, frame 30ms, min_speech = 120ms (chống xung tạp âm/động vật/hội trường), min_noise = 600ms
+    s_vad_inst = vad_create_with_param(VAD_MODE_3, 16000, 30, 120, 600);
     if (s_vad_inst) {
-        ESP_LOGI(TAG, "Espressif Hardware VAD Engine initialized (Mode 3, Trigger: 60ms speech, 600ms noise).");
+        ESP_LOGI(TAG, "Espressif Hardware VAD Engine initialized (Mode 3, Trigger: 120ms speech, 600ms noise).");
     } else {
         ESP_LOGE(TAG, "Failed to initialize Espressif VAD Engine!");
     }
@@ -389,9 +389,10 @@ bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms
 
     // 5. Điều kiện kết hợp:
     // - VAD Trigger Mode 3 xác nhận có phổ giọng nói người liên tục >= 120ms
-    // - Năng lượng RMS sạch vượt ngưỡng sàn ồn môi trường ít nhất +20 RMS (hoặc tối thiểu 45 RMS)
-    int min_speech_rms = audio_dsp_get_ambient_noise() + 20;
-    if (min_speech_rms < 45) min_speech_rms = 45;
+    // - Năng lượng RMS sạch vượt ngưỡng cận trường (tối thiểu 100 RMS hoặc ambient * 2 + 35)
+    int ambient = audio_dsp_get_ambient_noise();
+    int min_speech_rms = ambient * 2 + 35;
+    if (min_speech_rms < 100) min_speech_rms = 100;
 
     return (speech_detected && rms >= min_speech_rms);
 }

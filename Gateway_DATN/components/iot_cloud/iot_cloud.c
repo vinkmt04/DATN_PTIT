@@ -5,11 +5,17 @@
 #include "mesh_controller.h"
 #include "gateway_state_manager.h"
 #include "ai_cloud.h"
+#include "sys_core.h"
 #include "esp_mac.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 static const char *TAG = "iot_cloud";
 
@@ -26,6 +32,38 @@ void iot_cloud_publish_telemetry_now(void) {
 
     gateway_device_state_t st;
     gateway_state_get(&st);
+
+    static int s_last_dimmer_status = -1;
+    static int s_last_dimmer_bri = -1;
+    static int s_last_relay_status = -1;
+    static float s_last_temp = -999.0f;
+    static float s_last_hum = -999.0f;
+    static int64_t s_last_pub_ms = 0;
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    int cur_dimmer_status = st.dimmer_on ? 1 : 0;
+    int cur_dimmer_bri = st.dimmer_brightness;
+    int cur_relay_status = st.relay_on ? 1 : 0;
+
+    bool state_identical = (cur_dimmer_status == s_last_dimmer_status &&
+                            cur_dimmer_bri == s_last_dimmer_bri &&
+                            cur_relay_status == s_last_relay_status &&
+                            (st.sensor_valid ? (fabsf(st.temperature - s_last_temp) < 0.05f &&
+                                                fabsf(st.humidity - s_last_hum) < 0.05f) : true));
+
+    // Khử bản tin trùng lặp: Nếu trạng thái hoàn toàn không đổi thì không cần đẩy lại lên ThingsBoard
+    if (s_last_pub_ms > 0 && state_identical) {
+        return;
+    }
+
+    s_last_dimmer_status = cur_dimmer_status;
+    s_last_dimmer_bri = cur_dimmer_bri;
+    s_last_relay_status = cur_relay_status;
+    if (st.sensor_valid) {
+        s_last_temp = st.temperature;
+        s_last_hum = st.humidity;
+    }
+    s_last_pub_ms = now_ms;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return;
@@ -196,19 +234,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-static void telemetry_periodic_task(void *arg) {
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(THINGSBOARD_TELEMETRY_PERIOD_S * 1000));
-        // Chỉ đẩy bản tin định kỳ khi không có lượt hội thoại AI nào đang diễn ra,
-        // nhằm ưu tiên 100% băng thông Wi-Fi và CPU Core 0 cho luồng âm thanh thời gian thực.
-        if (s_is_connected && !ai_cloud_is_busy()) {
-            iot_cloud_publish_telemetry_now();
+static void on_wifi_ip_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
+    if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "Wi-Fi acquired IP -> Starting ThingsBoard MQTT client...");
+        if (s_mqtt_client) {
+            esp_mqtt_client_start(s_mqtt_client);
+        }
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Wi-Fi disconnected -> Pausing ThingsBoard MQTT client...");
+        s_is_connected = false;
+        if (s_mqtt_client) {
+            esp_mqtt_client_stop(s_mqtt_client);
         }
     }
 }
 
 void iot_cloud_init(void) {
-    ESP_LOGI(TAG, "Initializing ThingsBoard IoT Cloud Client...");
+    ESP_LOGI(TAG, "Initializing ThingsBoard IoT Cloud Client (Event-Driven)...");
 
     // Đăng ký nhận sự kiện thay đổi trạng thái từ Gateway State Manager
     gateway_state_register_callback(on_gateway_state_changed);
@@ -216,15 +258,23 @@ void iot_cloud_init(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = THINGSBOARD_BROKER_URI,
         .credentials.username = THINGSBOARD_ACCESS_TOKEN,
-        .task.stack_size = 4096,
+        .task.stack_size = 3072,
         .task.priority = 3,
     };
 
     s_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(s_mqtt_client);
 
-    xTaskCreate(telemetry_periodic_task, "tb_telemetry_task", 4096, NULL, 4, NULL);
+    // Đăng ký nhận sự kiện IP để chỉ khởi động MQTT khi Wi-Fi đã sẵn sàng
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_ip_event, NULL, NULL);
+    esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_wifi_ip_event, NULL, NULL);
+
+    if (sys_core_is_wifi_connected()) {
+        ESP_LOGI(TAG, "Wi-Fi already connected -> Starting ThingsBoard MQTT immediately");
+        esp_mqtt_client_start(s_mqtt_client);
+    } else {
+        ESP_LOGI(TAG, "Wi-Fi not connected yet. ThingsBoard MQTT will start automatically when IP is assigned.");
+    }
 }
 
 bool iot_cloud_is_connected(void) {

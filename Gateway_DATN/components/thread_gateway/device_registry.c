@@ -1,105 +1,351 @@
 /*
  * DEVICE REGISTRY MODULE - thread_gateway
  *
- * Tra cuu thiet bi va phan giai IPv6 dong qua bang SRP Server tren Border Router.
- * Tich hop NVS Cache giup Gateway ket noi tuc thi toi cac Node ngay khi khoi dong lai
- * ma khong can cho SRP Server hoc lai toan bo tu dau.
+ * Quản lý danh mục thiết bị tập trung (Device Registry) & Theo dõi hiện diện trực tuyến (Presence Tracking).
+ * Bộ nhớ RAM cache tốc độ cao O(1), phân giải địa chỉ SRP Server động và lưu trữ NVS bền vững.
  */
+
+#include "device_registry.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "openthread/instance.h"
 #include "openthread/ip6.h"
 #include "openthread/srp_server.h"
 
-#include "device_registry.h"
-
 #define TAG "DEV_REGISTRY"
-#define NVS_NS_IP_CACHE "dev_ip_cache"
 
-static bool s_relay_deleted_runtime  = false;
-static bool s_dimmer_deleted_runtime = false;
-static bool s_sensor_deleted_runtime = false;
+#define NVS_NS_UNIFIED   "mesh_registry"
+#define NVS_NS_LEGACY_1 "gw_dev_reg"
+#define NVS_NS_LEGACY_2 "tg_devs"
+#define NVS_NS_LEGACY_3 "dev_ip_cache"
 
-static bool load_cached_ip(const char *key, otIp6Address *out_addr)
+typedef struct {
+    thread_dev_type_t type;
+    const char       *name;
+    const char       *srp_label;
+    const char       *srp_service;
+    const char       *nvs_reg_key;
+    const char       *nvs_ip_key;
+    uint16_t          default_port;
+} thread_dev_desc_t;
+
+static const thread_dev_desc_t s_device_descs[THREAD_DEV_COUNT] = {
+    [THREAD_DEV_RELAY] = {
+        .type         = THREAD_DEV_RELAY,
+        .name         = "relay",
+        .srp_label    = "relay-01",
+        .srp_service  = "_relay._udp",
+        .nvs_reg_key  = "reg_relay",
+        .nvs_ip_key   = "ip_relay",
+        .default_port = 5683,
+    },
+    [THREAD_DEV_DIMMER] = {
+        .type         = THREAD_DEV_DIMMER,
+        .name         = "dimmer",
+        .srp_label    = "dimmer-01",
+        .srp_service  = "_dimmer._udp",
+        .nvs_reg_key  = "reg_dimmer",
+        .nvs_ip_key   = "ip_dimmer",
+        .default_port = 5683,
+    },
+    [THREAD_DEV_SENSOR] = {
+        .type         = THREAD_DEV_SENSOR,
+        .name         = "sensor",
+        .srp_label    = "sensor-01",
+        .srp_service  = "_sensor._udp",
+        .nvs_reg_key  = "reg_sensor",
+        .nvs_ip_key   = "ip_sensor",
+        .default_port = 5683,
+    },
+};
+
+typedef struct {
+    bool         registered;
+    int64_t      last_seen_ms;
+    bool         has_cached_ip;
+    otIp6Address cached_ip;
+    bool         deleted_runtime;
+} thread_dev_entry_t;
+
+static thread_dev_entry_t s_entries[THREAD_DEV_COUNT] = {0};
+static SemaphoreHandle_t  s_reg_mutex = NULL;
+static bool               s_inited = false;
+
+static void ensure_inited_locked(void)
 {
+    if (s_inited) return;
+
     nvs_handle_t h;
-    if (nvs_open(NVS_NS_IP_CACHE, NVS_READONLY, &h) != ESP_OK) {
-        return false;
-    }
-    size_t len = sizeof(*out_addr);
-    esp_err_t err = nvs_get_blob(h, key, out_addr, &len);
-    nvs_close(h);
-    return (err == ESP_OK && len == sizeof(*out_addr));
-}
+    bool has_unified = (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK);
 
-static void save_cached_ip(const char *key, const otIp6Address *in_addr)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_IP_CACHE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_blob(h, key, in_addr, sizeof(*in_addr));
-        nvs_commit(h);
-        nvs_close(h);
-    }
-}
+    for (int i = 0; i < THREAD_DEV_COUNT; i++) {
+        const thread_dev_desc_t *desc = &s_device_descs[i];
+        uint8_t reg_val = 0;
+        bool loaded = false;
 
-bool device_registry_has_cached_device(const char *dev_name)
-{
-    if (dev_name == NULL) return false;
-    otIp6Address dummy;
-    if (strstr(dev_name, "relay") != NULL) {
-        return !s_relay_deleted_runtime && load_cached_ip("ip_relay", &dummy);
-    }
-    if (strstr(dev_name, "dimmer") != NULL) {
-        return !s_dimmer_deleted_runtime && load_cached_ip("ip_dimmer", &dummy);
-    }
-    if (strstr(dev_name, "sensor") != NULL) {
-        return !s_sensor_deleted_runtime && load_cached_ip("ip_sensor", &dummy);
-    }
-    return false;
-}
-
-void device_registry_clear_cache(const char *dev_name)
-{
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS_IP_CACHE, NVS_READWRITE, &h) == ESP_OK) {
-        if (dev_name == NULL || strcasecmp(dev_name, "all") == 0) {
-            nvs_erase_all(h);
-            s_relay_deleted_runtime  = true;
-            s_dimmer_deleted_runtime = true;
-            s_sensor_deleted_runtime = true;
-            ESP_LOGI(TAG, "Cleared ALL device IPv6 caches");
-        } else {
-            if (strstr(dev_name, "relay") != NULL) {
-                nvs_erase_key(h, "ip_relay");
-                s_relay_deleted_runtime = true;
-                ESP_LOGI(TAG, "Cleared Relay IPv6 cache");
+        // 1. Kiểm tra namespace mới (mesh_registry)
+        if (has_unified) {
+            if (nvs_get_u8(h, desc->nvs_reg_key, &reg_val) == ESP_OK) {
+                s_entries[i].registered = (reg_val != 0);
+                loaded = true;
             }
-            if (strstr(dev_name, "dimmer") != NULL) {
-                nvs_erase_key(h, "ip_dimmer");
-                s_dimmer_deleted_runtime = true;
-                ESP_LOGI(TAG, "Cleared Dimmer IPv6 cache");
-            }
-            if (strstr(dev_name, "sensor") != NULL) {
-                nvs_erase_key(h, "ip_sensor");
-                s_sensor_deleted_runtime = true;
-                ESP_LOGI(TAG, "Cleared Sensor IPv6 cache");
+            size_t ip_len = sizeof(otIp6Address);
+            if (nvs_get_blob(h, desc->nvs_ip_key, &s_entries[i].cached_ip, &ip_len) == ESP_OK &&
+                ip_len == sizeof(otIp6Address)) {
+                s_entries[i].has_cached_ip = true;
             }
         }
+
+        // 2. Di trú dữ liệu từ namespace cũ nếu chưa có trong mesh_registry
+        if (!loaded) {
+            nvs_handle_t h_leg;
+            // Kiểm tra gw_dev_reg
+            if (nvs_open(NVS_NS_LEGACY_1, NVS_READONLY, &h_leg) == ESP_OK) {
+                if (nvs_get_u8(h_leg, desc->nvs_reg_key, &reg_val) == ESP_OK) {
+                    s_entries[i].registered = (reg_val != 0);
+                    loaded = true;
+                }
+                nvs_close(h_leg);
+            }
+            // Kiểm tra tg_devs nếu chưa có
+            if (!loaded && nvs_open(NVS_NS_LEGACY_2, NVS_READONLY, &h_leg) == ESP_OK) {
+                if (nvs_get_u8(h_leg, desc->nvs_reg_key, &reg_val) == ESP_OK) {
+                    s_entries[i].registered = (reg_val != 0);
+                    loaded = true;
+                }
+                nvs_close(h_leg);
+            }
+            // Nạp IP cache cũ từ dev_ip_cache
+            if (!s_entries[i].has_cached_ip && nvs_open(NVS_NS_LEGACY_3, NVS_READONLY, &h_leg) == ESP_OK) {
+                size_t ip_len = sizeof(otIp6Address);
+                if (nvs_get_blob(h_leg, desc->nvs_ip_key, &s_entries[i].cached_ip, &ip_len) == ESP_OK &&
+                    ip_len == sizeof(otIp6Address)) {
+                    s_entries[i].has_cached_ip = true;
+                    if (!loaded) {
+                        s_entries[i].registered = true;
+                    }
+                }
+                nvs_close(h_leg);
+            }
+
+            // Ghi cấu hình đã di trú vào mesh_registry
+            if (has_unified && s_entries[i].registered) {
+                nvs_set_u8(h, desc->nvs_reg_key, 1);
+                if (s_entries[i].has_cached_ip) {
+                    nvs_set_blob(h, desc->nvs_ip_key, &s_entries[i].cached_ip, sizeof(otIp6Address));
+                }
+            }
+        }
+
+        s_entries[i].last_seen_ms = 0;
+        s_entries[i].deleted_runtime = false;
+
+        ESP_LOGI(TAG, "Device [%s]: Registered=%d, CachedIP=%d",
+                 desc->name, s_entries[i].registered, s_entries[i].has_cached_ip);
+    }
+
+    if (has_unified) {
         nvs_commit(h);
         nvs_close(h);
     }
+
+    s_inited = true;
 }
 
-bool device_registry_find_locked(
+void device_registry_init(void)
+{
+    if (s_reg_mutex == NULL) {
+        s_reg_mutex = xSemaphoreCreateMutex();
+    }
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        ensure_inited_locked();
+        xSemaphoreGive(s_reg_mutex);
+    }
+}
+
+thread_dev_type_t device_registry_str_to_type(const char *dev_name)
+{
+    if (dev_name == NULL) return THREAD_DEV_UNKNOWN;
+    if (strstr(dev_name, "relay") != NULL)  return THREAD_DEV_RELAY;
+    if (strstr(dev_name, "dimmer") != NULL) return THREAD_DEV_DIMMER;
+    if (strstr(dev_name, "sensor") != NULL) return THREAD_DEV_SENSOR;
+    return THREAD_DEV_UNKNOWN;
+}
+
+const char *device_registry_type_to_str(thread_dev_type_t type)
+{
+    if (type >= 0 && type < THREAD_DEV_COUNT) {
+        return s_device_descs[type].name;
+    }
+    return "unknown";
+}
+
+bool device_registry_is_type_registered(thread_dev_type_t type)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return false;
+    device_registry_init();
+
+    bool reg = false;
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        reg = s_entries[type].registered && !s_entries[type].deleted_runtime;
+        xSemaphoreGive(s_reg_mutex);
+    }
+    return reg;
+}
+
+bool device_registry_is_registered(const char *dev_name)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    return (type != THREAD_DEV_UNKNOWN) ? device_registry_is_type_registered(type) : false;
+}
+
+void device_registry_set_type_registered(thread_dev_type_t type, bool registered)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return;
+    device_registry_init();
+
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        s_entries[type].registered = registered;
+        s_entries[type].deleted_runtime = !registered;
+        if (!registered) {
+            s_entries[type].last_seen_ms = 0;
+            s_entries[type].has_cached_ip = false;
+        }
+
+        const thread_dev_desc_t *desc = &s_device_descs[type];
+
+        // 1. Lưu vào unified namespace
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+            if (registered) {
+                nvs_set_u8(h, desc->nvs_reg_key, 1);
+            } else {
+                nvs_erase_key(h, desc->nvs_reg_key);
+                nvs_erase_key(h, desc->nvs_ip_key);
+            }
+            nvs_commit(h);
+            nvs_close(h);
+        }
+
+        // 2. Đồng bộ legacy namespaces để đảm bảo tương thích ngược tuyệt đối
+        if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
+            if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
+            else nvs_erase_key(h, desc->nvs_reg_key);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
+            if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
+            else nvs_erase_key(h, desc->nvs_reg_key);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        if (!registered && nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_key(h, desc->nvs_ip_key);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+
+        ESP_LOGI(TAG, "Device [%s] registration set to: %d (NVS persisted)", desc->name, registered);
+        xSemaphoreGive(s_reg_mutex);
+    }
+}
+
+void device_registry_set_registered(const char *dev_name, bool registered)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    if (type != THREAD_DEV_UNKNOWN) {
+        device_registry_set_type_registered(type, registered);
+    }
+}
+
+void device_registry_get_registered(bool *out_relay, bool *out_dimmer, bool *out_sensor)
+{
+    if (out_relay)  *out_relay  = device_registry_is_type_registered(THREAD_DEV_RELAY);
+    if (out_dimmer) *out_dimmer = device_registry_is_type_registered(THREAD_DEV_DIMMER);
+    if (out_sensor) *out_sensor = device_registry_is_type_registered(THREAD_DEV_SENSOR);
+}
+
+void device_registry_record_type_activity(thread_dev_type_t type)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return;
+    device_registry_init();
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        s_entries[type].last_seen_ms = now_ms;
+        s_entries[type].deleted_runtime = false;
+        xSemaphoreGive(s_reg_mutex);
+    }
+}
+
+void device_registry_record_activity(const char *dev_name)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    if (type != THREAD_DEV_UNKNOWN) {
+        device_registry_record_type_activity(type);
+    }
+}
+
+int64_t device_registry_get_last_seen_ms(thread_dev_type_t type)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return 0;
+    device_registry_init();
+    int64_t val = 0;
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        val = s_entries[type].last_seen_ms;
+        xSemaphoreGive(s_reg_mutex);
+    }
+    return val;
+}
+
+void device_registry_update_ip(thread_dev_type_t type, const otIp6Address *addr)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT || addr == NULL) return;
+    device_registry_init();
+
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        bool ip_changed = (!s_entries[type].has_cached_ip ||
+                           memcmp(&s_entries[type].cached_ip, addr, sizeof(otIp6Address)) != 0);
+        s_entries[type].cached_ip = *addr;
+        s_entries[type].has_cached_ip = true;
+        s_entries[type].last_seen_ms = esp_timer_get_time() / 1000;
+        s_entries[type].deleted_runtime = false;
+
+        const thread_dev_desc_t *desc = &s_device_descs[type];
+        if (ip_changed) {
+            nvs_handle_t h;
+            if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_blob(h, desc->nvs_ip_key, addr, sizeof(otIp6Address));
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_blob(h, desc->nvs_ip_key, addr, sizeof(otIp6Address));
+                nvs_commit(h);
+                nvs_close(h);
+            }
+            ESP_LOGI(TAG, "Device [%s] IP cache updated from live packet", desc->name);
+        }
+        xSemaphoreGive(s_reg_mutex);
+    }
+}
+
+bool device_registry_find_fresh_locked(
     otInstance   *instance,
     const char   *instance_label,
     const char   *service_type,
+    uint32_t      max_age_ms,
     otIp6Address *out_addr,
     uint16_t     *out_port)
 {
@@ -113,21 +359,34 @@ bool device_registry_find_locked(
             continue;
         }
 
+        // Kiểm tra tuổi đăng ký của host nếu max_age_ms > 0
+        if (max_age_ms > 0) {
+            otSrpServerLeaseInfo lease_info;
+            otSrpServerHostGetLeaseInfo(host, &lease_info);
+            // mLease và mRemainingLease trong OpenThread tính theo GIÂY -> quy đổi ra ms
+            uint32_t age_sec = (lease_info.mLease >= lease_info.mRemainingLease)
+                                ? (lease_info.mLease - lease_info.mRemainingLease)
+                                : 0;
+            uint32_t age_ms = age_sec * 1000;
+            if (age_ms > max_age_ms) {
+                ESP_LOGD(TAG, "Bỏ qua SRP Host vì bản ghi cũ (age=%lu ms > max=%lu ms)",
+                         (unsigned long)age_ms, (unsigned long)max_age_ms);
+                continue;
+            }
+        }
+
         const otSrpServerService *service = NULL;
         while ((service = otSrpServerHostGetNextService(host, service)) != NULL) {
             if (otSrpServerServiceIsDeleted(service)) {
                 continue;
             }
 
-            const char *label = otSrpServerServiceGetInstanceLabel(service);
             const char *service_name = otSrpServerServiceGetServiceName(service);
-
-            /* So khop loai dich vu SRP */
             if (service_name == NULL || strstr(service_name, service_type) == NULL) {
                 continue;
             }
 
-            /* So khop nhan instance: khop chinh xac hoac chua tu khoa nhan (neu instance_label != NULL) */
+            const char *label = otSrpServerServiceGetInstanceLabel(service);
             if (instance_label != NULL && label != NULL) {
                 if (strcasecmp(label, instance_label) != 0 && strstr(label, instance_label) == NULL) {
                     continue;
@@ -136,7 +395,7 @@ bool device_registry_find_locked(
 
             uint16_t port = otSrpServerServiceGetPort(service);
             if (port == 0) {
-                port = 5683; // Default CoAP port
+                port = 5683;
             }
 
             uint8_t addr_num = 0;
@@ -147,104 +406,220 @@ bool device_registry_find_locked(
 
             *out_addr = addrs[0];
             *out_port = port;
-
-            char ip_str[OT_IP6_ADDRESS_STRING_SIZE];
-            otIp6AddressToString(&addrs[0], ip_str, sizeof(ip_str));
-            ESP_LOGD(TAG, "Found SRP: instance='%s' type='%s' addr=[%s]:%u",
-                     label ? label : "n/a", service_name, ip_str, (unsigned)port);
-
             return true;
         }
     }
-
     return false;
+}
+
+bool device_registry_find_locked(
+    otInstance   *instance,
+    const char   *instance_label,
+    const char   *service_type,
+    otIp6Address *out_addr,
+    uint16_t     *out_port)
+{
+    return device_registry_find_fresh_locked(instance, instance_label, service_type, 0, out_addr, out_port);
+}
+
+esp_err_t device_registry_resolve_address_locked(
+    otInstance        *instance,
+    thread_dev_type_t  type,
+    otIp6Address      *out_addr,
+    uint16_t          *out_port)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT || out_addr == NULL || out_port == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    device_registry_init();
+
+    if (s_entries[type].deleted_runtime) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    const thread_dev_desc_t *desc = &s_device_descs[type];
+
+    // 1. Tìm kiếm trong bảng SRP Server hiện tại
+    if (instance != NULL &&
+        (device_registry_find_locked(instance, desc->srp_label, desc->srp_service, out_addr, out_port) ||
+         device_registry_find_locked(instance, desc->name, desc->srp_service, out_addr, out_port) ||
+         device_registry_find_locked(instance, NULL, desc->srp_service, out_addr, out_port))) {
+
+        // Cập nhật RAM IP cache
+        if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+            bool ip_changed = (!s_entries[type].has_cached_ip ||
+                               memcmp(&s_entries[type].cached_ip, out_addr, sizeof(otIp6Address)) != 0);
+            s_entries[type].cached_ip = *out_addr;
+            s_entries[type].has_cached_ip = true;
+
+            if (ip_changed) {
+                nvs_handle_t h;
+                if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_blob(h, desc->nvs_ip_key, out_addr, sizeof(otIp6Address));
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+                if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+                    nvs_set_blob(h, desc->nvs_ip_key, out_addr, sizeof(otIp6Address));
+                    nvs_commit(h);
+                    nvs_close(h);
+                }
+            }
+            xSemaphoreGive(s_reg_mutex);
+        }
+        return ESP_OK;
+    }
+
+    // 2. Fallback sử dụng IP Cache đã lưu trong RAM/NVS
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_entries[type].has_cached_ip) {
+            *out_addr = s_entries[type].cached_ip;
+            *out_port = desc->default_port;
+            xSemaphoreGive(s_reg_mutex);
+            return ESP_OK;
+        }
+        xSemaphoreGive(s_reg_mutex);
+    }
+
+    return ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t device_registry_find_relay_locked(otInstance *instance, otIp6Address *out_addr, uint16_t *out_port)
 {
-    if (s_relay_deleted_runtime) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // 1. Tim trong SRP Server
-    if (device_registry_find_locked(instance, "relay-01", "_relay._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, "relay", "_relay._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, NULL, "_relay._udp", out_addr, out_port)) {
-        save_cached_ip("ip_relay", out_addr);
-        return ESP_OK;
-    }
-
-    // 2. Fallback tim trong NVS cache
-    if (load_cached_ip("ip_relay", out_addr)) {
-        *out_port = 5683;
-        return ESP_OK;
-    }
-
-    return ESP_ERR_NOT_FOUND;
+    return device_registry_resolve_address_locked(instance, THREAD_DEV_RELAY, out_addr, out_port);
 }
 
 esp_err_t device_registry_find_dimmer_locked(otInstance *instance, otIp6Address *out_addr, uint16_t *out_port)
 {
-    if (s_dimmer_deleted_runtime) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // 1. Tim trong SRP Server (ho tro ca "dimmer-01", "dimmer-test-01", "dimmer" hoac bat ky service _dimmer._udp)
-    if (device_registry_find_locked(instance, "dimmer-01", "_dimmer._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, "dimmer-test-01", "_dimmer._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, "dimmer", "_dimmer._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, NULL, "_dimmer._udp", out_addr, out_port)) {
-        save_cached_ip("ip_dimmer", out_addr);
-        return ESP_OK;
-    }
-
-    // 2. Fallback tim trong NVS cache
-    if (load_cached_ip("ip_dimmer", out_addr)) {
-        *out_port = 5683;
-        return ESP_OK;
-    }
-
-    return ESP_ERR_NOT_FOUND;
+    return device_registry_resolve_address_locked(instance, THREAD_DEV_DIMMER, out_addr, out_port);
 }
 
 esp_err_t device_registry_find_sensor_locked(otInstance *instance, otIp6Address *out_addr, uint16_t *out_port)
 {
-    if (s_sensor_deleted_runtime) {
-        return ESP_ERR_NOT_FOUND;
+    return device_registry_resolve_address_locked(instance, THREAD_DEV_SENSOR, out_addr, out_port);
+}
+
+bool device_registry_is_type_online(otInstance *instance, thread_dev_type_t type)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return false;
+    device_registry_init();
+
+    if (!device_registry_is_type_registered(type)) {
+        return false;
     }
 
-    // 1. Tim trong SRP Server
-    if (device_registry_find_locked(instance, "sensor-01", "_sensor._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, "sensor", "_sensor._udp", out_addr, out_port) ||
-        device_registry_find_locked(instance, NULL, "_sensor._udp", out_addr, out_port)) {
-        save_cached_ip("ip_sensor", out_addr);
-        return ESP_OK;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool is_online = false;
+
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_entries[type].deleted_runtime) {
+            xSemaphoreGive(s_reg_mutex);
+            return false;
+        }
+
+        // 1. Kiểm tra hoạt động truyền thông gần nhất (phân biệt Actuator < 45s và Sensor < 75s)
+        int64_t timeout_limit_ms = (type == THREAD_DEV_SENSOR) ? SENSOR_PRESENCE_TIMEOUT_MS : ACTUATOR_PRESENCE_TIMEOUT_MS;
+        extern bool ai_edge_is_busy(void);
+        bool edge_busy = ai_edge_is_busy();
+        if (s_entries[type].last_seen_ms > 0 &&
+            (edge_busy || (now_ms - s_entries[type].last_seen_ms < timeout_limit_ms))) {
+            is_online = true;
+        } else if (instance != NULL) {
+            // Kiểm tra xem node có trong bảng SRP Server với bản ghi tươi (fresh) hay không
+            otIp6Address dummy_addr;
+            uint16_t dummy_port;
+            const thread_dev_desc_t *desc = &s_device_descs[type];
+            if (device_registry_find_fresh_locked(instance, desc->srp_label, desc->srp_service, 60000, &dummy_addr, &dummy_port) ||
+                device_registry_find_fresh_locked(instance, desc->name, desc->srp_service, 60000, &dummy_addr, &dummy_port) ||
+                device_registry_find_fresh_locked(instance, NULL, desc->srp_service, 60000, &dummy_addr, &dummy_port)) {
+                s_entries[type].last_seen_ms = now_ms;
+                is_online = true;
+            }
+        }
+        xSemaphoreGive(s_reg_mutex);
     }
 
-    // 2. Fallback tim trong NVS cache
-    if (load_cached_ip("ip_sensor", out_addr)) {
-        *out_port = 5683;
-        return ESP_OK;
-    }
+    return is_online;
+}
 
-    return ESP_ERR_NOT_FOUND;
+bool device_registry_is_node_online(otInstance *instance, const char *dev_name)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    return (type != THREAD_DEV_UNKNOWN) ? device_registry_is_type_online(instance, type) : false;
 }
 
 uint8_t device_registry_count_active_locked(otInstance *instance)
 {
     uint8_t count = 0;
-    otIp6Address addr;
-    uint16_t port;
-
-    if (device_registry_find_relay_locked(instance, &addr, &port) == ESP_OK) {
-        count++;
+    for (int i = 0; i < THREAD_DEV_COUNT; i++) {
+        if (device_registry_is_type_online(instance, (thread_dev_type_t)i)) {
+            count++;
+        }
     }
-    if (device_registry_find_dimmer_locked(instance, &addr, &port) == ESP_OK) {
-        count++;
-    }
-    if (device_registry_find_sensor_locked(instance, &addr, &port) == ESP_OK) {
-        count++;
-    }
-
     return count;
+}
+
+bool device_registry_has_cached_device(const char *dev_name)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    if (type == THREAD_DEV_UNKNOWN) return false;
+    device_registry_init();
+
+    bool has_ip = false;
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        has_ip = !s_entries[type].deleted_runtime && s_entries[type].has_cached_ip;
+        xSemaphoreGive(s_reg_mutex);
+    }
+    return has_ip;
+}
+
+void device_registry_clear_cache(const char *dev_name)
+{
+    device_registry_init();
+    if (dev_name == NULL || strcasecmp(dev_name, "all") == 0) {
+        device_registry_clear_all();
+        return;
+    }
+
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    if (type != THREAD_DEV_UNKNOWN) {
+        device_registry_set_type_registered(type, false);
+    }
+}
+
+void device_registry_clear_all(void)
+{
+    device_registry_init();
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < THREAD_DEV_COUNT; i++) {
+            s_entries[i].registered = false;
+            s_entries[i].deleted_runtime = true;
+            s_entries[i].last_seen_ms = 0;
+            s_entries[i].has_cached_ip = false;
+        }
+
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        ESP_LOGI(TAG, "Cleared ALL device registries & caches from NVS");
+        xSemaphoreGive(s_reg_mutex);
+    }
 }

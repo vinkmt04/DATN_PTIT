@@ -7,6 +7,7 @@
 #include "esp_crt_bundle.h"
 #include "audio_hal.h"
 #include "mesh_controller.h"
+#include "gateway_state_manager.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -369,44 +370,53 @@ static void parse_server_message(const char *json_string) {
 
             char result_msg[128] = "Đã thực hiện";
 
+            gateway_device_state_t cur_st;
+            gateway_state_get(&cur_st);
+
             if (strcmp(fn_name, "control_dimmer") == 0) {
-#if GATEWAY_ENABLE_DIMMER
-                if (strcmp(action, "set_brightness") == 0 || brightness >= 0) {
-                    if (brightness < 0) brightness = 80;
-                    if (brightness > 100) brightness = 100;
-                    char cmd_buf[32];
-                    snprintf(cmd_buf, sizeof(cmd_buf), "CMD:DIMMER:SET:%d", brightness);
-                    ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: %s <<<", cmd_buf);
-                    mesh_controller_send_command(cmd_buf);
-                    snprintf(result_msg, sizeof(result_msg), "Đã chỉnh độ sáng đèn lên %d%%", brightness);
-                } else if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
-                    ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:DIMMER:ON <<<");
-                    mesh_controller_send_command("CMD:DIMMER:ON");
-                    snprintf(result_msg, sizeof(result_msg), "Đã bật đèn");
-                } else if (strcmp(action, "turn_off") == 0 || strcmp(action, "off") == 0) {
-                    ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:DIMMER:OFF <<<");
-                    mesh_controller_send_command("CMD:DIMMER:OFF");
-                    snprintf(result_msg, sizeof(result_msg), "Đã tắt đèn");
+                if (!cur_st.dimmer_registered) {
+                    ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer - Đèn chưa đăng ký vào mạng Thread <<<");
+                    snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn chưa được kết nối vào hệ thống");
+                } else if (!cur_st.dimmer_node_online) {
+                    ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer - Đèn hiện đang ngoại tuyến <<<");
+                    snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn hiện đang ngoại tuyến, vui lòng kiểm tra nguồn");
+                } else {
+                    if (strcmp(action, "set_brightness") == 0 || brightness >= 0) {
+                        if (brightness < 0) brightness = 80;
+                        if (brightness > 100) brightness = 100;
+                        char cmd_buf[32];
+                        snprintf(cmd_buf, sizeof(cmd_buf), "CMD:DIMMER:SET:%d", brightness);
+                        ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: %s <<<", cmd_buf);
+                        mesh_controller_send_command(cmd_buf);
+                        snprintf(result_msg, sizeof(result_msg), "Đã chỉnh độ sáng đèn lên %d%%", brightness);
+                    } else if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
+                        ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:DIMMER:ON <<<");
+                        mesh_controller_send_command("CMD:DIMMER:ON");
+                        snprintf(result_msg, sizeof(result_msg), "Đã bật đèn");
+                    } else if (strcmp(action, "turn_off") == 0 || strcmp(action, "off") == 0) {
+                        ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:DIMMER:OFF <<<");
+                        mesh_controller_send_command("CMD:DIMMER:OFF");
+                        snprintf(result_msg, sizeof(result_msg), "Đã tắt đèn");
+                    }
                 }
-#else
-                ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer bị vô hiệu hóa (GATEWAY_ENABLE_DIMMER == 0)! Không gửi lệnh Mesh. <<<");
-                snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn chưa được kết nối vào hệ thống");
-#endif
             } else if (strcmp(fn_name, "control_relay") == 0) {
-#if GATEWAY_ENABLE_RELAY
-                if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
-                    ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:ON <<<");
-                    mesh_controller_send_command("CMD:RELAY:ON");
-                    snprintf(result_msg, sizeof(result_msg), "Đã bật công tắc");
-                } else if (strcmp(action, "turn_off") == 0 || strcmp(action, "off") == 0) {
-                    ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:OFF <<<");
-                    mesh_controller_send_command("CMD:RELAY:OFF");
-                    snprintf(result_msg, sizeof(result_msg), "Đã tắt công tắc");
+                if (!cur_st.relay_registered) {
+                    ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay - Relay chưa đăng ký vào mạng Thread <<<");
+                    snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc chưa được kết nối vào hệ thống");
+                } else if (!cur_st.relay_node_online) {
+                    ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay - Relay hiện đang ngoại tuyến <<<");
+                    snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc hiện đang ngoại tuyến, vui lòng kiểm tra nguồn");
+                } else {
+                    if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
+                        ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:ON <<<");
+                        mesh_controller_send_command("CMD:RELAY:ON");
+                        snprintf(result_msg, sizeof(result_msg), "Đã bật công tắc");
+                    } else if (strcmp(action, "turn_off") == 0 || strcmp(action, "off") == 0) {
+                        ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:OFF <<<");
+                        mesh_controller_send_command("CMD:RELAY:OFF");
+                        snprintf(result_msg, sizeof(result_msg), "Đã tắt công tắc");
+                    }
                 }
-#else
-                ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay bị vô hiệu hóa (GATEWAY_ENABLE_RELAY == 0)! Không gửi lệnh Mesh. <<<");
-                snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc chưa được kết nối vào hệ thống");
-#endif
             }
 
             // Ghi nhận functionResponse cho ID tương ứng
@@ -1302,7 +1312,7 @@ void ai_cloud_prewarm_session(void) {
                 .uri = GEMINI_WS_URL,
                 .crt_bundle_attach = esp_crt_bundle_attach,
                 .buffer_size = 24576, // 24KB (>16KB threshold -> cấp phát vào PSRAM, đọc trọn vẹn JSON Base64 chunk không phân mảnh)
-                .task_stack = 8192,
+                .task_stack = 8192,   // Stack 8KB cấp phát trong PSRAM (an toàn tuyệt đối cho TLS & mbedTLS handshake)
                 .task_core_id_set = true,
                 .task_core_id = 0,    // Ghim luồng WebSocket cố định vào Core 0 (Nhân Mạng)
                 .task_prio = 5,
@@ -1366,10 +1376,10 @@ void ai_cloud_init(void) {
         s_rx_json_ringbuf = xRingbufferCreateWithCaps(256 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     }
 
-    // Tạo luồng truyền âm thanh mạng độc lập & FSM Worker (Core 0, Priority 5, Stack 8KB)
-    xTaskCreatePinnedToCore(cloud_tx_task, "cloud_tx_task", 8192, NULL, 5, &s_tx_task_handle, 0);
-    // Tạo luồng Consumer parse JSON & decode Base64 PCM (Core 1, Priority 5 - dưới audio_play_task Prio 6, Stack 8KB)
-    xTaskCreatePinnedToCore(cloud_rx_process_task, "cloud_rx_task", 8192, NULL, 5, &s_rx_task_handle, 1);
+    // Tạo luồng truyền âm thanh mạng độc lập & FSM Worker (Core 0, Priority 5, Stack 12KB trong PSRAM)
+    xTaskCreatePinnedToCoreWithCaps(cloud_tx_task, "cloud_tx_task", 12288, NULL, 5, &s_tx_task_handle, 0, MALLOC_CAP_SPIRAM);
+    // Tạo luồng Consumer parse JSON & decode Base64 PCM (Core 1, Priority 5, Stack 12KB trong PSRAM)
+    xTaskCreatePinnedToCoreWithCaps(cloud_rx_process_task, "cloud_rx_task", 12288, NULL, 5, &s_rx_task_handle, 1, MALLOC_CAP_SPIRAM);
 
     s_session_timer = xTimerCreate("ai_session_tmr", pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS), pdFALSE, (void *)0, session_timer_cb);
     s_keep_alive_timer = xTimerCreate("ai_ws_keep_alive", pdMS_TO_TICKS(WS_KEEP_ALIVE_TIMEOUT_MS), pdFALSE, (void *)0, ws_keep_alive_timer_cb);

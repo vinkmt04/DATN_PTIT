@@ -114,7 +114,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
 
     const int16_t TARGET_PEAK = 24500;
     float target_gain = 4.0f; // Mức khuếch đại cơ sở khi im lặng / sàn ồn
-    if (window_peak > 350) {
+    if (window_peak > 150) {
         target_gain = (float)TARGET_PEAK / (float)window_peak;
         if (target_gain > 14.0f) target_gain = 14.0f; // Giới hạn trần 14.0x (+23 dB) khớp dataset_recorder.c
         if (target_gain < 1.0f) target_gain = 1.0f;
@@ -126,7 +126,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         }
     } else {
         target_gain = 4.0f;
-        s_smooth_gain = 4.0f; // Tuyệt đối không bơm gain lên 10-14x khi im lặng / sàn ồn tĩnh (window_peak <= 350)
+        s_smooth_gain = 4.0f; // Duy trì gain cơ sở khi hoàn toàn im lặng
     }
     float gain = s_smooth_gain;
 
@@ -207,11 +207,10 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
 
     int64_t now_ms = esp_timer_get_time() / 1000;
 
-    // 1. KIỂM TRA VETO LOCKOUT 650MS (ƯU TIÊN SỐ 1):
-    // Khóa 650ms nếu phát hiện dấu hiệu từ tương đồng (Hey Siri, Berry, Harry...)
-    if ((similar_score >= 0.38f && similar_score > hey_cherry_score) ||
-        (similar_score >= 0.25f && hey_cherry_score < 0.40f) ||
-        (similar_score >= 0.60f)) {
+    // 1. KIỂM TRA VETO LOCKOUT (ƯU TIÊN SỐ 1):
+    // Khóa 350ms nếu phát hiện dấu hiệu rõ ràng từ tương đồng (Hey Siri, Berry, Harry...)
+    if ((similar_score >= 0.55f && similar_score > hey_cherry_score * 1.5f) ||
+        (similar_score >= 0.70f)) {
         s_veto_until_ms = now_ms + EI_WAKEWORD_VETO_DURATION_MS;
         s_prev_hey_cherry_score = 0.0f; // BẮT BUỘC: Reset ngay tích lũy để không cộng dồn sang nhịp sau
         s_prev_similar_score = 0.0f;

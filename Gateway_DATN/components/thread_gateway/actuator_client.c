@@ -20,6 +20,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "esp_openthread.h"
 #include "esp_openthread_lock.h"
 
@@ -237,6 +238,7 @@ static void actuator_verify_and_update(const actuator_command_t *cmd, const actu
             snap->has_confirmed_value = true;
             snap->confirmed_value = confirmed_val;
             snap->last_confirmed_ms = evt->rx_time_ms;
+            device_registry_record_activity((cmd->device == ACTUATOR_RELAY) ? "relay" : "dimmer");
             ESP_LOGI(TAG, "Actuator %s CONFIRMED: value=%d",
                      (cmd->device == ACTUATOR_RELAY) ? "relay" : "dimmer", confirmed_val);
         } else {
@@ -342,7 +344,7 @@ esp_err_t actuator_client_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ret = xTaskCreate(actuator_task, "actuator_task", 4096, NULL, 5, NULL);
+    BaseType_t ret = xTaskCreatePinnedToCoreWithCaps(actuator_task, "actuator_task", 4096, NULL, 5, NULL, 0, MALLOC_CAP_SPIRAM);
     return (ret == pdPASS) ? ESP_OK : ESP_FAIL;
 }
 

@@ -13,6 +13,7 @@
 #include "thread_gateway.h"
 #include "esp_ot_config.h"
 #include "device_registry.h"
+#include "thread_commissioner.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -85,7 +86,6 @@ static void report_request_handler(void *aContext, otMessage *aMessage,
                                    const otMessageInfo *aMessageInfo)
 {
     (void)aContext;
-    (void)aMessageInfo;
     char payload[64] = {0};
     uint16_t offset = otMessageGetOffset(aMessage);
     uint16_t length = otMessageGetLength(aMessage) - offset;
@@ -94,6 +94,16 @@ static void report_request_handler(void *aContext, otMessage *aMessage,
         payload[length] = '\0';
     }
     ESP_LOGI(TAG, "Gateway CoAP received /report: '%s'", payload);
+
+    if (aMessageInfo != NULL) {
+        if (strncmp(payload, "relay:", 6) == 0) {
+            device_registry_update_ip(THREAD_DEV_RELAY, &aMessageInfo->mPeerAddr);
+        } else if (strncmp(payload, "dimmer:", 7) == 0) {
+            device_registry_update_ip(THREAD_DEV_DIMMER, &aMessageInfo->mPeerAddr);
+        } else if (strncmp(payload, "sensor", 6) == 0 || strncmp(payload, "temp:", 5) == 0) {
+            device_registry_update_ip(THREAD_DEV_SENSOR, &aMessageInfo->mPeerAddr);
+        }
+    }
 
     if (s_report_cb != NULL) {
         s_report_cb(payload);
@@ -133,8 +143,15 @@ static void gateway_ot_state_changed_cb(otChangedFlags flags, void *context)
         otDeviceRole role = otThreadGetDeviceRole(instance);
         ESP_LOGI(TAG, "OpenThread Gateway role changed to: %d (%s)", (int)role, otThreadDeviceRoleToString(role));
         if (role == OT_DEVICE_ROLE_CHILD) {
-            ESP_LOGI(TAG, "Gateway attached as Child -> upgrading to Router...");
+            ESP_LOGI(TAG, "Gateway attached as Child -> upgrading to Router & Leader...");
             otThreadBecomeRouter(instance);
+            otThreadBecomeLeader(instance);
+        } else if (role == OT_DEVICE_ROLE_ROUTER) {
+            ESP_LOGI(TAG, "Gateway is Router -> claiming Leader role (weight 255)...");
+            otThreadBecomeLeader(instance);
+            thread_commissioner_on_role_changed(role);
+        } else if (role == OT_DEVICE_ROLE_LEADER) {
+            thread_commissioner_on_role_changed(role);
         }
     }
 }
@@ -172,8 +189,8 @@ static void ot_task_worker(void *aContext)
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *instance = esp_openthread_get_instance();
     if (instance != NULL) {
-        otLoggingSetLevel(OT_LOG_LEVEL_INFO);
-        ESP_LOGI(TAG, "OpenThread logging level set to INFO");
+        otLoggingSetLevel(OT_LOG_LEVEL_WARN);
+        ESP_LOGI(TAG, "OpenThread logging level set to WARN (Production clean log)");
 
         otSrpServerSetEnabled(instance, true);
         ESP_LOGI(TAG, "OpenThread SRP Server enabled on port %u", (unsigned)otSrpServerGetPort(instance));
@@ -181,8 +198,8 @@ static void ot_task_worker(void *aContext)
         otBorderAgentSetEnabled(instance, true);
         ESP_LOGI(TAG, "OpenThread Border Agent enabled (UDP port %u)", (unsigned)otBorderAgentGetUdpPort(instance));
 
-        // Thiết lập trọng số Leader (128 > default 64) để Gateway ưu tiên vai trò Leader/Router
-        otThreadSetLocalLeaderWeight(instance, 128);
+        // Thiết lập trọng số Leader tuyệt đối (255 = mức cao nhất của OpenThread) để Gateway luôn luôn là Leader
+        otThreadSetLocalLeaderWeight(instance, 255);
         otSetStateChangedCallback(instance, gateway_ot_state_changed_cb, instance);
 
         if (otDatasetIsCommissioned(instance)) {
@@ -201,10 +218,30 @@ static void ot_task_worker(void *aContext)
             ESP_LOGI(TAG, "No dataset in NVS -> Generating Thread dataset (Channel 19, PAN 0xa05e)...");
             otOperationalDataset dataset;
             if (otDatasetCreateNewNetwork(instance, &dataset) == OT_ERROR_NONE) {
+                static const uint8_t s_fixed_network_key[OT_NETWORK_KEY_SIZE] = {
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+                };
+                static const otExtendedPanId s_fixed_ext_panid = {
+                    .m8 = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+                };
+                static const otMeshLocalPrefix s_fixed_mesh_local_prefix = {
+                    .m8 = {0xfd, 0x00, 0x0d, 0xad, 0x00, 0x00, 0x00, 0x00}
+                };
+
                 dataset.mChannel = 19;
                 dataset.mPanId = 0xa05e;
                 dataset.mComponents.mIsChannelPresent = true;
                 dataset.mComponents.mIsPanIdPresent = true;
+
+                memcpy(dataset.mNetworkKey.m8, s_fixed_network_key, sizeof(s_fixed_network_key));
+                dataset.mComponents.mIsNetworkKeyPresent = true;
+
+                memcpy(dataset.mExtendedPanId.m8, s_fixed_ext_panid.m8, sizeof(s_fixed_ext_panid.m8));
+                dataset.mComponents.mIsExtendedPanIdPresent = true;
+
+                memcpy(dataset.mMeshLocalPrefix.m8, s_fixed_mesh_local_prefix.m8, sizeof(s_fixed_mesh_local_prefix.m8));
+                dataset.mComponents.mIsMeshLocalPrefixPresent = true;
 
                 const char *net_name = "OpenThread-PTIT";
                 size_t name_len = strlen(net_name);
@@ -259,6 +296,7 @@ esp_err_t thread_gateway_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    // ot_br_main BẮT BUỘC có stack trong Internal DRAM vì OpenThread ghi NVS dataset khi cache PSRAM bị freeze
     BaseType_t ret = xTaskCreate(ot_task_worker, "ot_br_main", 8192, NULL, 5, NULL);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create ot_br_main task");
@@ -331,11 +369,7 @@ bool thread_gateway_is_relay_online(void)
     bool online = false;
     if (esp_openthread_lock_acquire(portMAX_DELAY)) {
         otInstance *instance = esp_openthread_get_instance();
-        if (instance != NULL) {
-            otIp6Address addr;
-            uint16_t port;
-            online = (device_registry_find_relay_locked(instance, &addr, &port) == ESP_OK);
-        }
+        online = device_registry_is_node_online(instance, "relay");
         esp_openthread_lock_release();
     }
     return online;
@@ -349,11 +383,7 @@ bool thread_gateway_is_dimmer_online(void)
     bool online = false;
     if (esp_openthread_lock_acquire(portMAX_DELAY)) {
         otInstance *instance = esp_openthread_get_instance();
-        if (instance != NULL) {
-            otIp6Address addr;
-            uint16_t port;
-            online = (device_registry_find_dimmer_locked(instance, &addr, &port) == ESP_OK);
-        }
+        online = device_registry_is_node_online(instance, "dimmer");
         esp_openthread_lock_release();
     }
     return online;
@@ -367,11 +397,7 @@ bool thread_gateway_is_sensor_online(void)
     bool online = false;
     if (esp_openthread_lock_acquire(portMAX_DELAY)) {
         otInstance *instance = esp_openthread_get_instance();
-        if (instance != NULL) {
-            otIp6Address addr;
-            uint16_t port;
-            online = (device_registry_find_sensor_locked(instance, &addr, &port) == ESP_OK);
-        }
+        online = device_registry_is_node_online(instance, "sensor");
         esp_openthread_lock_release();
     }
     return online;

@@ -74,87 +74,53 @@ void gateway_state_manager_init(void) {
         s_state_mutex = xSemaphoreCreateMutex();
     }
 
-    // Đọc trạng thái đã đăng ký (enrolled) từ NVS
-    nvs_handle_t h;
-    uint8_t reg_r = 0, reg_d = 0, reg_s = 0;
-    if (nvs_open(NVS_NS_STATE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u8(h, NVS_KEY_REG_RELAY, &reg_r);
-        nvs_get_u8(h, NVS_KEY_REG_DIMMER, &reg_d);
-        nvs_get_u8(h, NVS_KEY_REG_SENSOR, &reg_s);
-        nvs_close(h);
-    }
-
-    // Tương thích ngược: nếu chưa có cờ trong gw_dev_reg, kiểm tra dev_registry cache
-    if (!reg_r && device_registry_has_cached_device("relay")) reg_r = 1;
-    if (!reg_d && device_registry_has_cached_device("dimmer")) reg_d = 1;
-    if (!reg_s && device_registry_has_cached_device("sensor")) reg_s = 1;
+    // Đọc trạng thái đã đăng ký (enrolled) trực tiếp từ Device Registry NVS
+    bool reg_r = false, reg_d = false, reg_s = false;
+    device_registry_get_registered(&reg_r, &reg_d, &reg_s);
 
     uint8_t last_bri = load_last_brightness_nvs();
 
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        s_device_state.relay_registered = (reg_r != 0);
-        s_device_state.dimmer_registered = (reg_d != 0);
-        s_device_state.sensor_registered = (reg_s != 0);
+        s_device_state.relay_registered = reg_r;
+        s_device_state.dimmer_registered = reg_d;
+        s_device_state.sensor_registered = reg_s;
 
         // Ban đầu sau khi khởi động: Các node tạm thời Offline cho đến khi mesh_monitor xác nhận
         s_device_state.relay_node_online = false;
         s_device_state.dimmer_node_online = false;
         s_device_state.sensor_node_online = false;
-        s_device_state.mesh_node_count = 0;
+        s_device_state.mesh_node_count = (reg_r ? 1 : 0) + (reg_d ? 1 : 0) + (reg_s ? 1 : 0);
 
         s_device_state.dimmer_last_brightness = last_bri;
         xSemaphoreGive(s_state_mutex);
     }
 
     ESP_LOGI(TAG, "Gateway State Manager initialized (Registered Nodes: Relay=%d, Dimmer=%d, Sensor=%d, LastBri=%u%%)",
-             reg_r != 0, reg_d != 0, reg_s != 0, last_bri);
+             reg_r, reg_d, reg_s, last_bri);
 }
 
 uint8_t gateway_state_get_registered_node_count(void) {
-    uint8_t count = 0;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (s_device_state.relay_registered) count++;
-        if (s_device_state.dimmer_registered) count++;
-        if (s_device_state.sensor_registered) count++;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return count;
+    bool reg_r = false, reg_d = false, reg_s = false;
+    device_registry_get_registered(&reg_r, &reg_d, &reg_s);
+    return (reg_r ? 1 : 0) + (reg_d ? 1 : 0) + (reg_s ? 1 : 0);
 }
 
 bool gateway_state_is_relay_registered(void) {
-    bool reg = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        reg = s_device_state.relay_registered;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return reg;
+    return device_registry_is_type_registered(THREAD_DEV_RELAY);
 }
 
 bool gateway_state_is_dimmer_registered(void) {
-    bool reg = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        reg = s_device_state.dimmer_registered;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return reg;
+    return device_registry_is_type_registered(THREAD_DEV_DIMMER);
 }
 
 bool gateway_state_is_sensor_registered(void) {
-    bool reg = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        reg = s_device_state.sensor_registered;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return reg;
+    return device_registry_is_type_registered(THREAD_DEV_SENSOR);
 }
 
 void gateway_state_set_device_registered(const char *dev_type, bool registered) {
     if (dev_type == NULL) return;
     bool changed = false;
     gateway_device_state_t copy;
-
-    nvs_handle_t h;
-    bool nvs_ok = (nvs_open(NVS_NS_STATE, NVS_READWRITE, &h) == ESP_OK);
 
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (strstr(dev_type, "relay") != NULL) {
@@ -163,38 +129,24 @@ void gateway_state_set_device_registered(const char *dev_type, bool registered) 
                 changed = true;
             }
             if (!registered) s_device_state.relay_node_online = false;
-            if (nvs_ok) {
-                if (registered) nvs_set_u8(h, NVS_KEY_REG_RELAY, 1);
-                else nvs_erase_key(h, NVS_KEY_REG_RELAY);
-            }
+            device_registry_set_registered("relay", registered);
         } else if (strstr(dev_type, "dimmer") != NULL) {
             if (s_device_state.dimmer_registered != registered) {
                 s_device_state.dimmer_registered = registered;
                 changed = true;
             }
             if (!registered) s_device_state.dimmer_node_online = false;
-            if (nvs_ok) {
-                if (registered) nvs_set_u8(h, NVS_KEY_REG_DIMMER, 1);
-                else nvs_erase_key(h, NVS_KEY_REG_DIMMER);
-            }
+            device_registry_set_registered("dimmer", registered);
         } else if (strstr(dev_type, "sensor") != NULL) {
             if (s_device_state.sensor_registered != registered) {
                 s_device_state.sensor_registered = registered;
                 changed = true;
             }
             if (!registered) s_device_state.sensor_node_online = false;
-            if (nvs_ok) {
-                if (registered) nvs_set_u8(h, NVS_KEY_REG_SENSOR, 1);
-                else nvs_erase_key(h, NVS_KEY_REG_SENSOR);
-            }
+            device_registry_set_registered("sensor", registered);
         }
         memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
         xSemaphoreGive(s_state_mutex);
-    }
-
-    if (nvs_ok) {
-        nvs_commit(h);
-        nvs_close(h);
     }
 
     if (changed) {
@@ -246,11 +198,20 @@ void gateway_state_get(gateway_device_state_t *out_state) {
     if (s_state_mutex == NULL) {
         gateway_state_manager_init();
     }
+    bool reg_r = false, reg_d = false, reg_s = false;
+    device_registry_get_registered(&reg_r, &reg_d, &reg_s);
+
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_device_state.relay_registered = reg_r;
+        s_device_state.dimmer_registered = reg_d;
+        s_device_state.sensor_registered = reg_s;
         memcpy(out_state, &s_device_state, sizeof(gateway_device_state_t));
         xSemaphoreGive(s_state_mutex);
     } else {
         memcpy(out_state, &s_device_state, sizeof(gateway_device_state_t));
+        out_state->relay_registered = reg_r;
+        out_state->dimmer_registered = reg_d;
+        out_state->sensor_registered = reg_s;
     }
 }
 
@@ -299,26 +260,18 @@ void gateway_state_set_relay(bool on) {
 }
 
 void gateway_state_set_sensor(float temperature, float humidity) {
-    bool changed = false;
     gateway_device_state_t copy;
 
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (!s_device_state.sensor_valid ||
-            s_device_state.temperature != temperature ||
-            s_device_state.humidity != humidity) {
-            changed = true;
-            s_device_state.temperature = temperature;
-            s_device_state.humidity = humidity;
-            s_device_state.sensor_valid = true;
-        }
+        s_device_state.temperature = temperature;
+        s_device_state.humidity = humidity;
+        s_device_state.sensor_valid = true;
         memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
         xSemaphoreGive(s_state_mutex);
     }
 
-    if (changed) {
-        ESP_LOGI(TAG, "Sensor DHT11 Updated: Temp=%.1f°C, Humidity=%.1f%%", temperature, humidity);
-        notify_state_changed(&copy);
-    }
+    ESP_LOGI(TAG, "Sensor DHT11 Updated: Temp=%.1f°C, Humidity=%.1f%% -> Notifying listeners (Cloud & UI)", temperature, humidity);
+    notify_state_changed(&copy);
 }
 
 void gateway_state_set_node_presence(bool relay_online, bool dimmer_online, bool sensor_online) {

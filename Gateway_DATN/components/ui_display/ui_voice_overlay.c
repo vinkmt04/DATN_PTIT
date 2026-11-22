@@ -62,11 +62,12 @@ static void anim_timer_cb(lv_timer_t *timer) {
 void ui_voice_overlay_init(void) {
     if (s_overlay_container) return;
 
-    // Lớp phủ trên cùng (Toàn màn hình 320x240)
+    // Lớp phủ trên cùng (Toàn màn hình 320x240) với nền mờ đen phủ bóng (85% Dark Dim)
     s_overlay_container = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_overlay_container, UI_LCD_H_RES, UI_LCD_V_RES);
     lv_obj_align(s_overlay_container, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_opa(s_overlay_container, LV_OPA_TRANSP, 0); // Trong suốt để thấy nền
+    lv_obj_set_style_bg_color(s_overlay_container, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_overlay_container, LV_OPA_80, 0); // 85% Dark Dim chống rối mắt
     lv_obj_set_style_border_width(s_overlay_container, 0, 0);
     lv_obj_set_style_pad_all(s_overlay_container, 0, 0);
     lv_obj_clear_flag(s_overlay_container, LV_OBJ_FLAG_SCROLLABLE);

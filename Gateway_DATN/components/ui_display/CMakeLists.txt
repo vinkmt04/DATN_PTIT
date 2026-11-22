@@ -3,6 +3,7 @@ idf_component_register(
         "ui_display.c"
         "st7789v_driver.c"
         "xpt2046_driver.c"
+        "ui_screen_splash.c"
         "ui_screen_idle.c"
         "ui_screen_dashboard.c"
         "ui_voice_overlay.c"

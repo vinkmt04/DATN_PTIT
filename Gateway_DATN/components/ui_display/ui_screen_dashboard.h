@@ -29,7 +29,7 @@ void ui_screen_dashboard_select_tab(uint16_t tab_idx);
 void ui_screen_dashboard_on_device_discovered(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi);
 
 // Thông báo kết quả hoàn tất ghép nối thiết bị (Thành công / Thất bại)
-void ui_screen_dashboard_on_pairing_result(bool success);
+void ui_screen_dashboard_on_pairing_result(bool success, const char *dev_type_str);
 
 #ifdef __cplusplus
 }

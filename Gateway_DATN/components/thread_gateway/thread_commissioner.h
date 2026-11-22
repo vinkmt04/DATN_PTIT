@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "openthread/thread.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,9 +17,10 @@ typedef enum {
 } commissioner_dev_type_t;
 
 typedef void (*commissioner_discovery_cb_t)(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi);
-typedef void (*commissioner_pair_result_cb_t)(bool success, const char *id_str);
+typedef void (*commissioner_pair_result_cb_t)(bool success, const char *dev_type_str);
 
 esp_err_t thread_commissioner_init(void);
+void      thread_commissioner_on_role_changed(otDeviceRole role);
 esp_err_t thread_commissioner_start_scan(uint32_t timeout_sec);
 esp_err_t thread_commissioner_stop(void);
 bool      thread_commissioner_is_scanning(void);
@@ -29,6 +31,8 @@ void      thread_commissioner_set_pair_result_callback(commissioner_pair_result_
 esp_err_t thread_commissioner_approve_device(const char *dev_id_str);
 esp_err_t thread_commissioner_remove_device(const char *dev_id_str);
 bool      thread_commissioner_is_device_approved(const char *dev_id_str);
+void      thread_commissioner_notify_report_received(commissioner_dev_type_t type);
+commissioner_dev_type_t thread_commissioner_poll_joined_device(void);
 
 #ifdef __cplusplus
 }

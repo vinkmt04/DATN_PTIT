@@ -8,12 +8,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_sntp.h"
+#include "mdns.h"
 #include <time.h>
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "driver/gpio.h"
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 
 static const char *TAG = "sys_core";
@@ -44,7 +46,12 @@ static bool s_is_provisioned = false;
 static TimerHandle_t s_reconnect_timer = NULL;
 static sys_core_is_busy_cb_t s_voice_busy_cb = NULL;
 
-#define WIFI_RECONNECT_INTERVAL_MS 15000 // Thử kết nối lại mỗi 15 giây ở chế độ nền
+static uint32_t calculate_backoff_ms(int retry) {
+    if (retry <= 0) return 1000;  // Lần 1: 1s
+    if (retry == 1) return 2000;  // Lần 2: 2s
+    if (retry == 2) return 4000;  // Lần 3: 4s
+    return 8000;                  // Lần 4+: 8s
+}
 
 void sys_core_set_voice_busy_check(sys_core_is_busy_cb_t cb) {
     s_voice_busy_cb = cb;
@@ -60,16 +67,32 @@ static void wifi_reconnect_timer_cb(TimerHandle_t xTimer) {
     // Ưu tiên giọng nói: Nếu người dùng đang ra lệnh Offline (thu âm / suy luận) thì hoãn lượt quét
     if (s_voice_busy_cb && s_voice_busy_cb()) {
         ESP_LOGD(TAG, "[WIFI_RECONNECT] Hoãn quét Wi-Fi vì hệ thống giọng nói đang bận...");
+        if (s_reconnect_timer) {
+            xTimerChangePeriod(s_reconnect_timer, pdMS_TO_TICKS(2000), 0);
+        }
         return;
     }
 
-    ESP_LOGI(TAG, ">>> [WIFI_RECONNECT] Định kỳ 15s: Đang thử kết nối lại Wi-Fi trong nền... <<<");
+    s_retry_num++;
+    uint32_t next_ms = calculate_backoff_ms(s_retry_num);
+    ESP_LOGI(TAG, ">>> [WIFI_RECONNECT] Thử kết nối lại Wi-Fi lần %d (chu kỳ kế: %lums) <<<",
+             s_retry_num, (unsigned long)next_ms);
     esp_wifi_connect();
+
+    if (s_reconnect_timer) {
+        xTimerChangePeriod(s_reconnect_timer, pdMS_TO_TICKS(next_ms), 0);
+    }
 }
 
 static void time_sync_notification_cb(struct timeval *tv) {
     (void)tv;
-    ESP_LOGI(TAG, ">>> [SNTP SYNC SUCCESS] Thời gian hệ thống đã được cập nhật tức thì GMT+7! <<<");
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    char strftime_buf[64];
+    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, ">>> [SNTP SYNC SUCCESS] Thời gian hệ thống đã cập nhật tức thì: %s (GMT+7) <<<", strftime_buf);
 }
 
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -108,10 +131,13 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_is_connected = false;
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "Wi-Fi disconnected (reason: %d). Sẽ tự động kết nối lại mỗi 15s trong nền.", disc ? disc->reason : 0);
+        uint32_t initial_delay = calculate_backoff_ms(s_retry_num);
+        ESP_LOGW(TAG, "Wi-Fi disconnected (reason: %d). Sẽ tự động kết nối lại nhanh sau %lums...",
+                 disc ? disc->reason : 0, (unsigned long)initial_delay);
 
-        // Khởi động timer định kỳ 15s trong nền (Non-blocking, KHÔNG gọi vTaskDelay trong event loop!)
+        // Khởi động timer thử lại với backoff nhanh trong nền
         if (s_reconnect_timer) {
+            xTimerChangePeriod(s_reconnect_timer, pdMS_TO_TICKS(initial_delay), 0);
             xTimerStart(s_reconnect_timer, 0);
         }
         xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
@@ -128,17 +154,19 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
 
         // Khởi động đồng bộ giờ SNTP tức thì (Múi giờ GMT+7 Việt Nam)
+        setenv("TZ", "ICT-7", 1);
+        tzset();
         if (!esp_sntp_enabled()) {
             esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
             esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
-            esp_sntp_setservername(0, "vn.pool.ntp.org");
-            esp_sntp_setservername(1, "asia.pool.ntp.org");
-            esp_sntp_setservername(2, "time.google.com");
+            esp_sntp_setservername(0, "time.google.com");
+            esp_sntp_setservername(1, "pool.ntp.org");
+            esp_sntp_setservername(2, "time.cloudflare.com");
             esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
             esp_sntp_init();
-            setenv("TZ", "ICT-7", 1);
-            tzset();
-            ESP_LOGI(TAG, "SNTP Started (IMMED mode): Syncing network time to GMT+7 via VN/Asia/Google NTP...");
+            ESP_LOGI(TAG, "SNTP Started (IMMED mode): Syncing network time to GMT+7 via Google/Pool/Cloudflare NTP...");
+        } else {
+            esp_sntp_restart();
         }
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -151,18 +179,38 @@ void sys_core_reset_wifi(void) {
     esp_restart();
 }
 
-void sys_core_init(void) {
-    ESP_LOGI(TAG, "sys_core initialized");
-    
+void sys_core_platform_init(void) {
+    static bool s_platform_inited = false;
+    if (s_platform_inited) return;
+    s_platform_inited = true;
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t ev_ret = esp_event_loop_create_default();
+    if (ev_ret != ESP_OK && ev_ret != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(ev_ret);
+    }
+
+    // Khởi tạo mDNS sớm cho OpenThread Border Router (khử hoàn toàn lỗi meshcop mdns)
+    esp_err_t mdns_err = mdns_init();
+    if (mdns_err == ESP_OK) {
+        mdns_hostname_set("esp-ot-br");
+        mdns_instance_name_set("ESP32-S3 Thread Border Router");
+        ESP_LOGI(TAG, "mDNS initialized successfully for OpenThread Border Router (esp-ot-br)");
+    } else {
+        ESP_LOGW(TAG, "mDNS initialization returned %d", (int)mdns_err);
+    }
+}
+
+void sys_core_init(void) {
+    ESP_LOGI(TAG, "sys_core initialized (Wi-Fi STA / SoftAP Provisioning)");
+    sys_core_platform_init();
     
     s_wifi_event_group = xEventGroupCreate();
 
@@ -223,22 +271,22 @@ void sys_core_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     }
 
-    // Khởi tạo Software Timer kết nối lại Wi-Fi trong nền (chu kỳ 15s, auto-reload)
+    // Khởi tạo Software Timer kết nối lại Wi-Fi trong nền với backoff linh hoạt (khởi đầu 1000ms)
     if (!s_reconnect_timer) {
         s_reconnect_timer = xTimerCreate("wifi_reconn_tmr",
-                                          pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS),
-                                          pdTRUE, // Auto-reload
+                                          pdMS_TO_TICKS(1000),
+                                          pdFALSE, // Oneshot: mỗi lần cb sẽ tính chu kỳ mới
                                           NULL,
                                           wifi_reconnect_timer_cb);
     }
 
-    // Chờ tối đa 3.5 giây để kết nối Wi-Fi lúc khởi động (Sweet-Spot Boot Timeout):
-    // - Nếu có mạng (bình thường mất 1.5s - 2.0s): Trả về ngay lập tức để kịp phiên Online.
-    // - Nếu mất mạng / router tắt: Không bị treo kẹt, unblock sau 3.5s để khởi động toàn bộ Mic, Loa, Mesh, Edge AI chạy Offline trơn tru!
+    // Chờ tối đa 4.0 giây để kết nối Wi-Fi lúc khởi động (Sweet-Spot Boot Timeout cho Router DHCP):
+    // - Nếu có mạng (bình thường DHCP mất 2.0s - 3.5s): Trả về ngay lập tức để kịp phiên Online.
+    // - Nếu mất mạng / router tắt: Không bị treo kẹt, unblock sau 4.0s để chuyển sang chế độ Cục bộ (Offline)
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE,
-                                           pdMS_TO_TICKS(3500));
+                                           pdMS_TO_TICKS(4000));
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "==================================================");
         ESP_LOGI(TAG, ">>> [BOOT ONLINE] Kết nối Wi-Fi thành công lúc khởi động! <<<");
@@ -297,4 +345,21 @@ void sys_core_get_wifi_ssid(char *out_str, size_t max_len) {
         return;
     }
     snprintf(out_str, max_len, "Connected");
+}
+
+void sys_core_print_memory_stats(const char *phase_tag)
+{
+    size_t free_dram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t min_dram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_dram = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t min_psram = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+
+    ESP_LOGI("SYS_MEM", "=================================================");
+    ESP_LOGI("SYS_MEM", ">>> [MEMORY AUDIT - %s] <<<", phase_tag ? phase_tag : "RUNTIME");
+    ESP_LOGI("SYS_MEM", "  Internal DRAM (SRAM) : %u KB Free (Min Ever: %u KB, Max Block: %u KB)",
+             (unsigned)(free_dram / 1024), (unsigned)(min_dram / 1024), (unsigned)(largest_dram / 1024));
+    ESP_LOGI("SYS_MEM", "  Octal PSRAM (SPIRAM) : %u KB Free (Min Ever: %u KB)",
+             (unsigned)(free_psram / 1024), (unsigned)(min_psram / 1024));
+    ESP_LOGI("SYS_MEM", "=================================================");
 }

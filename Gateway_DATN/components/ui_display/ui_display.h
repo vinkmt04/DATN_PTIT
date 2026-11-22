@@ -79,6 +79,15 @@ void ui_display_notify_pair_result(bool success, const char *id_str);
 // Đánh thức màn hình từ Idle lên Dashboard (100% đèn nền)
 void ui_display_wake_up(void);
 
+// =============================================================================
+// QUẢN LÝ MÀN HÌNH CHỜ TIẾN TRÌNH KHỞI ĐỘNG (SPLASH PROGRESS SCREEN)
+// =============================================================================
+// Cập nhật thanh tiến trình khởi động (0 - 100%) và dòng trạng thái
+void ui_display_update_boot_progress(uint8_t percent, const char *status_msg);
+
+// Hoàn tất Splash và chuyển sang Màn hình Chờ (Idle Ambient Clock Screen)
+void ui_display_finish_splash(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@
 #include "ui_screen_idle.h"
 #include "ui_screen_dashboard.h"
 #include "ui_voice_overlay.h"
+#include "ui_screen_splash.h"
 
 #include "sys_core.h"
 #include "iot_cloud.h"
@@ -25,10 +26,12 @@ static const char *TAG = "ui_display";
 static SemaphoreHandle_t s_gui_mutex = NULL;
 static QueueHandle_t s_ui_event_queue = NULL;
 
+static lv_obj_t *s_scr_splash = NULL;
 static lv_obj_t *s_scr_idle = NULL;
 static lv_obj_t *s_scr_dash = NULL;
 
-static volatile bool s_is_idle = true;
+static volatile bool s_in_splash = true;
+static volatile bool s_is_idle = false;
 static int64_t s_last_interaction_us = 0;
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static esp_lcd_panel_io_handle_t s_io_handle = NULL;
@@ -44,6 +47,8 @@ typedef enum {
     UI_EVT_CLOUD_SPEAKING,
     UI_EVT_DISCOVERY_DEVICE,
     UI_EVT_PAIRING_RESULT,
+    UI_EVT_BOOT_PROGRESS,
+    UI_EVT_BOOT_FINISH,
 } ui_event_type_t;
 
 typedef struct {
@@ -65,6 +70,10 @@ typedef struct {
             bool success;
             char id_str[32];
         } pair_result;
+        struct {
+            uint8_t percent;
+            char status[64];
+        } boot;
     } data;
 } ui_event_msg_t;
 
@@ -85,6 +94,12 @@ static void lvgl_touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     bool pressed = xpt2046_read(&tx, &ty);
     if (pressed) {
         on_user_interaction();
+
+        // Đang trong màn hình khởi động (Splash): Nuốt toàn bộ sự kiện chạm
+        if (s_in_splash) {
+            data->state = LV_INDEV_STATE_REL;
+            return;
+        }
 
         // Nếu màn hình đang ở chế độ chờ (Idle):
         // Cú chạm đầu tiên chỉ dùng để đánh thức và mở Tab Thiết bị, nuốt sự kiện để không ấn nhầm nút
@@ -162,6 +177,7 @@ static void ui_display_task(void *pvParameters) {
                         break;
                     case UI_EVT_VOICE_HIDE:
                         ui_voice_overlay_hide();
+                        s_last_interaction_us = esp_timer_get_time();
                         break;
                     case UI_EVT_VOICE_RMS:
                         ui_voice_overlay_set_rms(msg.data.rms);
@@ -198,8 +214,18 @@ static void ui_display_task(void *pvParameters) {
                         s_last_interaction_us = esp_timer_get_time();
                         break;
                     case UI_EVT_PAIRING_RESULT:
-                        ui_screen_dashboard_on_pairing_result(msg.data.pair_result.success);
+                        ui_screen_dashboard_on_pairing_result(msg.data.pair_result.success, msg.data.pair_result.id_str);
                         s_last_interaction_us = esp_timer_get_time();
+                        break;
+                    case UI_EVT_BOOT_PROGRESS:
+                        ui_screen_splash_set_progress(msg.data.boot.percent, msg.data.boot.status);
+                        break;
+                    case UI_EVT_BOOT_FINISH:
+                        s_in_splash = false;
+                        s_is_idle = true;
+                        s_last_interaction_us = esp_timer_get_time();
+                        lv_scr_load_anim(s_scr_idle, LV_SCR_LOAD_ANIM_FADE_ON, 350, 0, false);
+                        ESP_LOGI(TAG, "Boot complete: Transitioned to Idle Screen (Ambient Clock)");
                         break;
                 }
                 xSemaphoreGive(s_gui_mutex);
@@ -239,7 +265,7 @@ static void ui_display_task(void *pvParameters) {
 
                 // Kiểm tra Idle Timeout: 90 giây không chạm và không có voice
                 int64_t now_us = esp_timer_get_time();
-                if (!s_is_idle && !ui_voice_overlay_is_visible()) {
+                if (!s_in_splash && !s_is_idle && !ui_voice_overlay_is_visible()) {
                     if ((now_us - s_last_interaction_us) > ((int64_t)UI_IDLE_TIMEOUT_SECONDS * 1000000LL)) {
                         s_is_idle = true;
                         lv_scr_load(s_scr_idle);
@@ -327,20 +353,23 @@ void ui_display_init(void) {
     ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 5000)); // 5ms
 
     // 6. Xây dựng giao diện đồ họa (Apple Clean Modern Theme)
+    s_scr_splash = ui_screen_splash_init();
     s_scr_idle = ui_screen_idle_init();
     s_scr_dash = ui_screen_dashboard_init();
     ui_voice_overlay_init();
 
-    // Mặc định nạp màn hình Idle và đặt độ sáng đèn nền
-    lv_scr_load(s_scr_idle);
-    st7789v_set_backlight(100); // Khởi động 100% trước, sau 30s tự giảm xuống 30%
+    // Mặc định nạp màn hình Splash và đặt độ sáng đèn nền 100%
+    lv_scr_load(s_scr_splash);
+    st7789v_set_backlight(100);
+    s_in_splash = true;
+    s_is_idle = false;
 
     // Đăng ký callback khi Commissioner phát hiện thiết bị mới hoặc hoàn tất ghép nối
     thread_commissioner_set_discovery_callback(ui_display_notify_discovery);
     thread_commissioner_set_pair_result_callback(ui_display_notify_pair_result);
 
-    // 7. Tạo GUI Task trên Core 0 (độ ưu tiên 4)
-    xTaskCreatePinnedToCore(ui_display_task, "ui_display_task", 6144, NULL, 4, NULL, 0);
+    // 7. Tạo GUI Task trên Core 0 (độ ưu tiên 4, Stack 8KB cấp phát trong Octal PSRAM)
+    xTaskCreatePinnedToCoreWithCaps(ui_display_task, "ui_display_task", 8192, NULL, 4, NULL, 0, MALLOC_CAP_SPIRAM);
 
     ESP_LOGI(TAG, "UI Display Component successfully initialized and running!");
 }
@@ -429,5 +458,24 @@ void ui_display_notify_pair_result(bool success, const char *id_str) {
     } else {
         msg.data.pair_result.id_str[0] = '\0';
     }
+    xQueueSend(s_ui_event_queue, &msg, 0);
+}
+
+void ui_display_update_boot_progress(uint8_t percent, const char *status_msg) {
+    if (!s_ui_event_queue) return;
+    ui_event_msg_t msg;
+    msg.type = UI_EVT_BOOT_PROGRESS;
+    msg.data.boot.percent = percent;
+    if (status_msg) {
+        snprintf(msg.data.boot.status, sizeof(msg.data.boot.status), "%s", status_msg);
+    } else {
+        msg.data.boot.status[0] = '\0';
+    }
+    xQueueSend(s_ui_event_queue, &msg, 0);
+}
+
+void ui_display_finish_splash(void) {
+    if (!s_ui_event_queue) return;
+    ui_event_msg_t msg = {.type = UI_EVT_BOOT_FINISH};
     xQueueSend(s_ui_event_queue, &msg, 0);
 }

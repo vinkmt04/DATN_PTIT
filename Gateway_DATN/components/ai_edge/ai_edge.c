@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "driver/gpio.h"
 #include "audio_hal.h"
 #include "ai_cloud.h"
@@ -9,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "ei_wrapper.h"
 #include "mesh_controller.h"
+#include "gateway_state_manager.h"
 #include "ui_display.h"
 #include <string.h>
 
@@ -32,46 +34,66 @@ static volatile int s_responding_silent_cycles = 0;
 
 static bool is_command_device_enabled(const char *cmd_label) {
     if (!cmd_label) return false;
+    gateway_device_state_t st;
+    gateway_state_get(&st);
     if (strcmp(cmd_label, "bat_den") == 0 || strcmp(cmd_label, "tat_den") == 0) {
-        return (GATEWAY_ENABLE_DIMMER == 1);
+        return st.dimmer_registered;
     }
     if (strcmp(cmd_label, "bat_cong_tac") == 0 || strcmp(cmd_label, "tat_cong_tac") == 0) {
-        return (GATEWAY_ENABLE_RELAY == 1);
+        return st.relay_registered;
     }
     return false;
 }
 
 static void dispatch_local_mesh_command(const char *cmd_label) {
     if (!cmd_label) return;
+    gateway_device_state_t st;
+    gateway_state_get(&st);
 
     if (strcmp(cmd_label, "bat_den") == 0) {
-#if GATEWAY_ENABLE_DIMMER
+        if (!st.dimmer_registered) {
+            ESP_LOGW(TAG, "Local Edge AI: Đèn chưa được đăng ký vào mạng Thread");
+            return;
+        }
+        if (!st.dimmer_node_online) {
+            ESP_LOGW(TAG, "Local Edge AI: Đèn hiện đang Offline, không gửi lệnh");
+            return;
+        }
         ESP_LOGI(TAG, "Local Edge AI: BẬT ĐÈN (khôi phục mức sáng gần nhất)");
         mesh_controller_set_dimmer(true, 0);
-#else
-        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'bat_den' do GATEWAY_ENABLE_DIMMER == 0");
-#endif
     } else if (strcmp(cmd_label, "tat_den") == 0) {
-#if GATEWAY_ENABLE_DIMMER
+        if (!st.dimmer_registered) {
+            ESP_LOGW(TAG, "Local Edge AI: Đèn chưa được đăng ký vào mạng Thread");
+            return;
+        }
+        if (!st.dimmer_node_online) {
+            ESP_LOGW(TAG, "Local Edge AI: Đèn hiện đang Offline, không gửi lệnh");
+            return;
+        }
         ESP_LOGI(TAG, "Local Edge AI: TẮT ĐÈN");
         mesh_controller_set_dimmer(false, 0);
-#else
-        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'tat_den' do GATEWAY_ENABLE_DIMMER == 0");
-#endif
     } else if (strcmp(cmd_label, "bat_cong_tac") == 0) {
-#if GATEWAY_ENABLE_RELAY
+        if (!st.relay_registered) {
+            ESP_LOGW(TAG, "Local Edge AI: Relay chưa được đăng ký vào mạng Thread");
+            return;
+        }
+        if (!st.relay_node_online) {
+            ESP_LOGW(TAG, "Local Edge AI: Relay hiện đang Offline, không gửi lệnh");
+            return;
+        }
         ESP_LOGI(TAG, "Local Edge AI: BẬT CÔNG TẮC RELAY");
         mesh_controller_set_relay(true);
-#else
-        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'bat_cong_tac' do GATEWAY_ENABLE_RELAY == 0");
-#endif
     } else if (strcmp(cmd_label, "tat_cong_tac") == 0) {
-#if GATEWAY_ENABLE_RELAY
+        if (!st.relay_registered) {
+            ESP_LOGW(TAG, "Local Edge AI: Relay chưa được đăng ký vào mạng Thread");
+            return;
+        }
+        if (!st.relay_node_online) {
+            ESP_LOGW(TAG, "Local Edge AI: Relay hiện đang Offline, không gửi lệnh");
+            return;
+        }
         ESP_LOGI(TAG, "Local Edge AI: TẮT CÔNG TẮC RELAY");
         mesh_controller_set_relay(false);
-#else
-        ESP_LOGW(TAG, "Local Edge AI: Bỏ qua 'tat_cong_tac' do GATEWAY_ENABLE_RELAY == 0");
-#endif
     } else {
         ESP_LOGW(TAG, "Bỏ qua nhãn không thuộc hệ thống (như quạt hoặc unknown): %s", cmd_label);
     }
@@ -173,11 +195,11 @@ static void audio_recording_task(void *arg) {
                     }
 
                     // Chốt chặn SNR Gate thích ứng theo nhiễu nền:
-                    // Yêu cầu max_rms_2slices >= 40 VÀ max_rms_2slices >= (int)(ambient * 1.3f) (tăng 30% so với sàn ồn)
+                    // Chỉ loại bỏ khi biên độ quá nhỏ so với sàn ồn (max_rms_2slices < 20 hoặc < ambient + 4)
                     if (detected) {
-                        int min_snr_rms = (int)(ambient * 1.3f);
-                        if (max_rms_2slices < 40 || max_rms_2slices < min_snr_rms) {
-                            ESP_LOGW(TAG, ">>> [SNR GATE BLOCKED] Bỏ qua kích hoạt giả (Score: %.1f%%, RMS: %d, Max2Slices: %d < 40 hoặc < Sàn ồn x1.3: %d) <<<",
+                        int min_snr_rms = ambient + 4;
+                        if (max_rms_2slices < 20 || max_rms_2slices < min_snr_rms) {
+                            ESP_LOGW(TAG, ">>> [SNR GATE BLOCKED] Bỏ qua kích hoạt giả (Score: %.1f%%, RMS: %d, Max2Slices: %d < 20 hoặc < Sàn ồn + 4: %d) <<<",
                                      confidence * 100.0f, rms, max_rms_2slices, min_snr_rms);
                             detected = false;
                         }
@@ -312,6 +334,7 @@ static void audio_recording_task(void *arg) {
                             // Quá 5.0s không ai nói gì: No-Speech Guard (84 chunks * 60ms = 5.04s)
                             if (command_total_chunks >= 84) {
                                 ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Không phát hiện tiếng nói sau 5.0s -> Hủy lượt & tiếp tục lắng nghe. <<<");
+                                ui_display_hide_voice_overlay();
                                 ai_cloud_stop_session();
                                 ei_wakeword_reset();
                                 s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
@@ -359,6 +382,18 @@ static void audio_recording_task(void *arg) {
                         int rel_peak_gate = (int)(max_speech_rms * 0.32f);
                         int user_voice_thresh = (min_ambient_gate > rel_peak_gate) ? min_ambient_gate : rel_peak_gate;
 
+                        // Bước 2.5: Kiểm tra xác thực giọng nói cận trường (Near-field Voice Validation)
+                        // Giọng người nói trực diện trước Gateway luôn có max_speech_rms >= 150.
+                        // Nếu max_speech_rms < 150, đây là xung tạp âm môi trường/động vật ở xa -> Kích hoạt Noise Rejection!
+                        if (max_speech_rms < 150) {
+                            ESP_LOGW(TAG, ">>> [NOISE REJECTION] Tạp âm môi trường xa (MaxRMS: %d < 150) -> Hủy bỏ lượt thu âm <<<", max_speech_rms);
+                            ui_display_hide_voice_overlay();
+                            ai_cloud_stop_session();
+                            ei_wakeword_reset();
+                            s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
+                            break;
+                        }
+
                         // Bước 3: Đếm tổng chunk giọng nói, chunk đuôi (300ms cuối: 20..24), và tính độ trải dài câu nói (speech_span_chunks)
                         int first_speech_chunk = -1;
                         int last_speech_chunk = -1;
@@ -400,6 +435,7 @@ static void audio_recording_task(void *arg) {
                             } else {
                                 ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
                                 audio_hal_play_error_sound();
+                                ui_display_hide_voice_overlay();
                                 ai_cloud_stop_session();
                                 ei_wakeword_reset();
                                 idle_slice_counter = 0;
@@ -502,6 +538,15 @@ static void audio_recording_task(void *arg) {
                             } else if (match) {
                                 ESP_LOGI(TAG, ">>> [LOCAL IGNORE]: Khớp nhãn '%s' (%.1f%%) nhưng thiết bị đang tắt/chưa có (ENABLE == 0) -> Bỏ qua lệnh cục bộ <<<",
                                          lbl ? lbl : "none", conf * 100.0f);
+                            } else if (s == 0) {
+                                // Centered Slice: Nếu phân loại xác nhận rõ ràng là câu hỏi mở (unknown >= 70%) hoặc tạp âm (noise >= 75%)
+                                // thì lập tức ngắt sớm chuyển thẳng Gemini Live, không tốn thêm 2 lát cắt (~1.3s CPU)!
+                                if ((lbl && strcmp(lbl, "unknown") == 0 && conf >= 0.70f) ||
+                                    (lbl && strcmp(lbl, "noise") == 0 && conf >= 0.75f)) {
+                                    ESP_LOGI(TAG, ">>> [MODEL 2 EARLY ROUTE] Lát cắt tâm rõ ràng không phải lệnh ('%s': %.1f%%) -> Chuyển thẳng Cloud! <<<",
+                                             lbl ? lbl : "none", conf * 100.0f);
+                                    break;
+                                }
                             }
                         }
 
@@ -518,6 +563,7 @@ static void audio_recording_task(void *arg) {
                         audio_hal_debug_play_captured_audio(cmd_audio_buffer, cmd_samples_from_speech);
                         vTaskDelay(pdMS_TO_TICKS(cmd_samples_from_speech * 1000 / 16000 + 200));
                         audio_hal_flush_rx();
+                        ui_display_hide_voice_overlay();
                         ai_cloud_stop_session();
                         ei_wakeword_reset();
                         idle_slice_counter = 0;
@@ -527,6 +573,7 @@ static void audio_recording_task(void *arg) {
                         // SMART NOISE GUARD: Nếu Model 2 xác nhận là tạp âm ('noise' >= 80%) và sau đó người dùng hoàn toàn im lặng
                         if (last_lbl && strcmp(last_lbl, "noise") == 0 && last_conf >= 0.80f && command_silence_chunks >= STREAM_SILENCE_TARGET) {
                             ESP_LOGW(TAG, ">>> [SMART NOISE GUARD] Tạp âm ngoại cảnh ('noise': %.1f%%) & người dùng không nói tiếp -> Hủy lượt êm! <<<", last_conf * 100.0f);
+                            ui_display_hide_voice_overlay();
                             ai_cloud_cancel_turn();
                             ei_wakeword_reset();
                             idle_slice_counter = 0;
@@ -597,6 +644,7 @@ static void audio_recording_task(void *arg) {
                             }
                         } else {
                             ESP_LOGI(TAG, ">>> [NO-SPEECH GUARD] Hết thời gian chờ mà không phát hiện tiếng nói -> Hủy lượt & tiếp tục lắng nghe. <<<");
+                            ui_display_hide_voice_overlay();
                             ai_cloud_stop_session();
                             ei_wakeword_reset();
                             s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
@@ -625,7 +673,9 @@ static void audio_recording_task(void *arg) {
                     if (has_voice) {
                         speech_chunks_total++;
                         s_consecutive_speech++;
-                        if (s_consecutive_speech >= 2) {
+                        // Robust Hangover: Chỉ reset silence_counter khi âm thanh thực sự có năng lượng giọng nói cận trường (rms >= 120)
+                        // Các tiếng động vật/xì xào nhỏ ở xa không được phép xóa trắng silence_counter!
+                        if (s_consecutive_speech >= 2 && rms >= 120) {
                             silence_counter = 0;
                         }
                     } else {
@@ -699,6 +749,7 @@ static void audio_recording_task(void *arg) {
                     if (s_responding_silent_cycles >= 250) {
                         ESP_LOGW(TAG, ">>> [AI_RESPONDING WATCHDOG] Loa im lặng liên tục > 15.0s nhưng Cloud vẫn bận -> Cưỡng bức đóng phiên về IDLE! <<<");
                         s_responding_silent_cycles = 0;
+                        ui_display_hide_voice_overlay();
                         ai_cloud_stop_session();
                         ei_wakeword_reset();
                         idle_slice_counter = 0;
@@ -806,9 +857,20 @@ void ai_edge_init(void) {
     // Đăng ký kiểm tra trạng thái bận với sys_core để hoãn quét Wi-Fi khi đang tương tác giọng nói
     sys_core_set_voice_busy_check(ai_edge_is_busy);
 
-    xTaskCreatePinnedToCore(button_trigger_task, "button_task", 4096, NULL, 5, &button_task_handle, 1);
-    // Stack 16KB đảm bảo an toàn tuyệt đối cho TFLite Micro inference
-    xTaskCreatePinnedToCore(audio_recording_task, "audio_task", 16384, NULL, 5, &audio_task_handle, 1);
+    // Cấp phát button_task trong PSRAM (SPIRAM) để giải phóng DRAM nội
+    xTaskCreatePinnedToCoreWithCaps(button_trigger_task, "button_task", 4096, NULL, 5, &button_task_handle, 1, MALLOC_CAP_SPIRAM);
+
+    // Cấp phát Stack 32KB trong PSRAM (SPIRAM) để giải phóng hoàn toàn DRAM nội cho DMA và đảm bảo đủ bộ nhớ cho TFLite Micro inference
+    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(audio_recording_task, "audio_task", 32768, NULL, 5, &audio_task_handle, 1, MALLOC_CAP_SPIRAM);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "FAILED to create audio_task in PSRAM (ret=%d)! Thử fallback về Internal DRAM...", (int)task_ret);
+        task_ret = xTaskCreatePinnedToCore(audio_recording_task, "audio_task", 16384, NULL, 5, &audio_task_handle, 1);
+        if (task_ret != pdPASS) {
+            ESP_LOGE(TAG, "CRITICAL: audio_task creation failed completely in DRAM as well! (ret=%d)", (int)task_ret);
+        }
+    } else {
+        ESP_LOGI(TAG, ">>> SUCCESS: audio_task created with 32KB stack in Octal PSRAM (SPIRAM)! <<<");
+    }
 }
 
 void ai_edge_stop_recording(void) {
