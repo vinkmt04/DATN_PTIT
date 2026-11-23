@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "gateway_state";
 
@@ -260,18 +261,27 @@ void gateway_state_set_relay(bool on) {
 }
 
 void gateway_state_set_sensor(float temperature, float humidity) {
+    bool changed = false;
     gateway_device_state_t copy;
 
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        s_device_state.temperature = temperature;
-        s_device_state.humidity = humidity;
-        s_device_state.sensor_valid = true;
+        // Chỉ coi là thay đổi khi lần đầu nhận dữ liệu hoặc độ lệch nhiệt độ >= 0.2°C / độ ẩm >= 1.0%
+        if (!s_device_state.sensor_valid ||
+            fabsf(s_device_state.temperature - temperature) >= 0.2f ||
+            fabsf(s_device_state.humidity - humidity) >= 1.0f) {
+            changed = true;
+            s_device_state.temperature = temperature;
+            s_device_state.humidity = humidity;
+            s_device_state.sensor_valid = true;
+        }
         memcpy(&copy, &s_device_state, sizeof(gateway_device_state_t));
         xSemaphoreGive(s_state_mutex);
     }
 
-    ESP_LOGI(TAG, "Sensor DHT11 Updated: Temp=%.1f°C, Humidity=%.1f%% -> Notifying listeners (Cloud & UI)", temperature, humidity);
-    notify_state_changed(&copy);
+    if (changed) {
+        ESP_LOGI(TAG, "Sensor DHT11 Updated: Temp=%.1f°C, Humidity=%.1f%% -> Notifying listeners (Cloud & UI)", temperature, humidity);
+        notify_state_changed(&copy);
+    }
 }
 
 void gateway_state_set_node_presence(bool relay_online, bool dimmer_online, bool sensor_online) {

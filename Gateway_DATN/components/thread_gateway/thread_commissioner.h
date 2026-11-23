@@ -24,6 +24,7 @@ void      thread_commissioner_on_role_changed(otDeviceRole role);
 esp_err_t thread_commissioner_start_scan(uint32_t timeout_sec);
 esp_err_t thread_commissioner_stop(void);
 bool      thread_commissioner_is_scanning(void);
+bool      thread_commissioner_is_pairing_active(void);
 uint32_t  thread_commissioner_get_remaining_sec(void);
 
 void      thread_commissioner_set_discovery_callback(commissioner_discovery_cb_t cb);

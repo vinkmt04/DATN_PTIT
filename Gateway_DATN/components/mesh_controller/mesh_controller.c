@@ -19,9 +19,11 @@ static const char *TAG = "mesh_controller";
 // Bỏ qua các bản tin heartbeat phản ánh trạng thái cũ đến trong vòng 2.5s sau khi Gateway vừa gửi lệnh điều khiển
 static int64_t s_relay_cmd_in_flight_until_ms = 0;
 static bool    s_relay_target_state = false;
+static int     s_relay_fail_count = 0;
 
 static int64_t s_dimmer_cmd_in_flight_until_ms = 0;
 static uint8_t s_dimmer_target_bri = 0;
+static int     s_dimmer_fail_count = 0;
 
 // Callback nhận dữ liệu DHT11 từ sensor_client (Thread CoAP)
 static void on_thread_sensor_snapshot(const sensor_client_data_t *data) {
@@ -42,41 +44,77 @@ static void on_thread_sensor_snapshot(const sensor_client_data_t *data) {
                  data->temperature_c, data->humidity_pct);
     } else if (data->state == SENSOR_STATE_TIMEOUT || data->state == SENSOR_STATE_RESP_ERROR) {
         if (gateway_state_is_sensor_registered()) {
-            gateway_state_set_node_presence(
-                gateway_state_is_relay_online(),
-                gateway_state_is_dimmer_online(),
-                false
-            );
+            // Chi danh dau Offline neu SRP & Registry cung xac nhan Sensor khong con online (khong co hb trong 70s)
+            if (!thread_gateway_is_sensor_online()) {
+                gateway_state_set_node_presence(
+                    gateway_state_is_relay_online(),
+                    gateway_state_is_dimmer_online(),
+                    false
+                );
+                ESP_LOGW(TAG, "Sensor node unreachable or timed out");
+            }
         }
-        ESP_LOGW(TAG, "Sensor node unreachable or timed out");
     }
 }
 
 // Callback nhận phản hồi từ actuator_client (Thread CoAP ACK / Response)
 static void on_thread_actuator_event(actuator_device_t device, actuator_status_t status, int confirmed_value) {
-    if (status != ACTUATOR_CONFIRMED) {
-        ESP_LOGW(TAG, "Actuator event error/timeout: dev=%d status=%d", device, status);
+    if (status == ACTUATOR_CONFIRMED) {
+        if (device == ACTUATOR_RELAY) {
+            s_relay_fail_count = 0;
+            bool on = (confirmed_value == 1);
+            s_relay_cmd_in_flight_until_ms = 0; // Đã nhận xác nhận từ node, kết thúc guard
+            device_registry_record_activity("relay");
+            if (gateway_state_is_relay_registered()) {
+                gateway_state_set_relay(on);
+                gateway_state_set_node_presence(true, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
+            }
+            ESP_LOGI(TAG, "Relay state confirmed from Thread Mesh: %s", on ? "ON" : "OFF");
+        } else if (device == ACTUATOR_DIMMER) {
+            s_dimmer_fail_count = 0;
+            bool on = (confirmed_value > 0);
+            s_dimmer_cmd_in_flight_until_ms = 0; // Đã nhận xác nhận từ node, kết thúc guard
+            device_registry_record_activity("dimmer");
+            if (gateway_state_is_dimmer_registered()) {
+                gateway_state_set_dimmer(on, (uint8_t)confirmed_value);
+                gateway_state_set_node_presence(gateway_state_is_relay_online(), true, gateway_state_is_sensor_online());
+            }
+            ESP_LOGI(TAG, "Dimmer brightness confirmed from Thread Mesh: %d%%", confirmed_value);
+        }
         return;
     }
 
+    // Xử lý khi Gặp lỗi hoặc Hết thời gian chờ (TIMEOUT / ERROR)
+    ESP_LOGW(TAG, "Actuator event error/timeout: dev=%d status=%d", (int)device, (int)status);
+
     if (device == ACTUATOR_RELAY) {
-        bool on = (confirmed_value == 1);
-        s_relay_cmd_in_flight_until_ms = 0; // Đã nhận xác nhận từ node, kết thúc guard
-        device_registry_record_activity("relay");
-        if (gateway_state_is_relay_registered()) {
-            gateway_state_set_relay(on);
-            gateway_state_set_node_presence(true, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
+        s_relay_cmd_in_flight_until_ms = 0;
+        s_relay_fail_count++;
+        // Rollback lại trạng thái đã xác nhận gần nhất
+        actuator_snapshot_t snap;
+        if (actuator_get_snapshot(ACTUATOR_RELAY, &snap) == ESP_OK && snap.has_confirmed_value) {
+            gateway_state_set_relay(snap.confirmed_value != 0);
+            ESP_LOGW(TAG, "Relay command failed -> Rolled back state to %s", snap.confirmed_value ? "ON" : "OFF");
         }
-        ESP_LOGI(TAG, "Relay state confirmed from Thread Mesh: %s", on ? "ON" : "OFF");
+        if (s_relay_fail_count >= 1) {
+            ESP_LOGW(TAG, "Relay command TIMEOUT -> Marking OFFLINE immediately");
+            device_registry_mark_type_offline(THREAD_DEV_RELAY);
+            gateway_state_set_node_presence(false, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
+        }
     } else if (device == ACTUATOR_DIMMER) {
-        bool on = (confirmed_value > 0);
-        s_dimmer_cmd_in_flight_until_ms = 0; // Đã nhận xác nhận từ node, kết thúc guard
-        device_registry_record_activity("dimmer");
-        if (gateway_state_is_dimmer_registered()) {
-            gateway_state_set_dimmer(on, (uint8_t)confirmed_value);
-            gateway_state_set_node_presence(gateway_state_is_relay_online(), true, gateway_state_is_sensor_online());
+        s_dimmer_cmd_in_flight_until_ms = 0;
+        s_dimmer_fail_count++;
+        // Rollback lại giá trị đã xác nhận gần nhất
+        actuator_snapshot_t snap;
+        if (actuator_get_snapshot(ACTUATOR_DIMMER, &snap) == ESP_OK && snap.has_confirmed_value) {
+            gateway_state_set_dimmer(snap.confirmed_value > 0, (uint8_t)snap.confirmed_value);
+            ESP_LOGW(TAG, "Dimmer command failed -> Rolled back state to %d%%", snap.confirmed_value);
         }
-        ESP_LOGI(TAG, "Dimmer brightness confirmed from Thread Mesh: %d%%", confirmed_value);
+        if (s_dimmer_fail_count >= 1) {
+            ESP_LOGW(TAG, "Dimmer command TIMEOUT -> Marking OFFLINE immediately");
+            device_registry_mark_type_offline(THREAD_DEV_DIMMER);
+            gateway_state_set_node_presence(gateway_state_is_relay_online(), false, gateway_state_is_sensor_online());
+        }
     }
 }
 
@@ -87,10 +125,11 @@ static void on_thread_report(const char *payload) {
 
     if (strncmp(payload, "relay:", 6) == 0) {
         bool on = (payload[6] == '1' || strcasecmp(payload + 6, "ON") == 0);
-        device_registry_record_activity("relay");
         thread_commissioner_notify_report_received(COMMISSIONER_DEV_RELAY);
 
         if (gateway_state_is_relay_registered()) {
+            device_registry_record_activity("relay");
+            s_relay_fail_count = 0;
             gateway_state_set_node_presence(true, gateway_state_is_dimmer_online(), gateway_state_is_sensor_online());
 
             // Nếu vừa gửi lệnh điều khiển mà bản tin heartbeat cũ đang bay trên mạng mang giá trị đối nghịch:
@@ -106,10 +145,11 @@ static void on_thread_report(const char *payload) {
         int bri = atoi(payload + 7);
         if (bri < 0) bri = 0;
         if (bri > 100) bri = 100;
-        device_registry_record_activity("dimmer");
         thread_commissioner_notify_report_received(COMMISSIONER_DEV_DIMMER);
 
         if (gateway_state_is_dimmer_registered()) {
+            device_registry_record_activity("dimmer");
+            s_dimmer_fail_count = 0;
             gateway_state_set_node_presence(gateway_state_is_relay_online(), true, gateway_state_is_sensor_online());
 
             // Nếu vừa kéo slider hoặc bật tắt đèn mà heartbeat cũ gửi giá trị khác:
@@ -123,9 +163,10 @@ static void on_thread_report(const char *payload) {
         }
     } else if (strcmp(payload, "sensor:hb") == 0 || strcmp(payload, "sensor") == 0) {
         ESP_LOGD(TAG, "Node Sensor heartbeat received");
-        device_registry_record_activity("sensor");
         thread_commissioner_notify_report_received(COMMISSIONER_DEV_SENSOR);
         if (gateway_state_is_sensor_registered()) {
+            device_registry_record_activity("sensor");
+            sensor_client_notify_report_rx(0.0f, 0.0f, false);
             gateway_state_set_node_presence(gateway_state_is_relay_online(), gateway_state_is_dimmer_online(), true);
         }
     } else if (strncmp(payload, "sensor:data:", 12) == 0 || strncmp(payload, "temp:", 5) == 0) {
@@ -134,9 +175,10 @@ static void on_thread_report(const char *payload) {
         if (sscanf(data_str, "%f,%f", &temp, &hum) == 2 ||
             sscanf(data_str, "temp:%f,hum:%f", &temp, &hum) == 2) {
             ESP_LOGI(TAG, "Node Sensor DHT11 Report received: Temp=%.1f°C, Hum=%.1f%% -> Syncing State & Telemetry", temp, hum);
-            device_registry_record_activity("sensor");
             thread_commissioner_notify_report_received(COMMISSIONER_DEV_SENSOR);
             if (gateway_state_is_sensor_registered()) {
+                device_registry_record_activity("sensor");
+                sensor_client_notify_report_rx(temp, hum, true);
                 gateway_state_set_sensor(temp, hum);
                 gateway_state_set_node_presence(gateway_state_is_relay_online(), gateway_state_is_dimmer_online(), true);
             }
@@ -165,31 +207,6 @@ static void mesh_monitor_task(void *pvParameters) {
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-
-        int64_t now_ms = esp_timer_get_time() / 1000;
-
-        // Chủ động Probe Actuator nếu mới khởi động (last_seen == 0) hoặc quá 15s không có tín hiệu
-        extern bool ai_edge_is_busy(void);
-        if (!ai_edge_is_busy()) {
-            if (gateway_state_is_relay_registered()) {
-                int64_t last_r = device_registry_get_last_seen_ms(THREAD_DEV_RELAY);
-                if (last_r == 0 || (now_ms - last_r >= 15000)) {
-                    actuator_read_relay();
-                }
-            }
-            if (gateway_state_is_dimmer_registered()) {
-                int64_t last_d = device_registry_get_last_seen_ms(THREAD_DEV_DIMMER);
-                if (last_d == 0 || (now_ms - last_d >= 15000)) {
-                    actuator_read_brightness();
-                }
-            }
-            if (gateway_state_is_sensor_registered()) {
-                int64_t last_s = device_registry_get_last_seen_ms(THREAD_DEV_SENSOR);
-                if (last_s == 0 || (now_ms - last_s >= 20000)) {
-                    sensor_client_poll_now();
-                }
-            }
-        }
 
         bool relay_on  = thread_gateway_is_relay_online();
         bool dimmer_on = thread_gateway_is_dimmer_online();

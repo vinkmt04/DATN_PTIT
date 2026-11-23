@@ -463,6 +463,12 @@ static void btn_approve_event_cb(lv_event_t *e) {
 void ui_screen_dashboard_on_device_discovered(commissioner_dev_type_t type, const char *name, const char *id_str, int8_t rssi) {
     if (!s_modal_backdrop || !s_cont_discovered) return;
 
+    // Nếu đang trong trạng thái chờ hoàn tất kết nối, TUYỆT ĐỐI không hiển thị lại thẻ phát hiện thiết bị
+    if (s_waiting_pairing) {
+        ESP_LOGI(TAG, "UI: Bỏ qua sự kiện phát hiện thiết bị vì đang trong tiến trình kết nối!");
+        return;
+    }
+
     strncpy(s_discovered_id_str, id_str ? id_str : "", sizeof(s_discovered_id_str) - 1);
 
     // Ẩn spinner và các hướng dẫn quét
@@ -488,19 +494,19 @@ void ui_screen_dashboard_on_device_discovered(commissioner_dev_type_t type, cons
 
     if (type == COMMISSIONER_DEV_RELAY) {
         icon_symbol = LV_SYMBOL_POWER;
-        snprintf(title_buf, sizeof(title_buf), "Công tắc [Relay-%s]", short_id);
-        snprintf(info_buf, sizeof(info_buf), "Tín hiệu: %ddBm • Thread", rssi);
+        snprintf(title_buf, sizeof(title_buf), "Công tắc Relay");
+        snprintf(info_buf, sizeof(info_buf), "ID: ...%s • %ddBm", short_id, rssi);
     } else if (type == COMMISSIONER_DEV_DIMMER) {
         icon_symbol = LV_SYMBOL_EYE_OPEN;
-        snprintf(title_buf, sizeof(title_buf), "Đèn [Dimmer-%s]", short_id);
-        snprintf(info_buf, sizeof(info_buf), "Tín hiệu: %ddBm • Thread", rssi);
+        snprintf(title_buf, sizeof(title_buf), "Đèn Dimmer");
+        snprintf(info_buf, sizeof(info_buf), "ID: ...%s • %ddBm", short_id, rssi);
     } else if (type == COMMISSIONER_DEV_SENSOR) {
         icon_symbol = LV_SYMBOL_TINT;
-        snprintf(title_buf, sizeof(title_buf), "Cảm biến [Sensor-%s]", short_id);
-        snprintf(info_buf, sizeof(info_buf), "Tín hiệu: %ddBm • Thread", rssi);
+        snprintf(title_buf, sizeof(title_buf), "Cảm biến DHT11");
+        snprintf(info_buf, sizeof(info_buf), "ID: ...%s • %ddBm", short_id, rssi);
     } else {
-        snprintf(title_buf, sizeof(title_buf), "Thiết bị mới [MAC ...%s]", short_id);
-        snprintf(info_buf, sizeof(info_buf), "Tín hiệu: %ddBm • Thread", rssi);
+        snprintf(title_buf, sizeof(title_buf), "Thiết bị Thread");
+        snprintf(info_buf, sizeof(info_buf), "MAC: ...%s • %ddBm", short_id, rssi);
     }
 
     lv_label_set_text(s_icon_discovered, icon_symbol);

@@ -181,7 +181,7 @@ static void audio_recording_task(void *arg) {
                     idle_slice_counter++;
                     // In nhịp tim định kỳ mỗi ~3 giây (12 lát * 250ms)
                     if (idle_slice_counter % 12 == 0) {
-                        ESP_LOGI(TAG, "[IDLE_WAKEWORD] Đang lắng nghe 'Hey Cherry'... (Mic RMS: %d, Sàn ồn: %d)",
+                        ESP_LOGD(TAG, "[IDLE_WAKEWORD] Đang lắng nghe 'Hey Cherry'... (Mic RMS: %d, Sàn ồn: %d)",
                                  rms, ambient);
                     }
 
@@ -663,6 +663,9 @@ static void audio_recording_task(void *arg) {
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
 
                 if (bytes_read > 0) {
+                    // BẮT BUỘC: Lọc sạch DC Offset và sóng hạ âm 50-80Hz trước khi tính RMS và VAD!
+                    audio_hal_apply_dc_filter(stream_chunk_buffer, bytes_read / sizeof(int16_t));
+
                     int rms = 0;
                     bool has_voice = audio_vad_is_speech_chunk(stream_chunk_buffer, bytes_read / sizeof(int16_t), &rms);
                     ui_display_update_audio_rms((uint16_t)rms);
@@ -670,12 +673,16 @@ static void audio_recording_task(void *arg) {
                     // Gửi chunk PCM lên WebSocket RingBuffer
                     ai_cloud_send_audio_chunk((uint8_t *)stream_chunk_buffer, bytes_read);
 
+                    int ambient = audio_dsp_get_ambient_noise();
+                    int speech_reset_thresh = ambient * 3;
+                    if (speech_reset_thresh < 250) speech_reset_thresh = 250;
+
                     if (has_voice) {
                         speech_chunks_total++;
                         s_consecutive_speech++;
-                        // Robust Hangover: Chỉ reset silence_counter khi âm thanh thực sự có năng lượng giọng nói cận trường (rms >= 120)
-                        // Các tiếng động vật/xì xào nhỏ ở xa không được phép xóa trắng silence_counter!
-                        if (s_consecutive_speech >= 2 && rms >= 120) {
+                        // Robust Hangover: Chỉ reset silence_counter khi âm thanh thực sự có năng lượng giọng nói cận trường
+                        // Các tiếng động vật/nhạc ở xa dưới tầng không được phép xóa trắng silence_counter!
+                        if (s_consecutive_speech >= 2 && rms >= speech_reset_thresh) {
                             silence_counter = 0;
                         }
                     } else {
@@ -689,7 +696,7 @@ static void audio_recording_task(void *arg) {
                     int silence_target = STREAM_SILENCE_TARGET;
 
                     if (streaming_counter % 8 == 0) {
-                        ESP_LOGI(TAG, "[STREAM VAD] RMS: %4d (Floor: %2d) | %s | Silence: %2d/%d (Speech: %d)",
+                        ESP_LOGD(TAG, "[STREAM VAD] RMS: %4d (Floor: %2d) | %s | Silence: %2d/%d (Speech: %d)",
                                  rms, audio_dsp_get_ambient_noise(),
                                  has_voice ? "CÓ TIẾNG" : "Im lặng  ",
                                  silence_counter, silence_target, speech_chunks_total);

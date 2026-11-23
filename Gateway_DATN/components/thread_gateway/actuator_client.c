@@ -37,7 +37,7 @@
 #define DIMMER_URI              "light"
 #define ACTUATOR_PAYLOAD_MAX    64
 #define ACTUATOR_CMD_QUEUE_LEN  8
-#define ACTUATOR_TIMEOUT_WAIT_MS 12000
+#define ACTUATOR_TIMEOUT_WAIT_MS 3500
 
 typedef struct {
     actuator_device_t device;
@@ -52,6 +52,7 @@ typedef enum {
 } actuator_event_type_t;
 
 typedef struct {
+    actuator_device_t     device;
     actuator_event_type_t type;
     otCoapCode            code;
     otError               error;
@@ -98,11 +99,11 @@ static void actuator_response_handler(void *context,
                                       const otMessageInfo *message_info,
                                       otError result)
 {
-    (void)context;
     (void)message_info;
 
     actuator_event_t event;
     memset(&event, 0, sizeof(event));
+    event.device = (actuator_device_t)(intptr_t)context;
     event.rx_time_ms = esp_timer_get_time() / 1000;
     event.error = result;
 
@@ -183,7 +184,7 @@ static otError actuator_send_request_locked(otInstance *instance, const actuator
         otMessageAppend(msg, payload, (uint16_t)strlen(payload));
     }
 
-    otError err = otCoapSendRequest(instance, msg, &message_info, actuator_response_handler, NULL);
+    otError err = otCoapSendRequest(instance, msg, &message_info, actuator_response_handler, (void *)(intptr_t)cmd->device);
     if (err != OT_ERROR_NONE) {
         otMessageFree(msg);
         ESP_LOGE(TAG, "Failed to send CoAP request: %d", (int)err);
@@ -197,12 +198,18 @@ static void actuator_verify_and_update(const actuator_command_t *cmd, const actu
         return;
     }
 
+    if (evt->device != cmd->device) {
+        ESP_LOGW(TAG, "Actuator event dev mismatch: expected dev=%d, got evt dev=%d (type=%d)", (int)cmd->device, (int)evt->device, (int)evt->type);
+        xSemaphoreGive(s_snapshot_mutex);
+        return;
+    }
+
     actuator_snapshot_t *snap = (cmd->device == ACTUATOR_RELAY) ? &s_relay_snapshot : &s_dimmer_snapshot;
     int confirmed_val = snap->confirmed_value;
 
     if (evt->type == ACTUATOR_EVT_TIMEOUT) {
         snap->status = ACTUATOR_TIMEOUT;
-        ESP_LOGW(TAG, "Actuator %s TIMEOUT after 12s", (cmd->device == ACTUATOR_RELAY) ? "relay" : "dimmer");
+        ESP_LOGW(TAG, "Actuator %s TIMEOUT after 3.5s", (cmd->device == ACTUATOR_RELAY) ? "relay" : "dimmer");
     } else if (evt->type == ACTUATOR_EVT_ERROR) {
         snap->status = ACTUATOR_ERROR;
         ESP_LOGE(TAG, "Actuator %s ERROR", (cmd->device == ACTUATOR_RELAY) ? "relay" : "dimmer");
@@ -269,6 +276,9 @@ static void actuator_task(void *pvParameters)
             continue;
         }
 
+        // 1. Reset s_evt_queue de xoa hoan toan bat ky event ton dong nao tu truoc
+        xQueueReset(s_evt_queue);
+
         if (xSemaphoreTake(s_snapshot_mutex, portMAX_DELAY) == pdTRUE) {
             actuator_snapshot_t *snap = (cmd.device == ACTUATOR_RELAY) ? &s_relay_snapshot : &s_dimmer_snapshot;
             snap->status = ACTUATOR_PENDING;
@@ -307,12 +317,32 @@ static void actuator_task(void *pvParameters)
         }
 
         actuator_event_t evt;
-        if (xQueueReceive(s_evt_queue, &evt, pdMS_TO_TICKS(ACTUATOR_TIMEOUT_WAIT_MS)) == pdTRUE) {
-            actuator_verify_and_update(&cmd, &evt);
-        } else {
+        int64_t wait_start = esp_timer_get_time() / 1000;
+        bool got_evt = false;
+
+        while ((esp_timer_get_time() / 1000) - wait_start < ACTUATOR_TIMEOUT_WAIT_MS) {
+            int64_t elapsed = (esp_timer_get_time() / 1000) - wait_start;
+            int64_t remain_ms = (int64_t)ACTUATOR_TIMEOUT_WAIT_MS - elapsed;
+            if (remain_ms <= 0) break;
+
+            if (xQueueReceive(s_evt_queue, &evt, pdMS_TO_TICKS(remain_ms)) == pdTRUE) {
+                if (evt.device == cmd.device) {
+                    got_evt = true;
+                    actuator_verify_and_update(&cmd, &evt);
+                    break;
+                } else {
+                    ESP_LOGW(TAG, "Actuator event discarded due to device mismatch (expected %d, got %d)", (int)cmd.device, (int)evt.device);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if (!got_evt) {
             actuator_event_t timeout_evt = {
-                .type  = ACTUATOR_EVT_TIMEOUT,
-                .error = OT_ERROR_RESPONSE_TIMEOUT,
+                .device = cmd.device,
+                .type   = ACTUATOR_EVT_TIMEOUT,
+                .error  = OT_ERROR_RESPONSE_TIMEOUT,
             };
             actuator_verify_and_update(&cmd, &timeout_evt);
         }
@@ -356,7 +386,11 @@ esp_err_t actuator_set_relay(bool on)
         .is_get = false,
         .value  = on ? 1 : 0,
     };
-    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+    if (uxQueueSpacesAvailable(s_cmd_queue) == 0) {
+        actuator_command_t dummy;
+        xQueueReceive(s_cmd_queue, &dummy, 0);
+    }
+    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t actuator_set_brightness(int percent)
@@ -369,7 +403,11 @@ esp_err_t actuator_set_brightness(int percent)
         .is_get = false,
         .value  = percent,
     };
-    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+    if (uxQueueSpacesAvailable(s_cmd_queue) == 0) {
+        actuator_command_t dummy;
+        xQueueReceive(s_cmd_queue, &dummy, 0);
+    }
+    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t actuator_read_relay(void)
@@ -380,7 +418,11 @@ esp_err_t actuator_read_relay(void)
         .is_get = true,
         .value  = 0,
     };
-    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+    if (uxQueueSpacesAvailable(s_cmd_queue) == 0) {
+        actuator_command_t dummy;
+        xQueueReceive(s_cmd_queue, &dummy, 0);
+    }
+    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t actuator_read_brightness(void)
@@ -391,7 +433,11 @@ esp_err_t actuator_read_brightness(void)
         .is_get = true,
         .value  = 0,
     };
-    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(100)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
+    if (uxQueueSpacesAvailable(s_cmd_queue) == 0) {
+        actuator_command_t dummy;
+        xQueueReceive(s_cmd_queue, &dummy, 0);
+    }
+    return (xQueueSend(s_cmd_queue, &cmd, pdMS_TO_TICKS(50)) == pdTRUE) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t actuator_get_snapshot(actuator_device_t device, actuator_snapshot_t *out)
@@ -433,13 +479,13 @@ esp_err_t actuator_send_unpair(actuator_device_t device)
         return ESP_ERR_NO_MEM;
     }
 
-    otCoapMessageInit(msg, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
+    otCoapMessageInit(msg, OT_COAP_TYPE_CONFIRMABLE, OT_COAP_CODE_POST);
     otCoapMessageAppendUriPathOptions(msg, "unpair");
     otError err = otCoapSendRequest(instance, msg, &message_info, NULL, NULL);
     if (err != OT_ERROR_NONE) {
         otMessageFree(msg);
     }
     esp_openthread_lock_release();
-    ESP_LOGI(TAG, "Sent CoAP POST /unpair to actuator device %d (err=%d)", device, (int)err);
+    ESP_LOGI(TAG, "Sent CoAP POST /unpair (Confirmable) to actuator device %d (err=%d)", device, (int)err);
     return (err == OT_ERROR_NONE) ? ESP_OK : ESP_FAIL;
 }

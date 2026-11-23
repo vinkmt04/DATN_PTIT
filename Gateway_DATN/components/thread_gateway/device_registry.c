@@ -297,6 +297,25 @@ void device_registry_record_activity(const char *dev_name)
     }
 }
 
+void device_registry_mark_type_offline(thread_dev_type_t type)
+{
+    if (type < 0 || type >= THREAD_DEV_COUNT) return;
+    device_registry_init();
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        s_entries[type].last_seen_ms = 0;
+        xSemaphoreGive(s_reg_mutex);
+        ESP_LOGI(TAG, "Device [%s] explicitly marked OFFLINE (last_seen reset)", device_registry_type_to_str(type));
+    }
+}
+
+void device_registry_mark_offline(const char *dev_name)
+{
+    thread_dev_type_t type = device_registry_str_to_type(dev_name);
+    if (type != THREAD_DEV_UNKNOWN) {
+        device_registry_mark_type_offline(type);
+    }
+}
+
 int64_t device_registry_get_last_seen_ms(thread_dev_type_t type)
 {
     if (type < 0 || type >= THREAD_DEV_COUNT) return 0;
@@ -438,8 +457,20 @@ esp_err_t device_registry_resolve_address_locked(
     }
 
     const thread_dev_desc_t *desc = &s_device_descs[type];
+    int64_t now_ms = esp_timer_get_time() / 1000;
 
-    // 1. Tìm kiếm trong bảng SRP Server hiện tại
+    // 1. UU TIEN SO 1: Kiem tra cached_ip vua nhan tu ban tin /report trong 45s qua
+    if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_entries[type].has_cached_ip && (now_ms - s_entries[type].last_seen_ms < 45000)) {
+            *out_addr = s_entries[type].cached_ip;
+            *out_port = desc->default_port;
+            xSemaphoreGive(s_reg_mutex);
+            return ESP_OK;
+        }
+        xSemaphoreGive(s_reg_mutex);
+    }
+
+    // 2. UU TIEN SO 2: Tim kiem trong bang SRP Server hien tai
     if (instance != NULL &&
         (device_registry_find_locked(instance, desc->srp_label, desc->srp_service, out_addr, out_port) ||
          device_registry_find_locked(instance, desc->name, desc->srp_service, out_addr, out_port) ||
@@ -517,24 +548,13 @@ bool device_registry_is_type_online(otInstance *instance, thread_dev_type_t type
             return false;
         }
 
-        // 1. Kiểm tra hoạt động truyền thông gần nhất (phân biệt Actuator < 45s và Sensor < 75s)
+        // 1. Kiem tra hoat dong truyen thong gan nhat tu ban tin /report thuc te
         int64_t timeout_limit_ms = (type == THREAD_DEV_SENSOR) ? SENSOR_PRESENCE_TIMEOUT_MS : ACTUATOR_PRESENCE_TIMEOUT_MS;
         extern bool ai_edge_is_busy(void);
         bool edge_busy = ai_edge_is_busy();
         if (s_entries[type].last_seen_ms > 0 &&
             (edge_busy || (now_ms - s_entries[type].last_seen_ms < timeout_limit_ms))) {
             is_online = true;
-        } else if (instance != NULL) {
-            // Kiểm tra xem node có trong bảng SRP Server với bản ghi tươi (fresh) hay không
-            otIp6Address dummy_addr;
-            uint16_t dummy_port;
-            const thread_dev_desc_t *desc = &s_device_descs[type];
-            if (device_registry_find_fresh_locked(instance, desc->srp_label, desc->srp_service, 60000, &dummy_addr, &dummy_port) ||
-                device_registry_find_fresh_locked(instance, desc->name, desc->srp_service, 60000, &dummy_addr, &dummy_port) ||
-                device_registry_find_fresh_locked(instance, NULL, desc->srp_service, 60000, &dummy_addr, &dummy_port)) {
-                s_entries[type].last_seen_ms = now_ms;
-                is_online = true;
-            }
         }
         xSemaphoreGive(s_reg_mutex);
     }

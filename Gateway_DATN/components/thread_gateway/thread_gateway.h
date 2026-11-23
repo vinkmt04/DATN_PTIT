@@ -62,6 +62,11 @@ void thread_gateway_set_report_callback(thread_report_callback_t cb);
  */
 esp_err_t thread_gateway_remove_device(const char *dev_id_str);
 
+/**
+ * @brief Xoa sach bang SRP Server (tat/bat lai SRP va dat Key-Lease 120s) de tranh loi Name Conflict (Error 6).
+ */
+void thread_gateway_purge_srp_server(void);
+
 #ifdef __cplusplus
 }
 #endif

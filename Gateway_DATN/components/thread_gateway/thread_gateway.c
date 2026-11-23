@@ -95,14 +95,57 @@ static void report_request_handler(void *aContext, otMessage *aMessage,
     }
     ESP_LOGI(TAG, "Gateway CoAP received /report: '%s'", payload);
 
-    if (aMessageInfo != NULL) {
-        if (strncmp(payload, "relay:", 6) == 0) {
-            device_registry_update_ip(THREAD_DEV_RELAY, &aMessageInfo->mPeerAddr);
-        } else if (strncmp(payload, "dimmer:", 7) == 0) {
-            device_registry_update_ip(THREAD_DEV_DIMMER, &aMessageInfo->mPeerAddr);
-        } else if (strncmp(payload, "sensor", 6) == 0 || strncmp(payload, "temp:", 5) == 0) {
-            device_registry_update_ip(THREAD_DEV_SENSOR, &aMessageInfo->mPeerAddr);
+    thread_dev_type_t dev_type = THREAD_DEV_UNKNOWN;
+    if (strncmp(payload, "relay:", 6) == 0) {
+        dev_type = THREAD_DEV_RELAY;
+    } else if (strncmp(payload, "dimmer:", 7) == 0) {
+        dev_type = THREAD_DEV_DIMMER;
+    } else if (strncmp(payload, "sensor", 6) == 0 || strncmp(payload, "temp:", 5) == 0) {
+        dev_type = THREAD_DEV_SENSOR;
+    }
+
+    // Kiểm tra tính hợp lệ của thiết bị gửi report
+    if (dev_type != THREAD_DEV_UNKNOWN) {
+        if (!device_registry_is_type_registered(dev_type)) {
+            bool in_pairing_mode = thread_commissioner_is_scanning() || thread_commissioner_is_pairing_active();
+            if (in_pairing_mode) {
+                // Đang trong cửa sổ quét tìm hoặc đang duyệt ghép nối -> Đây là node ứng viên mới vừa join Thread!
+                // TUYỆT ĐỐI KHÔNG GỬI /unpair! Cập nhật IP peer và chuyển tiếp report để Commissioner / UI nhận diện!
+                ESP_LOGI(TAG, "Gateway received /report from candidate node (type=%d) during pairing scan. Updating cache & forwarding.", dev_type);
+                if (aMessageInfo != NULL) {
+                    device_registry_update_ip(dev_type, &aMessageInfo->mPeerAddr);
+                }
+                if (s_report_cb != NULL) {
+                    s_report_cb(payload);
+                }
+                return;
+            } else {
+                // Thiết bị này KHÔNG được đăng ký trong Gateway VÀ Gateway KHÔNG ở chế độ ghép nối
+                // (Node mồ côi hoặc vừa bị xóa trên Gateway trong lúc node offline)!
+                ESP_LOGW(TAG, "Gateway received /report from UNREGISTERED node (type=%d) while not in pairing mode! Ejecting via CoAP POST /unpair...", dev_type);
+                if (aMessageInfo != NULL) {
+                    otInstance *instance = esp_openthread_get_instance();
+                    if (instance != NULL) {
+                        otMessage *unpair_msg = otCoapNewMessage(instance, NULL);
+                        if (unpair_msg != NULL) {
+                            otCoapMessageInit(unpair_msg, OT_COAP_TYPE_CONFIRMABLE, OT_COAP_CODE_POST);
+                            otCoapMessageAppendUriPathOptions(unpair_msg, "unpair");
+                            otError err = otCoapSendRequest(instance, unpair_msg, aMessageInfo, NULL, NULL);
+                            if (err != OT_ERROR_NONE) {
+                                otMessageFree(unpair_msg);
+                            } else {
+                                ESP_LOGW(TAG, "Ejection CoAP /unpair sent successfully to unregistered node");
+                            }
+                        }
+                    }
+                }
+                return; // Chặn hoàn toàn: Không cập nhật IP cache, không chuyển tiếp cho controller!
+            }
         }
+    }
+
+    if (aMessageInfo != NULL && dev_type != THREAD_DEV_UNKNOWN) {
+        device_registry_update_ip(dev_type, &aMessageInfo->mPeerAddr);
     }
 
     if (s_report_cb != NULL) {
@@ -193,7 +236,14 @@ static void ot_task_worker(void *aContext)
         ESP_LOGI(TAG, "OpenThread logging level set to WARN (Production clean log)");
 
         otSrpServerSetEnabled(instance, true);
-        ESP_LOGI(TAG, "OpenThread SRP Server enabled on port %u", (unsigned)otSrpServerGetPort(instance));
+        otSrpServerLeaseConfig lease_cfg = {
+            .mMinLease    = 30,
+            .mMaxLease    = 7200,
+            .mMinKeyLease = 30,
+            .mMaxKeyLease = 120, // 2 phut max key lease phong ngua Name Conflict Error 6
+        };
+        otSrpServerSetLeaseConfig(instance, &lease_cfg);
+        ESP_LOGI(TAG, "OpenThread SRP Server enabled on port %u (Key-Lease: 30-120s)", (unsigned)otSrpServerGetPort(instance));
 
         otBorderAgentSetEnabled(instance, true);
         ESP_LOGI(TAG, "OpenThread Border Agent enabled (UDP port %u)", (unsigned)otBorderAgentGetUdpPort(instance));
@@ -430,6 +480,33 @@ esp_err_t thread_gateway_remove_device(const char *dev_id_str)
     // 2. Xoa khoi NVS IP Cache
     device_registry_clear_cache(dev_id_str);
 
-    // 3. Xoa khoi Commissioner approved registry
+    // 3. Danh dau offline ngay lap tuc trong registry
+    device_registry_mark_offline(dev_id_str);
+
+    // 4. Purge SRP Server bang cach reset SRP Server
+    thread_gateway_purge_srp_server();
+
+    // 5. Xoa khoi Commissioner approved registry
     return thread_commissioner_remove_device(dev_id_str);
+}
+
+void thread_gateway_purge_srp_server(void)
+{
+    if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
+        return;
+    }
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance != NULL) {
+        ESP_LOGI(TAG, "Purging SRP Server entries to clear stale keys...");
+        otSrpServerSetEnabled(instance, false);
+        otSrpServerSetEnabled(instance, true);
+        otSrpServerLeaseConfig lease_cfg = {
+            .mMinLease    = 30,
+            .mMaxLease    = 7200,
+            .mMinKeyLease = 30,
+            .mMaxKeyLease = 120,
+        };
+        otSrpServerSetLeaseConfig(instance, &lease_cfg);
+    }
+    esp_openthread_lock_release();
 }

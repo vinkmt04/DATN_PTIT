@@ -31,6 +31,7 @@
 #include "device_registry.h"
 #include "actuator_client.h"
 #include "sensor_client.h"
+#include "thread_gateway.h"
 
 #define TAG "THREAD_COMM"
 #define COMMISSIONER_UNIVERSAL_PSKD "DATN2026"
@@ -64,6 +65,11 @@ void thread_commissioner_set_pair_result_callback(commissioner_pair_result_cb_t 
 bool thread_commissioner_is_scanning(void)
 {
     return s_scanning;
+}
+
+bool thread_commissioner_is_pairing_active(void)
+{
+    return s_pairing_active;
 }
 
 uint32_t thread_commissioner_get_remaining_sec(void)
@@ -125,17 +131,21 @@ static void commissioner_state_changed_cb(otCommissionerState aState, void *aCon
                             (aState == OT_COMMISSIONER_STATE_PETITION) ? "PETITIONING" : "DISABLED";
     ESP_LOGI(TAG, "Commissioner state changed: %d (%s)", (int)aState, state_str);
 
-    // BẮT BUỘC: otCommissionerAddJoiner CHỈ ĐƯỢC PHÉP GỌI KHI Commissioner đã ACTIVE (Đã hoàn tất Petitioning)
+    // BẮT BUỘC: otCommissionerAddJoiner CHỈ ĐƯỢC PHÉP GỌI KHI Commissioner đã ACTIVE VÀ ĐANG TRONG CỬA SỔ GHÉP NỐI (s_scanning)
     if (aState == OT_COMMISSIONER_STATE_ACTIVE) {
         otInstance *instance = esp_openthread_get_instance();
         if (instance != NULL) {
-            uint32_t timeout = (s_scanning && s_remaining_sec > 0) ? s_remaining_sec : 86400;
-            otError add_err = otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, timeout);
-            if (add_err == OT_ERROR_NONE) {
-                ESP_LOGI(TAG, ">>> COMMISSIONER ACTIVE: Đã đăng ký Wildcard Joiner (PSKd='%s', timeout=%lu s) <<<",
-                         COMMISSIONER_UNIVERSAL_PSKD, (unsigned long)timeout);
+            if (s_scanning && s_remaining_sec > 0) {
+                otError add_err = otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, s_remaining_sec);
+                if (add_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, ">>> COMMISSIONER ACTIVE: Đã mở Wildcard Joiner (PSKd='%s', timeout=%lu s) <<<",
+                             COMMISSIONER_UNIVERSAL_PSKD, (unsigned long)s_remaining_sec);
+                } else {
+                    ESP_LOGE(TAG, "otCommissionerAddJoiner thất bại trong callback: %d", (int)add_err);
+                }
             } else {
-                ESP_LOGE(TAG, "otCommissionerAddJoiner thất bại trong callback: %d", (int)add_err);
+                otCommissionerRemoveJoiner(instance, NULL);
+                ESP_LOGI(TAG, ">>> COMMISSIONER ACTIVE: Joiner đang ĐÓNG (Chỉ mở khi người dùng bấm Thêm thiết bị) <<<");
             }
         }
     }
@@ -144,6 +154,13 @@ static void commissioner_state_changed_cb(otCommissionerState aState, void *aCon
 void thread_commissioner_notify_report_received(commissioner_dev_type_t type)
 {
     if (s_pairing_active || s_scanning) {
+        // BẮT BUỘC CHẶN CHẶT: Chỉ chấp nhận /report từ thiết bị CHƯA được đăng ký trong hệ thống
+        // Bỏ qua hoàn toàn các bản tin heartbeat định kỳ của các thiết bị đã đăng ký sẵn (Relay, Sensor),
+        // tránh tuyệt đối việc heartbeat ngẫu nhiên cướp kênh và nhận diện sai thiết bị đang ghép nối!
+        if (device_registry_is_type_registered((thread_dev_type_t)type)) {
+            ESP_LOGD(TAG, "Bỏ qua /report từ thiết bị type=%d vì đã được đăng ký", (int)type);
+            return;
+        }
         s_reported_pairing_type = type;
         ESP_LOGI(TAG, "Notified report received during pairing/scan: type=%d", (int)type);
     }
@@ -179,12 +196,12 @@ commissioner_dev_type_t thread_commissioner_poll_joined_device(void)
             const char *label   = (t == THREAD_DEV_RELAY) ? "relay-01" :
                                   (t == THREAD_DEV_DIMMER) ? "dimmer-01" : "sensor-01";
 
-            if (device_registry_find_fresh_locked(instance, label, service, max_fresh_age_ms, &addr, &port) ||
+            if (device_registry_resolve_address_locked(instance, t, &addr, &port) == ESP_OK ||
+                device_registry_find_fresh_locked(instance, label, service, max_fresh_age_ms, &addr, &port) ||
                 device_registry_find_fresh_locked(instance, device_registry_type_to_str(t), service, max_fresh_age_ms, &addr, &port) ||
                 device_registry_find_locked(instance, label, service, &addr, &port) ||
                 device_registry_find_locked(instance, device_registry_type_to_str(t), service, &addr, &port) ||
-                device_registry_find_locked(instance, NULL, service, &addr, &port) ||
-                device_registry_resolve_address_locked(instance, t, &addr, &port) == ESP_OK) {
+                device_registry_find_locked(instance, NULL, service, &addr, &port)) {
                 matched_type = t;
                 ESP_LOGI(TAG, "Matched candidate from direct /report event: %s", device_registry_type_to_str(t));
             }
@@ -337,26 +354,31 @@ static void commissioner_joiner_event_cb(otCommissionerJoinerEvent aEvent,
 
     ESP_LOGI(TAG, "Joiner Event %d from [%s]", (int)aEvent, id_str);
 
-    // Khi Joiner bắt đầu bắt tay DTLS hoặc đã kết nối, thông báo lên UI để hiển thị Thẻ Phê Duyệt
-    if (aEvent == OT_COMMISSIONER_JOINER_START || aEvent == OT_COMMISSIONER_JOINER_CONNECTED) {
-        if (s_discovery_cb != NULL) {
+    // Khi Joiner bắt đầu bắt tay DTLS, thông báo lên UI để hiển thị Thẻ Phê Duyệt
+    // Chỉ thông báo trên sự kiện START (không lặp lại trên CONNECTED) và CHỈ khi không đang trong tiến trình pairing!
+    if (aEvent == OT_COMMISSIONER_JOINER_START) {
+        if (!s_pairing_active && s_discovery_cb != NULL) {
             s_discovery_cb(COMMISSIONER_DEV_UNKNOWN, "Thiết bị Thread mới", id_str, -45);
         }
     }
 
     // Khi một Joiner hoàn tất bắt tay DTLS
-    if (aEvent == OT_COMMISSIONER_JOINER_FINALIZE || aEvent == OT_COMMISSIONER_JOINER_END || aEvent == OT_COMMISSIONER_JOINER_REMOVED) {
-        if (aEvent == OT_COMMISSIONER_JOINER_FINALIZE || aEvent == OT_COMMISSIONER_JOINER_END) {
-            s_joiner_finalized = true;
-            ESP_LOGI(TAG, ">>> Joiner finalized for [%s]! Waiting for SRP registration... <<<", id_str);
-        }
+    if (aEvent == OT_COMMISSIONER_JOINER_FINALIZE) {
+        s_joiner_finalized = true;
+        s_probe_start_ms = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, ">>> Joiner finalized for [%s]! <<<", id_str);
 
         otInstance *instance = esp_openthread_get_instance();
         if (instance != NULL && otCommissionerGetState(instance) == OT_COMMISSIONER_STATE_ACTIVE) {
-            otError re_err = otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, 86400);
-            if (re_err == OT_ERROR_NONE) {
-                ESP_LOGI(TAG, ">>> Đã tự động tái kích hoạt Wildcard Joiner (PSKd='%s', timeout=86400s) cho các node kế tiếp <<<",
-                         COMMISSIONER_UNIVERSAL_PSKD);
+            // Luôn duy trì Wildcard Joiner mở trong suốt cửa sổ quét s_remaining_sec
+            // TUYỆT ĐỐI không gọi otCommissionerRemoveJoiner ở đây vì sẽ xóa Steering Data
+            // làm cho gói tin MLE Discovery Request tiếp theo của Node bị từ chối với lỗi Security!
+            if (s_scanning && s_remaining_sec > 0) {
+                otError re_err = otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, s_remaining_sec);
+                if (re_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, ">>> Đã duy trì Wildcard Joiner (PSKd='%s', timeout=%lu s) <<<",
+                             COMMISSIONER_UNIVERSAL_PSKD, (unsigned long)s_remaining_sec);
+                }
             }
         }
     }
@@ -412,6 +434,9 @@ esp_err_t thread_commissioner_start_scan(uint32_t timeout_sec)
     s_joiner_finalized = false;
     s_reported_pairing_type = COMMISSIONER_DEV_UNKNOWN;
 
+    // Purge SRP server truoc khi quet de loai bo cac key ECDSA cu cua cac node vua bi flash/reset
+    thread_gateway_purge_srp_server();
+
     if (!esp_openthread_lock_acquire(portMAX_DELAY)) {
         return ESP_ERR_TIMEOUT;
     }
@@ -462,22 +487,24 @@ esp_err_t thread_commissioner_stop(void)
 {
     s_scanning = false;
     s_remaining_sec = 0;
-    s_pairing_active = false;
-    s_joiner_finalized = false;
-    s_coap_probe_sent = false;
-    s_probing_type = THREAD_DEV_UNKNOWN;
-    s_reported_pairing_type = COMMISSIONER_DEV_UNKNOWN;
-    if (s_countdown_timer != NULL) {
+    if (!s_pairing_active) {
+        s_joiner_finalized = false;
+        s_coap_probe_sent = false;
+        s_probing_type = THREAD_DEV_UNKNOWN;
+        s_reported_pairing_type = COMMISSIONER_DEV_UNKNOWN;
+    }
+    if (s_countdown_timer != NULL && !s_pairing_active) {
         xTimerStop(s_countdown_timer, 0);
     }
-    if (esp_openthread_lock_acquire(pdMS_TO_TICKS(200))) {
+    if (esp_openthread_lock_acquire(pdMS_TO_TICKS(500))) {
         otInstance *instance = esp_openthread_get_instance();
         if (instance != NULL && otCommissionerGetState(instance) == OT_COMMISSIONER_STATE_ACTIVE) {
-            otCommissionerAddJoiner(instance, NULL, COMMISSIONER_UNIVERSAL_PSKD, 86400);
+            otCommissionerRemoveJoiner(instance, NULL);
+            ESP_LOGI(TAG, ">>> Cửa sổ ghép nối đã đóng: Đã gỡ bỏ Wildcard Joiner (RemoveJoiner) thành công <<<");
         }
         esp_openthread_lock_release();
     }
-    ESP_LOGI(TAG, "Pairing scan window closed (Wildcard Joiner maintained in background)");
+    ESP_LOGI(TAG, "Pairing scan window closed (Wildcard Joiner CLOSED)");
     return ESP_OK;
 }
 
@@ -486,12 +513,14 @@ esp_err_t thread_commissioner_approve_device(const char *dev_id_str)
     if (dev_id_str == NULL) return ESP_ERR_INVALID_ARG;
     strncpy(s_approving_id_str, dev_id_str, sizeof(s_approving_id_str) - 1);
     s_pairing_active = true;
+    s_joiner_finalized = true; // Bắt buộc giữ true để tiến trình poll SRP tìm thấy candidate node vừa duyệt!
     s_pairing_ticks = 0;
     s_coap_probe_sent = false;
     s_probing_type = THREAD_DEV_UNKNOWN;
-    s_reported_pairing_type = COMMISSIONER_DEV_UNKNOWN;
+    // Giữ nguyên s_reported_pairing_type nếu đã nhận được report từ trước khi bấm Duyệt
     s_probe_start_ms = esp_timer_get_time() / 1000;
     s_probe_send_time_ms = 0;
+
     if (s_countdown_timer != NULL) {
         xTimerStart(s_countdown_timer, 0);
     }
@@ -503,6 +532,7 @@ esp_err_t thread_commissioner_remove_device(const char *dev_id_str)
 {
     if (dev_id_str == NULL) return ESP_ERR_INVALID_ARG;
     device_registry_clear_cache(dev_id_str);
+    device_registry_set_registered(dev_id_str, false);
     ESP_LOGI(TAG, "Device [%s] REMOVED from registry", dev_id_str);
     return ESP_OK;
 }

@@ -48,8 +48,8 @@ void iot_cloud_publish_telemetry_now(void) {
     bool state_identical = (cur_dimmer_status == s_last_dimmer_status &&
                             cur_dimmer_bri == s_last_dimmer_bri &&
                             cur_relay_status == s_last_relay_status &&
-                            (st.sensor_valid ? (fabsf(st.temperature - s_last_temp) < 0.05f &&
-                                                fabsf(st.humidity - s_last_hum) < 0.05f) : true));
+                            (st.sensor_valid ? (fabsf(st.temperature - s_last_temp) < 0.15f &&
+                                                fabsf(st.humidity - s_last_hum) < 0.8f) : true));
 
     // Khử bản tin trùng lặp: Nếu trạng thái hoàn toàn không đổi thì không cần đẩy lại lên ThingsBoard
     if (s_last_pub_ms > 0 && state_identical) {

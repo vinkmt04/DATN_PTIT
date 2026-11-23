@@ -320,6 +320,28 @@ esp_err_t sensor_client_get_snapshot(sensor_client_data_t *out)
     return (xQueuePeek(s_snapshot_queue, out, 0) == pdTRUE) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
+void sensor_client_notify_report_rx(float temp, float hum, bool is_data)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    s_sensor_data.last_rx_time_ms = now_ms;
+    if (is_data) {
+        s_sensor_data.has_valid_sample = true;
+        s_sensor_data.temperature_c = temp;
+        s_sensor_data.humidity_pct = hum;
+        s_sensor_data.last_read_ok = true;
+        s_sensor_data.stale = false;
+        s_sensor_data.state = SENSOR_STATE_GOOD;
+    } else {
+        if (s_sensor_data.state == SENSOR_STATE_TIMEOUT || s_sensor_data.state == SENSOR_STATE_NO_DATA) {
+            s_sensor_data.state = s_sensor_data.has_valid_sample ? SENSOR_STATE_GOOD : SENSOR_STATE_NO_DATA;
+        }
+    }
+    strncpy(s_sensor_data.node_id, SENSOR_NODE_ID, sizeof(s_sensor_data.node_id) - 1);
+    if (s_snapshot_queue != NULL) {
+        xQueueOverwrite(s_snapshot_queue, &s_sensor_data);
+    }
+}
+
 esp_err_t sensor_send_unpair(void)
 {
     if (!esp_openthread_lock_acquire(pdMS_TO_TICKS(1000))) {
@@ -343,13 +365,13 @@ esp_err_t sensor_send_unpair(void)
         return ESP_ERR_NO_MEM;
     }
 
-    otCoapMessageInit(msg, OT_COAP_TYPE_NON_CONFIRMABLE, OT_COAP_CODE_POST);
+    otCoapMessageInit(msg, OT_COAP_TYPE_CONFIRMABLE, OT_COAP_CODE_POST);
     otCoapMessageAppendUriPathOptions(msg, "unpair");
     otError err = otCoapSendRequest(instance, msg, &message_info, NULL, NULL);
     if (err != OT_ERROR_NONE) {
         otMessageFree(msg);
     }
     esp_openthread_lock_release();
-    ESP_LOGI(TAG, "Sent CoAP POST /unpair to Sensor node (err=%d)", (int)err);
+    ESP_LOGI(TAG, "Sent CoAP POST /unpair (Confirmable) to Sensor node (err=%d)", (int)err);
     return (err == OT_ERROR_NONE) ? ESP_OK : ESP_FAIL;
 }

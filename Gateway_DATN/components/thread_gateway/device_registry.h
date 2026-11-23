@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-#define ACTUATOR_PRESENCE_TIMEOUT_MS 45000  // 45s không có phản hồi -> Coi như Offline cho Relay/Dimmer (Chu kỳ hb 30s + 15s grace)
-#define SENSOR_PRESENCE_TIMEOUT_MS   75000  // 75s không có phản hồi -> Coi như Offline cho Sensor (chu kỳ gửi 60s + 15s grace)
+#define ACTUATOR_PRESENCE_TIMEOUT_MS 35000  // 35s khong co phan hoi -> Coi nhu Offline cho Relay/Dimmer (Chu ky hb 30s + 5s grace)
+#define SENSOR_PRESENCE_TIMEOUT_MS   70000  // 70s khong co phan hoi -> Coi nhu Offline cho Sensor (chu ky gui 60s + 10s grace)
 #define PRESENCE_ACTIVITY_TIMEOUT_MS ACTUATOR_PRESENCE_TIMEOUT_MS // Tương thích ngược
 
 /**
@@ -98,6 +98,13 @@ uint8_t device_registry_count_active_locked(otInstance *instance);
  */
 void device_registry_record_type_activity(thread_dev_type_t type);
 void device_registry_record_activity(const char *dev_name);
+
+/**
+ * @brief Đánh dấu thiết bị Offline ngay lập tức (xóa mốc last_seen_ms).
+ * Dùng khi lệnh điều khiển CoAP bị timeout hoặc báo lỗi kết nối.
+ */
+void device_registry_mark_type_offline(thread_dev_type_t type);
+void device_registry_mark_offline(const char *dev_name);
 
 /**
  * @brief Lấy mốc thời gian hoạt động gần nhất (epoch ms) của thiết bị.

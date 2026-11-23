@@ -198,8 +198,13 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
     static int s_eval_log_counter = 0;
     s_eval_log_counter++;
 
-    if (hey_cherry_score >= 0.20f || is_top || (s_eval_log_counter % 12 == 0)) {
+    if (hey_cherry_score >= 0.50f) {
         ESP_LOGI(TAG, "[EVAL] hey_cherry: %4.1f%% | similar: %4.1f%% | unknown: %4.1f%% | noise: %4.1f%% (RawPk: %d, x%.1f->%d | Top: '%s') | DSP: %ums, NN: %ums",
+                 hey_cherry_score * 100.0f, similar_score * 100.0f, unknown_score * 100.0f, noise_score * 100.0f, 
+                 raw_peak, gain, boosted_peak, best_label,
+                 (unsigned int)result.timing.dsp, (unsigned int)result.timing.classification);
+    } else {
+        ESP_LOGD(TAG, "[EVAL] hey_cherry: %4.1f%% | similar: %4.1f%% | unknown: %4.1f%% | noise: %4.1f%% (RawPk: %d, x%.1f->%d | Top: '%s') | DSP: %ums, NN: %ums",
                  hey_cherry_score * 100.0f, similar_score * 100.0f, unknown_score * 100.0f, noise_score * 100.0f, 
                  raw_peak, gain, boosted_peak, best_label,
                  (unsigned int)result.timing.dsp, (unsigned int)result.timing.classification);
