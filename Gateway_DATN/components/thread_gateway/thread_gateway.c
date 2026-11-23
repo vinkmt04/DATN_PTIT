@@ -259,8 +259,7 @@ static void ot_task_worker(void *aContext)
                 th_err = otThreadSetEnabled(instance, true);
             }
             if (th_err == OT_ERROR_NONE) {
-                otError lead_err = otThreadBecomeLeader(instance);
-                ESP_LOGI(TAG, "Thread network restored and running as Leader! (lead_res=%d)", (int)lead_err);
+                ESP_LOGI(TAG, "Thread network restored from NVS (LeaderWeight=255)! Attaching naturally...");
             } else {
                 ESP_LOGE(TAG, "Failed to restore Thread network: %d", (int)th_err);
             }
