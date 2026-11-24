@@ -18,7 +18,7 @@ static const char *TAG = "ai_edge";
 
 #define BOOT_BUTTON_GPIO         0
 #define STREAM_CHUNK_SAMPLES     960    // 60ms @ 16kHz
-#define STREAM_SILENCE_TARGET    17     // 17 * 60ms = 1020ms ~ 1.0s im lặng để chốt lượt với Gemini Live
+#define STREAM_SILENCE_TARGET    14     // 14 * 60ms = 840ms im lặng để chốt lượt với Gemini Live (phản xạ nhanh)
 
 // =============================================================================
 // [CHẾ ĐỘ KIỂM THỬ MODEL 2 CÔ LẬP]
@@ -31,6 +31,13 @@ static TaskHandle_t audio_task_handle = NULL;
 static TaskHandle_t button_task_handle = NULL;
 static volatile ai_edge_state_t s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
 static volatile int s_responding_silent_cycles = 0;
+static volatile bool s_manual_wake_requested = false;
+static volatile bool s_manual_finish_requested = false;
+static bool s_cloud_speaking_notified = false;
+
+void ai_edge_finish_speaking(void) {
+    s_manual_finish_requested = true;
+}
 
 static bool is_command_device_enabled(const char *cmd_label) {
     if (!cmd_label) return false;
@@ -144,6 +151,8 @@ static void audio_recording_task(void *arg) {
     int command_speech_chunks = 0;
     int command_silence_chunks = 0;
     int command_total_chunks = 0;
+    int cmd_start_voice_streak = 0;
+    float stream_noise_floor = 16.0f;
 
     int streaming_counter = 0;
     int silence_counter = 0;
@@ -152,6 +161,7 @@ static void audio_recording_task(void *arg) {
     int idle_slice_counter = 0;
     int responding_log_counter = 0;
     int prev_wake_rms = 0;
+    int stream_peak_rms = 0;
 
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, " HỆ THỐNG LẮNG NGHE ĐÃ SẴN SÀNG (HYBRID DUAL-MODEL)!");
@@ -163,6 +173,37 @@ static void audio_recording_task(void *arg) {
     while (1) {
         switch (s_edge_state) {
             case AI_EDGE_STATE_IDLE_WAKEWORD: {
+                // Kiểm tra yêu cầu kích hoạt thủ công từ nút nhấn BOOT
+                if (s_manual_wake_requested) {
+                    s_manual_wake_requested = false;
+                    ESP_LOGI(TAG, "**************************************************");
+                    ESP_LOGI(TAG, ">>> KÍCH HOẠT THỦ CÔNG TỪ NÚT BẤM BOOT! <<<");
+                    ESP_LOGI(TAG, "**************************************************");
+#if !DEBUG_LOCAL_TEST_MODE
+                    if (sys_core_is_wifi_connected()) {
+                        ai_cloud_prewarm_session();
+                    }
+#endif
+                    audio_hal_play_wake_sound();
+                    ui_display_show_voice_overlay();
+
+                    cmd_inference_count = 0;
+                    cmd_samples_from_speech = 0;
+                    command_speech_started = false;
+                    wake_dma_flushed = false;
+                    command_speech_chunks = 0;
+                    command_silence_chunks = 0;
+                    command_total_chunks = 0;
+                    preroll_count = 0;
+                    preroll_idx = 0;
+                    if (s_preroll_buffer) memset(s_preroll_buffer, 0, PREROLL_BUFFER_SIZE);
+                    if (cmd_audio_buffer) memset(cmd_audio_buffer, 0, EI_COMMAND_BUFFER_SAMPLES * sizeof(int16_t));
+                    ei_command_reset_window();
+
+                    s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
+                    break;
+                }
+
                 // Đọc lát cắt 250ms (4000 mẫu) từ mic DMA
                 size_t bytes_to_read = wake_slice_size * sizeof(int16_t);
                 size_t bytes_read = audio_hal_record_chunk(wake_slice_buffer, bytes_to_read);
@@ -230,6 +271,7 @@ static void audio_recording_task(void *arg) {
                         command_speech_chunks = 0;
                         command_silence_chunks = 0;
                         command_total_chunks = 0;
+                        cmd_start_voice_streak = 0;
                         preroll_count = 0;
                         preroll_idx = 0;
                         if (s_preroll_buffer) {
@@ -254,6 +296,16 @@ static void audio_recording_task(void *arg) {
             }
 
             case AI_EDGE_STATE_COMMAND_LISTENING: {
+                if (s_manual_finish_requested) {
+                    s_manual_finish_requested = false;
+                    ESP_LOGI(TAG, ">>> MANUAL FINISH REQUESTED (Touch Button): CHỐT CÂU LỆNH NGAY LẬP TỨC <<<");
+                    ei_wakeword_reset();
+                    ai_cloud_end_turn();
+                    s_responding_silent_cycles = 0;
+                    s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
+                    responding_log_counter = 0;
+                    break;
+                }
                 prev_wake_rms = 0;
                 // Đọc từng chunk 60ms (960 mẫu = 1920 bytes) để VAD chính xác từng mili-giây
                 size_t bytes_to_read = STREAM_CHUNK_SAMPLES * sizeof(int16_t);
@@ -263,7 +315,8 @@ static void audio_recording_task(void *arg) {
                     audio_hal_apply_dc_filter(stream_chunk_buffer, STREAM_CHUNK_SAMPLES);
 
                     int rms = audio_vad_get_rms(stream_chunk_buffer, STREAM_CHUNK_SAMPLES);
-                    ui_display_update_audio_rms((uint16_t)rms);
+                    // Cắt đứt lưu lượng SPI2 trong lúc thu âm để không gây nhiễu chéo vào mic INMP441
+                    // ui_display_update_audio_rms((uint16_t)rms);
                     int floor = audio_dsp_get_ambient_noise();
 
                     // 1. Quản lý thời điểm bắt đầu thu âm:
@@ -303,10 +356,16 @@ static void audio_recording_task(void *arg) {
                         }
 
                         if (has_voice) {
+                            cmd_start_voice_streak++;
+                        } else {
+                            cmd_start_voice_streak = 0;
+                        }
+
+                        if (cmd_start_voice_streak >= 2) {
                             command_speech_started = true;
-                            command_speech_chunks = 1;
+                            command_speech_chunks = 2;
                             command_silence_chunks = 0;
-                            ESP_LOGI(TAG, ">>> [VOICE START] Bắt đầu nói (RMS: %d, Sàn ồn: %d) -> Lùi %dms giữ trọn phụ âm đầu! <<<",
+                            ESP_LOGI(TAG, ">>> [VOICE START] Bắt đầu nói (2 chunks liên tiếp có tiếng, RMS: %d, Sàn ồn: %d) -> Lùi %dms giữ trọn phụ âm đầu! <<<",
                                      rms, floor, preroll_count * 60);
 
                             // Kích hoạt Stream song song lên Cloud ngay lập tức (Speculative Streaming)
@@ -314,7 +373,7 @@ static void audio_recording_task(void *arg) {
                                 ai_cloud_start_turn();
                             }
 
-                            // Nạp các chunk Pre-roll (lùi tối đa 180ms) vào đầu cmd_audio_buffer VÀ stream ngay lên Cloud
+                            // Nạp các chunk Pre-roll (lùi tối đa 300ms) vào đầu cmd_audio_buffer VÀ stream ngay lên Cloud
                             cmd_samples_from_speech = 0;
                             if (s_preroll_buffer) {
                                 int start_idx = (preroll_idx - preroll_count + PREROLL_CHUNKS) % PREROLL_CHUNKS;
@@ -329,7 +388,7 @@ static void audio_recording_task(void *arg) {
                                     }
                                 }
                             }
-                        } else {
+                        } else if (!has_voice) {
                             audio_dsp_update_ambient_noise(rms);
                             // Quá 5.0s không ai nói gì: No-Speech Guard (84 chunks * 60ms = 5.04s)
                             if (command_total_chunks >= 84) {
@@ -340,6 +399,9 @@ static void audio_recording_task(void *arg) {
                                 s_edge_state = AI_EDGE_STATE_IDLE_WAKEWORD;
                                 break;
                             }
+                            break;
+                        } else {
+                            // has_voice chunk 1: Đang chờ chunk 2 xác nhận để loại bỏ hoàn toàn xung nhiễu / đuôi chuông
                             break;
                         }
                     } else {
@@ -394,37 +456,57 @@ static void audio_recording_task(void *arg) {
                             break;
                         }
 
-                        // Bước 3: Đếm tổng chunk giọng nói, chunk đuôi (300ms cuối: 20..24), và tính độ trải dài câu nói (speech_span_chunks)
+                        // Bước 3: Đếm tổng chunk giọng nói, xác định biên độ câu lệnh chính (Gap-aware Utterance Boundary)
                         int first_speech_chunk = -1;
                         int last_speech_chunk = -1;
                         int total_user_chunks = 0;
                         int tail_active_chunks = 0;
+                        int silence_gap = 0;
+                        bool main_utterance_closed = false;
 
                         for (int k = 0; k < 25; k++) {
                             if (chunk_rms[k] >= user_voice_thresh) {
                                 if (first_speech_chunk == -1) first_speech_chunk = k;
-                                last_speech_chunk = k;
+                                if (!main_utterance_closed) {
+                                    last_speech_chunk = k;
+                                }
+                                silence_gap = 0;
                                 total_user_chunks++;
                                 if (k >= 20) {
                                     tail_active_chunks++;
                                 }
+                            } else {
+                                if (first_speech_chunk != -1) {
+                                    silence_gap++;
+                                    if (silence_gap >= 3) {
+                                        main_utterance_closed = true;
+                                    }
+                                }
                             }
                         }
 
-                        int speech_span_chunks = (first_speech_chunk != -1) ? (last_speech_chunk - first_speech_chunk + 1) : 0;
+                        int speech_span_chunks = (first_speech_chunk != -1 && last_speech_chunk >= first_speech_chunk) ?
+                                                 (last_speech_chunk - first_speech_chunk + 1) : 0;
 
-                        // Bước 4: Kiểm tra điều kiện Câu phức / Câu dài (Chuyển thẳng sang Gemini Live, KHÔNG chạy Model 2):
-                        // A1: Người dùng vẫn đang phát âm ở cuối khung 1.5s ((tail >= 2 && total >= 8) || mép cuối chunk 23 hoặc 24 có tiếng)
-                        bool cond_a1 = (tail_active_chunks >= 2 && total_user_chunks >= 8) ||
-                                       (chunk_rms[23] >= user_voice_thresh || chunk_rms[24] >= user_voice_thresh);
-                        // A2: Độ trải dài của câu nói vượt quá độ dài lệnh 2-3 âm tiết (>= 17 chunks ~ 1.02s)
-                        bool cond_a2 = (speech_span_chunks >= 17);
-                        // A3: Tổng số chunk năng lượng cao quá nhiều (>= 15 chunks)
-                        bool cond_a3 = (total_user_chunks >= 15);
+                        // Bước 4: Kiểm tra điều kiện Câu dài liên tục (Continuous Long Utterance):
+                        // Chỉ bỏ qua Model 2 khi người dùng thực sự vẫn đang nói liên tục không ngừng nghỉ ở mép 1.5s:
+                        // - Câu nói chưa dứt (!main_utterance_closed)
+                        // - Đuôi 300ms cuối (chunks 20..24) có ít nhất 4/5 chunk năng lượng cao (tail_active_chunks >= 4)
+                        // - Cả 2 chunk cuối cùng (23 & 24) đều có tiếng nói
+                        // - Tổng số chunk giọng nói tích lũy lớn (total_user_chunks >= 20)
+                        bool is_continuous_long_speech = (!main_utterance_closed) &&
+                                                         (tail_active_chunks >= 4) &&
+                                                         (chunk_rms[23] >= user_voice_thresh && chunk_rms[24] >= user_voice_thresh) &&
+                                                         (total_user_chunks >= 20);
 
-                        if (cond_a1 || cond_a2 || cond_a3) {
-                            ESP_LOGI(TAG, ">>> [COMPLEX SENTENCE DETECTED] Phát hiện câu nói dài/tiếp diễn (TailActive: %d/5, Span: %d chunks, TotalActive: %d, MaxRMS: %d, Thresh: %d) -> Bỏ qua Model 2, chuyển thẳng sang Gemini Live! <<<",
-                                     tail_active_chunks, speech_span_chunks, total_user_chunks, max_speech_rms, user_voice_thresh);
+                        if (is_continuous_long_speech) {
+                            char rms_csv[180] = {0};
+                            int roff = 0;
+                            for (int k = 0; k < 25; k++) {
+                                roff += snprintf(rms_csv + roff, sizeof(rms_csv) - roff, "%d%s", chunk_rms[k], k < 24 ? "," : "");
+                            }
+                            ESP_LOGI(TAG, ">>> [CONTINUOUS SPEECH DETECTED] Người dùng vẫn đang nói ở cuối 1.5s (Tail: %d/5, Total: %d, MaxRMS: %d, Thresh: %d) -> Chuyển thẳng sang Gemini Live! <<<",
+                                     tail_active_chunks, total_user_chunks, max_speech_rms, user_voice_thresh);
 
                             if (sys_core_is_wifi_connected()) {
                                 s_edge_state = AI_EDGE_STATE_STREAMING_SPEECH;
@@ -432,6 +514,8 @@ static void audio_recording_task(void *arg) {
                                 silence_counter = command_silence_chunks;
                                 s_consecutive_speech = 2;
                                 speech_chunks_total = command_speech_chunks;
+                                stream_peak_rms = max_speech_rms;
+                                stream_noise_floor = (float)audio_dsp_get_ambient_noise();
                             } else {
                                 ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
                                 audio_hal_play_error_sound();
@@ -450,17 +534,21 @@ static void audio_recording_task(void *arg) {
                             int speech_start_sample = first_speech_chunk * STREAM_CHUNK_SAMPLES;
                             int speech_end_sample = (last_speech_chunk + 1) * STREAM_CHUNK_SAMPLES;
                             speech_center_sample = (speech_start_sample + speech_end_sample) / 2;
-                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Lệnh ngắn dứt câu (Tail: %d/5, Span: %d chunks, Total: %d). Phát hiện từ sample %d -> %d (%dms -> %dms, tâm: %dms, Thresh: %d, MaxRMS: %d) <<<",
-                                     tail_active_chunks, speech_span_chunks, total_user_chunks,
-                                     speech_start_sample, speech_end_sample,
-                                     speech_start_sample / 16, speech_end_sample / 16,
-                                     speech_center_sample / 16, user_voice_thresh, max_speech_rms);
                         } else {
                             // Fallback: Ước lượng câu nói bắt đầu sau Pre-roll 300ms (sample 4800)
                             speech_center_sample = 4800 + (EI_COMMAND_WINDOW_SAMPLES / 2); // 4800 + 9600 = 14400 (900ms)
-                            ESP_LOGI(TAG, ">>> [ENERGY CENTER] Không xác định rõ tâm năng lượng -> Dùng tâm dự phòng %dms <<<",
-                                     speech_center_sample / 16);
                         }
+
+                        char rms_csv[180] = {0};
+                        int roff = 0;
+                        for (int k = 0; k < 25; k++) {
+                            roff += snprintf(rms_csv + roff, sizeof(rms_csv) - roff, "%d%s", chunk_rms[k], k < 24 ? "," : "");
+                        }
+                        ESP_LOGI(TAG, ">>> [MODEL 2 INFERENCE] chunk_rms=[%s] | Span: %d chunks (%dms -> %dms, Tâm: %dms) | Tail: %d/5 | Total: %d | Thresh: %d | MaxRMS: %d <<<",
+                                 rms_csv, speech_span_chunks,
+                                 (first_speech_chunk >= 0 ? first_speech_chunk * 60 : 0),
+                                 (last_speech_chunk >= 0 ? (last_speech_chunk + 1) * 60 : 0),
+                                 speech_center_sample / 16, tail_active_chunks, total_user_chunks, user_voice_thresh, max_speech_rms);
 
                         // Căn tâm: Khung 19,200 mẫu (1.2s) có tâm là (best_offset + 9600) -> best_offset = speech_center_sample - 9600
                         int best_offset = speech_center_sample - (EI_COMMAND_WINDOW_SAMPLES / 2);
@@ -599,6 +687,8 @@ static void audio_recording_task(void *arg) {
                                 silence_counter = command_silence_chunks;
                                 s_consecutive_speech = (command_silence_chunks == 0) ? 2 : 0;
                                 speech_chunks_total = command_speech_chunks;
+                                stream_peak_rms = max_speech_rms;
+                                stream_noise_floor = (float)audio_dsp_get_ambient_noise();
                             }
                         } else {
                             ESP_LOGE(TAG, ">>> [OFFLINE FALLBACK] Ngoại tuyến hoặc lỗi kết nối Live API! <<<");
@@ -657,33 +747,59 @@ static void audio_recording_task(void *arg) {
             }
 
             case AI_EDGE_STATE_STREAMING_SPEECH: {
+                if (s_manual_finish_requested) {
+                    s_manual_finish_requested = false;
+                    ESP_LOGI(TAG, ">>> MANUAL FINISH REQUESTED (Touch Button): CHỐT CÂU LỆNH NGAY LẬP TỨC <<<");
+                    ei_wakeword_reset();
+                    ai_cloud_end_turn();
+                    s_responding_silent_cycles = 0;
+                    s_edge_state = AI_EDGE_STATE_AI_RESPONDING;
+                    responding_log_counter = 0;
+                    break;
+                }
                 prev_wake_rms = 0;
                 // Đọc chunk 60ms từ mic (960 mẫu)
                 size_t bytes_to_read = STREAM_CHUNK_SAMPLES * sizeof(int16_t);
                 size_t bytes_read = audio_hal_record_chunk(stream_chunk_buffer, bytes_to_read);
 
                 if (bytes_read > 0) {
-                    // BẮT BUỘC: Lọc sạch DC Offset và sóng hạ âm 50-80Hz trước khi tính RMS và VAD!
+                    // BẮT BUỘC: Lọc sạch DC Offset và sóng hạ âm trước khi tính RMS và VAD!
                     audio_hal_apply_dc_filter(stream_chunk_buffer, bytes_read / sizeof(int16_t));
 
                     int rms = 0;
                     bool has_voice = audio_vad_is_speech_chunk(stream_chunk_buffer, bytes_read / sizeof(int16_t), &rms);
-                    ui_display_update_audio_rms((uint16_t)rms);
+                    // Cắt đứt lưu lượng SPI2 trong lúc thu âm để không gây nhiễu chéo vào mic INMP441
+                    // ui_display_update_audio_rms((uint16_t)rms);
 
                     // Gửi chunk PCM lên WebSocket RingBuffer
                     ai_cloud_send_audio_chunk((uint8_t *)stream_chunk_buffer, bytes_read);
 
-                    int ambient = audio_dsp_get_ambient_noise();
-                    int speech_reset_thresh = ambient * 3;
-                    if (speech_reset_thresh < 250) speech_reset_thresh = 250;
+                    // Thích nghi sàn ồn nhanh khi WebRTC VAD xác nhận không phải giọng người (tiếng quạt, gió lùa, ồn lớp học)
+                    if (!has_voice) {
+                        if ((float)rms > stream_noise_floor) {
+                            stream_noise_floor = stream_noise_floor * 0.85f + (float)rms * 0.15f;
+                        } else {
+                            stream_noise_floor = stream_noise_floor * 0.80f + (float)rms * 0.20f;
+                        }
+                        if (stream_noise_floor < 15.0f) stream_noise_floor = 15.0f;
+                        if (stream_noise_floor > 600.0f) stream_noise_floor = 600.0f;
+                    }
 
-                    if (has_voice) {
+                    int abs_gate = (int)(stream_noise_floor * 1.55f) + 35;
+                    if (abs_gate < 110) abs_gate = 110;
+                    int rel_gate = (int)(stream_peak_rms * 0.30f);
+                    int active_speech_thresh = (abs_gate > rel_gate) ? abs_gate : rel_gate;
+
+                    bool user_speaking = (has_voice && rms >= active_speech_thresh);
+
+                    if (user_speaking) {
                         speech_chunks_total++;
                         s_consecutive_speech++;
-                        // Robust Hangover: Chỉ reset silence_counter khi âm thanh thực sự có năng lượng giọng nói cận trường
-                        // Các tiếng động vật/nhạc ở xa dưới tầng không được phép xóa trắng silence_counter!
-                        if (s_consecutive_speech >= 2 && rms >= speech_reset_thresh) {
+                        // Chỉ reset silence_counter = 0 và cập nhật stream_peak_rms khi s_consecutive_speech >= 4
+                        // (240ms giọng nói liên tục vượt ngưỡng), tránh tiếng gió quạt hay tiếng ồn thoảng qua xóa sạch tiến độ
+                        if (s_consecutive_speech >= 4) {
                             silence_counter = 0;
+                            if (rms > stream_peak_rms) stream_peak_rms = rms;
                         }
                     } else {
                         s_consecutive_speech = 0;
@@ -692,19 +808,20 @@ static void audio_recording_task(void *arg) {
 
                     streaming_counter++;
 
-                    // VAD Cutoff Window: Dừng sau ĐÚNG 1.0s im lặng (17 chunks * 60ms = 1020ms) để phản xạ cực nhanh!
+                    // VAD Cutoff Window: Dừng sau ĐÚNG ~840ms im lặng (14 chunks * 60ms = 840ms) để phản xạ cực nhanh!
                     int silence_target = STREAM_SILENCE_TARGET;
 
                     if (streaming_counter % 8 == 0) {
-                        ESP_LOGD(TAG, "[STREAM VAD] RMS: %4d (Floor: %2d) | %s | Silence: %2d/%d (Speech: %d)",
-                                 rms, audio_dsp_get_ambient_noise(),
-                                 has_voice ? "CÓ TIẾNG" : "Im lặng  ",
+                        ESP_LOGI(TAG, "[STREAM VAD] RMS: %4d (Peak: %4d, Thresh: %3d, Floor: %2d, NoiseFlr: %d) | %s | Silence: %2d/%d (Speech: %d)",
+                                 rms, stream_peak_rms, active_speech_thresh, audio_dsp_get_ambient_noise(),
+                                 (int)stream_noise_floor,
+                                 user_speaking ? "CÓ TIẾNG" : "Im lặng  ",
                                  silence_counter, silence_target, speech_chunks_total);
                     }
 
-                    // DỨT CÂU NÓI HỢP LỆ (1.5s im lặng)
+                    // DỨT CÂU NÓI HỢP LỆ (14 chunks * 60ms = 840ms im lặng)
                     if (silence_counter >= silence_target) {
-                        ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói (1.0s im lặng) -> Chốt câu hỏi lên Gemini Live <<<");
+                        ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói (%dms im lặng) -> Chốt câu hỏi lên Gemini Live <<<", silence_target * 60);
                         ei_wakeword_reset();
                         ai_cloud_end_turn();
                         s_responding_silent_cycles = 0;
@@ -737,7 +854,8 @@ static void audio_recording_task(void *arg) {
                 bool cloud_busy = ai_cloud_is_busy();
                 bool speaker_playing = audio_hal_is_playing();
 
-                if (cloud_busy || speaker_playing) {
+                if ((cloud_busy || speaker_playing) && !s_cloud_speaking_notified) {
+                    s_cloud_speaking_notified = true;
                     ui_display_notify_cloud_speaking();
                 }
 
@@ -757,6 +875,7 @@ static void audio_recording_task(void *arg) {
                         ESP_LOGW(TAG, ">>> [AI_RESPONDING WATCHDOG] Loa im lặng liên tục > 15.0s nhưng Cloud vẫn bận -> Cưỡng bức đóng phiên về IDLE! <<<");
                         s_responding_silent_cycles = 0;
                         ui_display_hide_voice_overlay();
+                        s_cloud_speaking_notified = false;
                         ai_cloud_stop_session();
                         ei_wakeword_reset();
                         idle_slice_counter = 0;
@@ -771,6 +890,7 @@ static void audio_recording_task(void *arg) {
                 if (!cloud_busy && !speaker_playing) {
                     ESP_LOGI(TAG, ">>> [TURN COMPLETE] AI trả lời hoàn tất & loa đã nghỉ -> Trở về lắng nghe 'Hey Cherry' <<<");
                     ui_display_hide_voice_overlay();
+                    s_cloud_speaking_notified = false;
                     s_responding_silent_cycles = 0;
                     ai_cloud_stop_session();
                     ei_wakeword_reset();
@@ -822,11 +942,7 @@ static void button_trigger_task(void *arg) {
                     switch (s_edge_state) {
                         case AI_EDGE_STATE_IDLE_WAKEWORD: {
                             ESP_LOGI(TAG, ">>> BOOT BUTTON CLICK: KÍCH HOẠT THỦ CÔNG <<<");
-                            if (sys_core_is_wifi_connected()) {
-                                ai_cloud_prewarm_session();
-                            }
-                            audio_hal_play_wake_sound();
-                            s_edge_state = AI_EDGE_STATE_COMMAND_LISTENING;
+                            s_manual_wake_requested = true;
                             break;
                         }
 
@@ -868,10 +984,10 @@ void ai_edge_init(void) {
     xTaskCreatePinnedToCoreWithCaps(button_trigger_task, "button_task", 4096, NULL, 5, &button_task_handle, 1, MALLOC_CAP_SPIRAM);
 
     // Cấp phát Stack 32KB trong PSRAM (SPIRAM) để giải phóng hoàn toàn DRAM nội cho DMA và đảm bảo đủ bộ nhớ cho TFLite Micro inference
-    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(audio_recording_task, "audio_task", 32768, NULL, 5, &audio_task_handle, 1, MALLOC_CAP_SPIRAM);
+    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(audio_recording_task, "audio_task", 32768, NULL, 6, &audio_task_handle, 1, MALLOC_CAP_SPIRAM);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "FAILED to create audio_task in PSRAM (ret=%d)! Thử fallback về Internal DRAM...", (int)task_ret);
-        task_ret = xTaskCreatePinnedToCore(audio_recording_task, "audio_task", 16384, NULL, 5, &audio_task_handle, 1);
+        task_ret = xTaskCreatePinnedToCore(audio_recording_task, "audio_task", 16384, NULL, 6, &audio_task_handle, 1);
         if (task_ret != pdPASS) {
             ESP_LOGE(TAG, "CRITICAL: audio_task creation failed completely in DRAM as well! (ret=%d)", (int)task_ret);
         }

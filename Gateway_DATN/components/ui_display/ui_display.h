@@ -65,6 +65,11 @@ typedef void (*ui_display_abort_cb_t)(void);
 void ui_display_set_abort_callback(ui_display_abort_cb_t cb);
 void ui_display_trigger_abort(void);
 
+// Đăng ký callback khi người dùng bấm "Gửi ngay" chốt câu lệnh tức thì (phương án dự phòng lớp học ồn)
+typedef void (*ui_display_finish_cb_t)(void);
+void ui_display_set_finish_callback(ui_display_finish_cb_t cb);
+void ui_display_trigger_finish(void);
+
 #include "thread_commissioner.h"
 
 // Lấy trạng thái màn hình hiện tại đang là Idle (true) hay Dashboard (false)

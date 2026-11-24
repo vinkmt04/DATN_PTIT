@@ -12,8 +12,9 @@ static const char *TAG = "st7789v_driver";
 #define LCD_LEDC_CHANNEL     LEDC_CHANNEL_0
 #define LCD_LEDC_FREQ_HZ     5000
 
-esp_err_t st7789v_driver_init(esp_lcd_panel_handle_t *out_panel, esp_lcd_panel_io_handle_t *out_io) {
-    ESP_LOGI(TAG, "Initializing SPI2 bus for ST7789V (SCLK:%d, MOSI:%d, CS:%d, DC:%d, RST:%d, BL:%d)",
+esp_err_t st7789v_driver_init(esp_lcd_panel_handle_t *out_panel, esp_lcd_panel_io_handle_t *out_io,
+                             esp_lcd_panel_io_color_trans_done_cb_t on_color_trans_done, void *user_ctx) {
+    ESP_LOGI(TAG, "Initializing SPI2 bus for ST7789V (SCLK:%d, MOSI:%d, CS:%d, DC:%d, RST:%d, BL:%d @ 40MHz)",
              LCD_PIN_SCLK, LCD_PIN_MOSI, LCD_PIN_CS, LCD_PIN_DC, LCD_PIN_RST, LCD_PIN_BL);
 
     // 1. Cấu hình SPI2 Bus cho màn hình
@@ -36,11 +37,13 @@ esp_err_t st7789v_driver_init(esp_lcd_panel_handle_t *out_panel, esp_lcd_panel_i
     esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num = LCD_PIN_DC,
         .cs_gpio_num = LCD_PIN_CS,
-        .pclk_hz = 40 * 1000 * 1000, // 40MHz
+        .pclk_hz = 40 * 1000 * 1000, // 40MHz - Tốc độ cao chuẩn ST7789V, triệt tiêu hiện tượng quét hiển thị chậm
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        .on_color_trans_done = on_color_trans_done,
+        .user_ctx = user_ctx,
     };
     ret = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)SPI2_HOST, &io_config, &io_handle);
     if (ret != ESP_OK) {
@@ -104,8 +107,15 @@ esp_err_t st7789v_driver_init(esp_lcd_panel_handle_t *out_panel, esp_lcd_panel_i
 }
 
 void st7789v_set_backlight(uint8_t brightness_percent) {
-    if (brightness_percent > 100) brightness_percent = 100;
-    uint32_t duty = (brightness_percent * 255) / 100;
-    ledc_set_duty(LCD_LEDC_MODE, LCD_LEDC_CHANNEL, duty);
-    ledc_update_duty(LCD_LEDC_MODE, LCD_LEDC_CHANNEL);
+    if (brightness_percent >= 100) {
+        // Xuất mức DC HIGH tĩnh tuyệt đối trên GPIO 3 (ngắt hoàn toàn xung PWM 5kHz sát cạnh chân BCLK GPIO 4 của mic)
+        ledc_stop(LCD_LEDC_MODE, LCD_LEDC_CHANNEL, 1);
+    } else if (brightness_percent == 0) {
+        ledc_stop(LCD_LEDC_MODE, LCD_LEDC_CHANNEL, 0);
+    } else {
+        // Tự động khôi phục xung PWM khi ở độ sáng trung bình (ví dụ Idle 30%)
+        uint32_t duty = (brightness_percent * 255) / 100;
+        ledc_set_duty(LCD_LEDC_MODE, LCD_LEDC_CHANNEL, duty);
+        ledc_update_duty(LCD_LEDC_MODE, LCD_LEDC_CHANNEL);
+    }
 }

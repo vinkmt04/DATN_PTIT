@@ -13,7 +13,7 @@
 
 static const char *TAG = "tts_client";
 
-static mp3dec_t mp3d;
+static mp3dec_t *s_mp3d = NULL;
 static uint8_t *mp3_buf = NULL;
 static size_t mp3_buf_len = 0;
 #define MP3_BUF_MAX 16384 // 16KB buffer for incoming MP3 data
@@ -54,8 +54,8 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
                 mp3dec_frame_info_t info;
                 short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
-                while (mp3_buf_len > 0) {
-                    int samples = mp3dec_decode_frame(&mp3d, mp3_buf, mp3_buf_len, pcm, &info);
+                while (s_mp3d && mp3_buf_len > 0) {
+                    int samples = mp3dec_decode_frame(s_mp3d, mp3_buf, mp3_buf_len, pcm, &info);
                     if (info.frame_bytes > 0) {
                         if (samples > 0) {
                             audio_hal_play_chunk((const uint8_t*)pcm, samples * info.channels * sizeof(short));
@@ -94,7 +94,16 @@ void tts_client_play(const char *text) {
         return;
     }
     mp3_buf_len = 0;
-    mp3dec_init(&mp3d);
+
+    s_mp3d = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_mp3d) s_mp3d = (mp3dec_t *)malloc(sizeof(mp3dec_t));
+    if (!s_mp3d) {
+        ESP_LOGE(TAG, "Failed to allocate MP3 decoder in PSRAM");
+        heap_caps_free(mp3_buf);
+        mp3_buf = NULL;
+        return;
+    }
+    mp3dec_init(s_mp3d);
 
     esp_http_client_config_t config = {
         .url = url,
@@ -107,6 +116,8 @@ void tts_client_play(const char *text) {
         ESP_LOGE(TAG, "Failed to init HTTP client");
         heap_caps_free(mp3_buf);
         mp3_buf = NULL;
+        heap_caps_free(s_mp3d);
+        s_mp3d = NULL;
         return;
     }
     
@@ -121,4 +132,8 @@ void tts_client_play(const char *text) {
     esp_http_client_cleanup(client);
     heap_caps_free(mp3_buf);
     mp3_buf = NULL;
+    if (s_mp3d) {
+        heap_caps_free(s_mp3d);
+        s_mp3d = NULL;
+    }
 }

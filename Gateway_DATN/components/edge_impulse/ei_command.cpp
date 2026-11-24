@@ -7,6 +7,7 @@ using namespace ModelCommand;
 
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -16,8 +17,8 @@ static const int16_t *s_raw_audio_ptr = nullptr;
 static size_t s_raw_audio_len = 0;
 static float s_command_gain = 2.5f;
 
-// Bộ đệm 1.2s cho Model 2 (19.200 mẫu @ 16kHz)
-static int16_t s_command_window[EI_COMMAND_WINDOW_SAMPLES] = {0};
+// Bộ đệm 1.2s cho Model 2 (19.200 mẫu @ 16kHz) - Cấp phát động trong PSRAM chỉ khi gọi ei_command_slide_chunk để tiết kiệm 38.4KB DRAM
+static int16_t *s_command_window = nullptr;
 static size_t s_window_samples_fed = 0;
 
 static int get_command_audio_signal_data(size_t offset, size_t length, float *out_ptr) {
@@ -51,7 +52,9 @@ bool ei_command_init(void) {
 }
 
 void ei_command_reset_window(void) {
-    memset(s_command_window, 0, sizeof(s_command_window));
+    if (s_command_window) {
+        memset(s_command_window, 0, EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t));
+    }
     s_window_samples_fed = 0;
     ESP_LOGD(TAG, "Command sliding window reset (zeroed).");
 }
@@ -68,6 +71,15 @@ static bool is_valid_local_command(const char *label) {
 bool ei_command_slide_chunk(const int16_t *chunk_400ms, size_t num_samples,
                             float *out_confidence, const char **out_label) {
     if (chunk_400ms == nullptr || num_samples == 0) return false;
+
+    if (!s_command_window) {
+        s_command_window = (int16_t *)heap_caps_malloc(EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_command_window) {
+            s_command_window = (int16_t *)malloc(EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t));
+        }
+        if (!s_command_window) return false;
+        memset(s_command_window, 0, EI_COMMAND_WINDOW_SAMPLES * sizeof(int16_t));
+    }
 
     // 1. Trượt cửa sổ: Dịch dữ liệu cũ sang trái, đưa chunk 400ms mới vào cuối
     if (num_samples >= EI_COMMAND_WINDOW_SAMPLES) {

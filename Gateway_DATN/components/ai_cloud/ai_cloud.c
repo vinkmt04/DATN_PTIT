@@ -8,6 +8,7 @@
 #include "audio_hal.h"
 #include "mesh_controller.h"
 #include "gateway_state_manager.h"
+#include "esp_timer.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,6 +83,9 @@ static volatile bool s_need_send_activity_start = false;
 static volatile bool s_turn_ending = false;
 static volatile bool s_cmd_dispatched_in_turn = false;
 static volatile bool s_mute_response_audio = false;
+static volatile bool s_ws_rx_reset_req = false;
+static volatile uint32_t s_turn_generation = 0;
+static int64_t s_tool_resp_sent_ms = 0;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (256KB trong PSRAM ~ 8 giây âm thanh)
 // Giúp luồng thu âm mic KHÔNG BAO GIỜ BỊ BLOCK bởi mạng!
@@ -111,9 +115,7 @@ static void recover_from_ws_failure(const char *reason, bool force_close_socket)
     s_is_ws_connecting = false;
     s_setup_complete = false;
     s_last_disconnect_time_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (xTaskGetCurrentTaskHandle() != s_rx_task_handle) {
-        s_ws_rx_len = 0;
-    }
+    s_ws_rx_reset_req = true;
     s_rx_flush_requested = true;
 
     if (s_current_state == AI_STATE_SPEAKING) {
@@ -224,33 +226,36 @@ static void parse_server_message(const char *json_string) {
         text_source = strstr(json_string, "\"modelTurn\"");
     }
     if (text_source) {
-        const char *text_key = strstr(text_source, "\"text\":");
+        const char *text_key = strstr(text_source, "\"text\"");
         if (text_key) {
-            const char *val_start = strchr(text_key + 7, '\"');
-            if (val_start) {
-                val_start++;
-                const char *val_end = strchr(val_start, '\"');
-                while (val_end && *(val_end - 1) == '\\') {
-                    val_end = strchr(val_end + 1, '\"');
-                }
-                if (val_end && val_end > val_start) {
-                    char reply_buf[256];
-                    size_t len = val_end - val_start;
-                    if (len >= sizeof(reply_buf)) len = sizeof(reply_buf) - 1;
-                    memcpy(reply_buf, val_start, len);
-                    reply_buf[len] = '\0';
+            const char *colon = strchr(text_key + 6, ':');
+            if (colon) {
+                const char *val_start = strchr(colon, '\"');
+                if (val_start) {
+                    val_start++;
+                    const char *val_end = strchr(val_start, '\"');
+                    while (val_end && *(val_end - 1) == '\\') {
+                        val_end = strchr(val_end + 1, '\"');
+                    }
+                    if (val_end && val_end > val_start) {
+                        char reply_buf[256];
+                        size_t len = val_end - val_start;
+                        if (len >= sizeof(reply_buf)) len = sizeof(reply_buf) - 1;
+                        memcpy(reply_buf, val_start, len);
+                        reply_buf[len] = '\0';
 
-                    // Lọc sạch các thẻ rác XML/HTML/SSML như \u003caudio src=\"say:...\"/\u003e
-                    char *say_pos = strstr(reply_buf, "say:");
-                    if (say_pos) {
-                        say_pos += 4;
-                        char *quote_end = strchr(say_pos, '\"');
-                        if (quote_end) *quote_end = '\0';
-                        ESP_LOGI(TAG, "Gemini Reply: %s", say_pos);
-                    } else if (strstr(reply_buf, "\\u003c") || strstr(reply_buf, "<audio")) {
-                        // Bỏ qua log thẻ rác XML
-                    } else {
-                        ESP_LOGI(TAG, "Gemini Reply: %s", reply_buf);
+                        // Lọc sạch các thẻ rác XML/HTML/SSML như \u003caudio src=\"say:...\"/\u003e
+                        char *say_pos = strstr(reply_buf, "say:");
+                        if (say_pos) {
+                            say_pos += 4;
+                            char *quote_end = strchr(say_pos, '\"');
+                            if (quote_end) *quote_end = '\0';
+                            ESP_LOGI(TAG, "Gemini Reply: %s", say_pos);
+                        } else if (strstr(reply_buf, "\\u003c") || strstr(reply_buf, "<audio")) {
+                            // Bỏ qua log thẻ rác XML
+                        } else {
+                            ESP_LOGI(TAG, "Gemini Reply: %s", reply_buf);
+                        }
                     }
                 }
             }
@@ -271,7 +276,7 @@ static void parse_server_message(const char *json_string) {
         ESP_LOGI(TAG, ">>> [GEMINI TOOL CALL RECEIVED] <<<");
         s_current_state = AI_STATE_EXECUTING_TOOL;
         s_cmd_dispatched_in_turn = true;
-        s_mute_response_audio = true; // Mute loa cho toàn bộ câu trả lời thoại sau lệnh điều khiển
+        bool has_tool_error = false;
 
         char func_responses_json[512] = {0};
         size_t resp_offset = 0;
@@ -377,9 +382,11 @@ static void parse_server_message(const char *json_string) {
                 if (!cur_st.dimmer_registered) {
                     ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer - Đèn chưa đăng ký vào mạng Thread <<<");
                     snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn chưa được kết nối vào hệ thống");
+                    has_tool_error = true;
                 } else if (!cur_st.dimmer_node_online) {
                     ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_dimmer - Đèn hiện đang ngoại tuyến <<<");
                     snprintf(result_msg, sizeof(result_msg), "Lỗi: Đèn hiện đang ngoại tuyến, vui lòng kiểm tra nguồn");
+                    has_tool_error = true;
                 } else {
                     if (strcmp(action, "set_brightness") == 0 || brightness >= 0) {
                         if (brightness < 0) brightness = 80;
@@ -403,9 +410,11 @@ static void parse_server_message(const char *json_string) {
                 if (!cur_st.relay_registered) {
                     ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay - Relay chưa đăng ký vào mạng Thread <<<");
                     snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc chưa được kết nối vào hệ thống");
+                    has_tool_error = true;
                 } else if (!cur_st.relay_node_online) {
                     ESP_LOGW(TAG, ">>> [TOOL GUARD]: control_relay - Relay hiện đang ngoại tuyến <<<");
                     snprintf(result_msg, sizeof(result_msg), "Lỗi: Công tắc hiện đang ngoại tuyến, vui lòng kiểm tra nguồn");
+                    has_tool_error = true;
                 } else {
                     if (strcmp(action, "turn_on") == 0 || strcmp(action, "on") == 0) {
                         ESP_LOGW(TAG, ">>> [TOOL EXEC -> THREAD MESH]: CMD:RELAY:ON <<<");
@@ -423,8 +432,8 @@ static void parse_server_message(const char *json_string) {
             if (call_id[0] != '\0') {
                 char single_resp[256];
                 int s_len = snprintf(single_resp, sizeof(single_resp),
-                    "%s{\"response\":{\"output\":{\"result\":\"%s\"}},\"id\":\"%s\"}",
-                    (call_count > 0 ? "," : ""), result_msg, call_id
+                    "%s{\"id\":\"%s\",\"name\":\"%s\",\"response\":{\"result\":\"%s\"}}",
+                    (call_count > 0 ? "," : ""), call_id, fn_name, result_msg
                 );
                 if (resp_offset + s_len < sizeof(func_responses_json)) {
                     memcpy(func_responses_json + resp_offset, single_resp, s_len);
@@ -446,20 +455,28 @@ static void parse_server_message(const char *json_string) {
             );
             if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
                 esp_websocket_client_send_text(ws_client, tool_resp_buf, strlen(tool_resp_buf), pdMS_TO_TICKS(4000));
+                s_tool_resp_sent_ms = esp_timer_get_time() / 1000;
                 ESP_LOGI(TAG, ">>> Sent toolResponse (%d functions) to Gemini Live <<<", call_count);
                 xSemaphoreGive(ws_mutex);
             }
         }
 
-        // [LOCAL-SYNC SILENT EXIT]: Điều khiển thiết bị xong -> Giữ loa 100% im lặng, chờ turnComplete kết thúc lượt
-        ESP_LOGI(TAG, ">>> [LOCAL-SYNC SILENT EXIT] Lệnh điều khiển đã gửi -> Mute loa, chờ turnComplete... <<<");
+        // [LOCAL-SYNC SILENT EXIT / ERROR ALERT]
+        if (has_tool_error) {
+            s_mute_response_audio = false; // Bật loa để Gemini nói to câu cảnh báo lỗi thiết bị cho người dùng nghe!
+            ESP_LOGW(TAG, ">>> [TOOL ERROR] Thiết bị ngoại tuyến hoặc chưa kết nối -> Bật loa để AI nói lỗi! <<<");
+        } else {
+            // Điều khiển thiết bị thành công -> Giữ loa 100% im lặng, chờ turnComplete kết thúc lượt
+            s_mute_response_audio = true;
+            ESP_LOGI(TAG, ">>> [LOCAL-SYNC SILENT EXIT] Lệnh điều khiển thành công -> Mute loa, chờ turnComplete... <<<");
+            audio_hal_stop_playback();
+            audio_hal_set_turn_active(false);
+        }
         s_current_state = AI_STATE_WAITING_POST_TOOL_SPEECH;
-        audio_hal_stop_playback();
-        audio_hal_set_turn_active(false);
 
-        // Khởi động lại Safeguard Timer 3 giây bảo vệ: nếu quá 3s Google không gửi turnComplete thì timeout đóng socket
+        // Khởi động lại Safeguard Timer 4 giây bảo vệ: nếu quá 4s Google không gửi audio lỗi thì timeout đóng socket và phát âm báo lỗi
         if (s_session_timer) {
-            xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(3000), 0);
+            xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(4000), 0);
             xTimerStart(s_session_timer, 0);
         }
     }
@@ -468,9 +485,11 @@ static void parse_server_message(const char *json_string) {
     const char *search_ptr = json_string;
     const char *inline_tag = NULL;
     while ((inline_tag = strstr(search_ptr, "\"inlineData\"")) != NULL) {
-        const char *data_key = strstr(inline_tag, "\"data\":");
+        const char *data_key = strstr(inline_tag, "\"data\"");
         if (!data_key) break;
-        const char *val_start = strchr(data_key + 7, '\"');
+        const char *colon = strchr(data_key + 6, ':');
+        if (!colon) break;
+        const char *val_start = strchr(colon, '\"');
         if (!val_start) break;
         val_start++;
         const char *val_end = strchr(val_start, '\"');
@@ -493,7 +512,6 @@ static void parse_server_message(const char *json_string) {
             if (!s_mute_response_audio) {
                 s_current_state = AI_STATE_SPEAKING;
             }
-            ai_edge_stop_recording();
             expecting_first_chunk = true;
             if (s_session_timer) {
                 xTimerStop(s_session_timer, 0);
@@ -589,8 +607,13 @@ static void parse_server_message(const char *json_string) {
     // Bỏ qua generationComplete đơn lẻ, CHỈ chấp nhận turnComplete: true chính thức kết thúc toàn bộ lượt!
     if (s_current_state == AI_STATE_EXECUTING_TOOL) {
         is_turn_finished = false;
-    } else if (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH && !has_turn_complete) {
-        is_turn_finished = false;
+    } else if (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH) {
+        if (!s_mute_response_audio && (esp_timer_get_time() / 1000 - s_tool_resp_sent_ms) < 350) {
+            // Chặn gói turnComplete/generationComplete trễ của lượt toolCall cũ (đến sau < 350ms), tiếp tục chờ Gemini gửi audio giải thích lỗi
+            is_turn_finished = false;
+        } else if (!has_turn_complete) {
+            is_turn_finished = false;
+        }
     }
 
     if (is_turn_finished && s_current_state != AI_STATE_IDLE) {
@@ -708,7 +731,7 @@ static void send_setup_frame(void) {
             "5. Hàm control_relay CHỈ gọi khi người dùng nói 'công tắc'. Tuyệt đối không gọi cho 'đèn', 'quạt'. "
 #endif
             "6. Tuyệt đối không tự suy diễn câu lệnh của thiết bị này sang thiết bị khác, không gọi hàm lần thứ 2 trong cùng lượt. "
-            "7. Sau khi gọi hàm điều khiển: Phản hồi cực ngắn (dưới 4 từ, ví dụ: 'Đã bật đèn.', 'Đã bật công tắc.') và kết thúc lượt ngay. "
+            "7. Sau khi gọi hàm điều khiển: Phản hồi cực ngắn (dưới 4 từ, ví dụ: 'Đã bật đèn.', 'Đã bật công tắc.') và kết thúc lượt ngay. Nếu toolResponse trả về thông báo lỗi (như thiết bị ngoại tuyến hoặc chưa kết nối), BẮT BUỘC phải nói rõ câu báo lỗi bằng tiếng Việt cho người dùng nghe. "
 #if GATEWAY_ENABLE_DHT11
             "8. Khi hỏi nhiệt độ, độ ẩm phòng (DHT11) hoặc trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
 #else
@@ -721,38 +744,48 @@ static void send_setup_frame(void) {
             ESP_LOGE(TAG, "Prompt buffer overflow! p_len=%d >= 4096", p_len);
         }
 
-        // Sinh động trường tools_json: chỉ khai báo tool cho thiết bị có cờ enable = 1
-        char tools_json[2048] = "";
+        // Sinh động trường tools_json: chỉ khai báo tool cho thiết bị có cờ enable = 1 (cấp phát PSRAM)
+        char *tools_json = (char *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!tools_json) tools_json = (char *)malloc(2048);
+        if (tools_json) {
+            tools_json[0] = '\0';
+        }
 #if GATEWAY_ENABLE_DIMMER && GATEWAY_ENABLE_RELAY
-        snprintf(tools_json, sizeof(tools_json), "%s",
-            "\"tools\":[{\"functionDeclarations\":["
-                "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
-                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
-                    "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
-                "},\"required\":[\"action\"]}},"
-                "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
-                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
-                "},\"required\":[\"action\"]}}"
-            "]}],");
+        if (tools_json) {
+            snprintf(tools_json, 2048, "%s",
+                "\"tools\":[{\"functionDeclarations\":["
+                    "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
+                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
+                        "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
+                    "},\"required\":[\"action\"]}},"
+                    "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
+                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
+                    "},\"required\":[\"action\"]}}"
+                "]}],");
+        }
 #elif GATEWAY_ENABLE_DIMMER
-        snprintf(tools_json, sizeof(tools_json), "%s",
-            "\"tools\":[{\"functionDeclarations\":["
-                "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
-                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
-                    "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
-                "},\"required\":[\"action\"]}}"
-            "]}],");
+        if (tools_json) {
+            snprintf(tools_json, 2048, "%s",
+                "\"tools\":[{\"functionDeclarations\":["
+                    "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
+                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
+                        "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
+                    "},\"required\":[\"action\"]}}"
+                "]}],");
+        }
 #elif GATEWAY_ENABLE_RELAY
-        snprintf(tools_json, sizeof(tools_json), "%s",
-            "\"tools\":[{\"functionDeclarations\":["
-                "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
-                "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                    "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
-                "},\"required\":[\"action\"]}}"
-            "]}],");
+        if (tools_json) {
+            snprintf(tools_json, 2048, "%s",
+                "\"tools\":[{\"functionDeclarations\":["
+                    "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
+                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
+                    "},\"required\":[\"action\"]}}"
+                "]}],");
+        }
 #endif
 
         int setup_len = snprintf(setup_buf, 8192,
@@ -760,7 +793,7 @@ static void send_setup_frame(void) {
             "%s"
             "\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
             "\"realtimeInputConfig\":{\"automaticActivityDetection\":{\"disabled\":true}},\"inputAudioTranscription\":{}}}",
-            tools_json,
+            tools_json ? tools_json : "",
             prompt_buf
         );
 
@@ -768,10 +801,14 @@ static void send_setup_frame(void) {
             ESP_LOGE(TAG, "Setup buffer overflow! setup_len=%d >= 8192", setup_len);
         }
 
-        esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(4000));
+        if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(4000));
+            xSemaphoreGive(ws_mutex);
+        }
         ESP_LOGI(TAG, "Sent Dynamic Setup message (len: %d bytes, DIMMER=%d, RELAY=%d, DHT11=%d). Waiting for setupComplete...",
                  setup_len, GATEWAY_ENABLE_DIMMER, GATEWAY_ENABLE_RELAY, GATEWAY_ENABLE_DHT11);
 
+        if (tools_json) free(tools_json);
         free(prompt_buf);
         free(setup_buf);
     }
@@ -1065,7 +1102,7 @@ static void cloud_tx_task(void *arg) {
             // Xử lý TIMEOUT từ Software Timer (chuyển về xử lý an toàn tại đây với Stack 8KB)
             if (notify_bits & CLOUD_EVT_TIMEOUT) {
                 if (s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH) {
-                    bool was_tool = (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH || s_mute_response_audio);
+                    bool was_tool_success = (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH && s_mute_response_audio);
                     ESP_LOGW(TAG, "Response Timeout (waiting AI or post-tool ack). Resetting turn & closing socket...");
                     s_current_state = AI_STATE_IDLE;
                     s_turn_ending = false;
@@ -1076,7 +1113,7 @@ static void cloud_tx_task(void *arg) {
                     if (s_session_timer) xTimerStop(s_session_timer, 0);
                     s_rx_flush_requested = true;
                     audio_hal_set_turn_active(false);
-                    if (!was_tool) {
+                    if (!was_tool_success) {
                         audio_hal_play_error_sound();
                     }
                     stop_ws_client_safe();
@@ -1119,6 +1156,14 @@ static void cloud_tx_task(void *arg) {
                 s_current_state = AI_STATE_RECORDING;
                 s_need_send_activity_start = true;
                 s_cmd_dispatched_in_turn = false;
+                s_turn_generation++;
+                if (s_tx_audio_ringbuf) {
+                    size_t dummy_sz;
+                    uint8_t *dummy_it;
+                    while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
+                        vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                    }
+                }
             }
 
             // Xử lý END_TURN
@@ -1248,9 +1293,8 @@ static void cloud_tx_task(void *arg) {
 
             vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)item);
 
-            // Điều tiết tốc độ (Traffic Pacing): Nghỉ 35ms sau mỗi frame 60ms PCM.
-            // Vừa xả nhanh hơn thời gian thực (~1.7x), vừa bảo đảm TCP Send Buffer chịu được jitter/DELBA Wi-Fi!
-            vTaskDelay(pdMS_TO_TICKS(35));
+            // Điều tiết tốc độ (Traffic Pacing): 10ms khi s_turn_ending để xả nhanh gửi activityEnd, 50ms khi đang nói bình thường.
+            vTaskDelay(pdMS_TO_TICKS(s_turn_ending ? 10 : 50));
         } else {
             // RingBuffer đã rỗng hoàn toàn (toàn bộ âm thanh câu nói đã được gửi lên Google)
             if (s_turn_ending && s_current_state == AI_STATE_RECORDING) {
@@ -1342,8 +1386,9 @@ void ai_cloud_prewarm_session(void) {
             esp_err_t err = esp_websocket_client_start(ws_client);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "esp_websocket_client_start failed: 0x%x -> Resetting client", err);
-                esp_websocket_client_stop(ws_client);
-                s_is_ws_connecting = false;
+                xSemaphoreGive(ws_mutex);
+                stop_ws_client_safe();
+                return;
             }
         }
         xSemaphoreGive(ws_mutex);
@@ -1394,14 +1439,8 @@ bool ai_cloud_start_turn(void) {
         xTimerStop(s_session_timer, 0);
     }
 
-    // 2. Xóa sạch mọi dữ liệu ghi âm tồn đọng từ lượt trước trong RingBuffer TX
-    if (s_tx_audio_ringbuf) {
-        size_t dummy_size;
-        uint8_t *dummy_item;
-        while ((dummy_item = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_size, 0)) != NULL) {
-            vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_item);
-        }
-    }
+    // 2. Không tự xả RingBuffer TX từ Core 1 để tránh race condition đa luồng đọc (Single-Consumer).
+    // Việc xả sạch sẽ do cloud_tx_task xử lý an toàn trên Core 0 khi nhận CLOUD_EVT_START_TURN.
 
     // 3. Đảm bảo kết nối đã được kích hoạt
     ai_cloud_prewarm_session();

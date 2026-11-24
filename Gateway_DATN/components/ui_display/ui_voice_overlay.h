@@ -14,6 +14,9 @@ void ui_voice_overlay_init(void);
 // Hiển thị lớp phủ và bắt đầu hiệu ứng viền Siri phát sáng
 void ui_voice_overlay_show(void);
 
+// Bật lại hiệu ứng animation sóng âm khi AI trả lời (mic không còn thu)
+void ui_voice_overlay_resume_anim(void);
+
 // Ẩn lớp phủ Siri
 void ui_voice_overlay_hide(void);
 

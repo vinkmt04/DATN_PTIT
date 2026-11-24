@@ -55,6 +55,7 @@ void app_main(void)
     ui_display_update_boot_progress(60, "Nạp mô hình Edge AI 'Hey Cherry'...");
     ai_edge_init();
     ui_display_set_abort_callback(ai_edge_abort);
+    ui_display_set_finish_callback(ai_edge_finish_speaking);
     ui_display_update_boot_progress(70, "Trợ lý giọng nói Edge AI sẵn sàng");
     vTaskDelay(pdMS_TO_TICKS(150));
 
@@ -92,6 +93,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Initialization complete. Gateway running in Standby Mode.");
     sys_core_print_memory_stats("BOOT_COMPLETE");
+    sys_core_print_memory_stats("AFTER_OPTIMIZATION");
 
     // Xóa task main vì các subsystem đều chạy trên các FreeRTOS worker tasks
     vTaskDelete(NULL);

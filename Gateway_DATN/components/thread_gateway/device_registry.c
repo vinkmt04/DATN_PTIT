@@ -17,6 +17,8 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
+#include "esp_memory_utils.h"
 
 #include "openthread/instance.h"
 #include "openthread/ip6.h"
@@ -209,9 +211,22 @@ bool device_registry_is_registered(const char *dev_name)
     return (type != THREAD_DEV_UNKNOWN) ? device_registry_is_type_registered(type) : false;
 }
 
+static void device_registry_set_reg_deferred(void *pvParameter1, uint32_t ulParameter2) {
+    (void)ulParameter2;
+    uint32_t packed = (uint32_t)(uintptr_t)pvParameter1;
+    thread_dev_type_t type = (thread_dev_type_t)(packed & 0xFFFF);
+    bool registered = (bool)((packed >> 16) & 0x01);
+    device_registry_set_type_registered(type, registered);
+}
+
 void device_registry_set_type_registered(thread_dev_type_t type, bool registered)
 {
     if (type < 0 || type >= THREAD_DEV_COUNT) return;
+    if (esp_ptr_external_ram(&type)) {
+        uint32_t packed = ((uint32_t)type & 0xFFFF) | ((registered ? 1 : 0) << 16);
+        xTimerPendFunctionCall(device_registry_set_reg_deferred, (void *)(uintptr_t)packed, 0, pdMS_TO_TICKS(100));
+        return;
+    }
     device_registry_init();
 
     if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {

@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-#define ACTUATOR_PRESENCE_TIMEOUT_MS 35000  // 35s khong co phan hoi -> Coi nhu Offline cho Relay/Dimmer (Chu ky hb 30s + 5s grace)
-#define SENSOR_PRESENCE_TIMEOUT_MS   70000  // 70s khong co phan hoi -> Coi nhu Offline cho Sensor (chu ky gui 60s + 10s grace)
+#define ACTUATOR_PRESENCE_TIMEOUT_MS 75000  // 75s khong co phan hoi -> Coi nhu Offline cho Relay/Dimmer (2 chu ky hb 30s + 15s grace)
+#define SENSOR_PRESENCE_TIMEOUT_MS   135000 // 135s khong co phan hoi -> Coi nhu Offline cho Sensor (2 chu ky gui 60s + 15s grace)
 #define PRESENCE_ACTIVITY_TIMEOUT_MS ACTUATOR_PRESENCE_TIMEOUT_MS // Tương thích ngược
 
 /**

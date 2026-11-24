@@ -8,13 +8,15 @@ using namespace ModelWakeWord;
 #include "edge-impulse-sdk/classifier/ei_run_classifier.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
 
 static const char *TAG = "ei_wakeword";
 
-static int16_t s_boosted_slice_buffer[EI_WAKEWORD_SLICE_SAMPLES];
+// Cấp phát trong PSRAM để tiết kiệm ~8KB DRAM
+static int16_t *s_boosted_slice_buffer = nullptr;
 static float s_prev_hey_cherry_score = 0.0f;
 static float s_prev_similar_score = 0.0f;
 static int64_t s_veto_until_ms = 0;
@@ -29,6 +31,7 @@ static int16_t s_recent_boosted_peaks[4] = {0, 0, 0, 0};
 static int s_boosted_peak_idx = 0;
 
 static int get_wakeword_audio_signal_data(size_t offset, size_t length, float *out_ptr) {
+    if (!s_boosted_slice_buffer) return -1;
     for (size_t i = 0; i < length; i++) {
         out_ptr[i] = (float)s_boosted_slice_buffer[offset + i];
     }
@@ -46,7 +49,18 @@ bool ei_wakeword_init(void) {
     s_smooth_gain = 4.0f;
     memset(s_recent_boosted_peaks, 0, sizeof(s_recent_boosted_peaks));
     s_boosted_peak_idx = 0;
-    memset(s_boosted_slice_buffer, 0, sizeof(s_boosted_slice_buffer));
+
+    if (!s_boosted_slice_buffer) {
+        s_boosted_slice_buffer = (int16_t *)heap_caps_malloc(EI_WAKEWORD_SLICE_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_boosted_slice_buffer) {
+            s_boosted_slice_buffer = (int16_t *)malloc(EI_WAKEWORD_SLICE_SAMPLES * sizeof(int16_t));
+        }
+        if (!s_boosted_slice_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate s_boosted_slice_buffer in PSRAM!");
+            return false;
+        }
+    }
+    memset(s_boosted_slice_buffer, 0, EI_WAKEWORD_SLICE_SAMPLES * sizeof(int16_t));
 
     ESP_LOGI(TAG, "Wake Word Engine Ready -> Project ID: %lu | Window: %lu samples (%lums) | Slice: %lu samples (%lums)",
              (unsigned long)ModelWakeWord::ei_default_impulse.impulse->project_id,
@@ -77,6 +91,7 @@ void ei_wakeword_reset(void) {
 bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples, 
                                float *out_confidence, const char **out_label) {
     if (audio_chunk == nullptr || chunk_samples == 0) return false;
+    if (!s_boosted_slice_buffer) return false;
 
     if (chunk_samples != EI_WAKEWORD_SLICE_SAMPLES) {
         ESP_LOGW(TAG, "Chunk size mismatch! Expected %d, got %zu", EI_WAKEWORD_SLICE_SAMPLES, chunk_samples);

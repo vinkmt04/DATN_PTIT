@@ -16,6 +16,7 @@
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
 #include "esp_heap_caps.h"
+#include "cJSON.h"
 #include <string.h>
 
 static const char *TAG = "sys_core";
@@ -125,6 +126,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_max_tx_power(68); // 17 dBm: giảm ~40% xung dòng đỉnh 3.3V, hạn chế gợn nguồn vào mic INMP441
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         esp_wifi_set_ps(WIFI_PS_NONE);
@@ -179,10 +181,28 @@ void sys_core_reset_wifi(void) {
     esp_restart();
 }
 
+static void *cjson_psram_malloc(size_t sz) {
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(sz);
+    return p;
+}
+
+static void cjson_psram_free(void *ptr) {
+    if (ptr) heap_caps_free(ptr);
+}
+
 void sys_core_platform_init(void) {
     static bool s_platform_inited = false;
     if (s_platform_inited) return;
     s_platform_inited = true;
+
+    // Chuyển toàn bộ cấp phát cJSON AST sang PSRAM để giải phóng Internal DRAM
+    cJSON_Hooks hooks = {
+        .malloc_fn = cjson_psram_malloc,
+        .free_fn = cjson_psram_free
+    };
+    cJSON_InitHooks(&hooks);
+    ESP_LOGI(TAG, "cJSON dynamic allocations routed to Octal PSRAM.");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -268,6 +288,7 @@ void sys_core_init(void) {
         wifi_prov_mgr_deinit();
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
+        esp_wifi_set_max_tx_power(68); // Trần công suất 17 dBm (giảm xung dòng đỉnh 3.3V)
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     }
 

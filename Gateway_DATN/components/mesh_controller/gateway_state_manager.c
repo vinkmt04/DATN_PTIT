@@ -5,6 +5,8 @@
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
+#include "esp_memory_utils.h"
 #include <string.h>
 #include <math.h>
 
@@ -49,13 +51,28 @@ static void notify_state_changed(const gateway_device_state_t *state) {
     }
 }
 
-static void save_last_brightness_nvs(uint8_t bri) {
+static void save_last_brightness_nvs_internal(uint8_t bri) {
     if (bri == 0) return;
     nvs_handle_t h;
     if (nvs_open(NVS_NS_STATE, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, NVS_KEY_LAST_BRI, bri);
         nvs_commit(h);
         nvs_close(h);
+    }
+}
+
+static void save_last_brightness_deferred(void *pvParameter1, uint32_t ulParameter2) {
+    (void)ulParameter2;
+    uint8_t bri = (uint8_t)(uintptr_t)pvParameter1;
+    save_last_brightness_nvs_internal(bri);
+}
+
+static void save_last_brightness_nvs(uint8_t bri) {
+    if (bri == 0) return;
+    if (esp_ptr_external_ram(&bri)) {
+        xTimerPendFunctionCall(save_last_brightness_deferred, (void *)(uintptr_t)bri, 0, pdMS_TO_TICKS(100));
+    } else {
+        save_last_brightness_nvs_internal(bri);
     }
 }
 

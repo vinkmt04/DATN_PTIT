@@ -36,6 +36,14 @@ static int64_t s_last_interaction_us = 0;
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static esp_lcd_panel_io_handle_t s_io_handle = NULL;
 static ui_display_abort_cb_t s_abort_cb = NULL;
+static ui_display_finish_cb_t s_finish_cb = NULL;
+static lv_disp_drv_t s_disp_drv;
+
+static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
+    lv_disp_drv_t *disp_driver = (lv_disp_drv_t *)user_ctx;
+    lv_disp_flush_ready(disp_driver);
+    return false;
+}
 
 // Sự kiện bất đồng bộ gửi tới GUI Task
 typedef enum {
@@ -80,7 +88,7 @@ typedef struct {
 static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map) {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)drv->user_data;
     esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_map);
-    lv_disp_flush_ready(drv);
+    // lv_disp_flush_ready() được gọi bất đồng bộ từ callback on_color_trans_done khi SPI DMA truyền xong
 }
 
 static bool s_waking_up = false;
@@ -198,6 +206,7 @@ static void ui_display_task(void *pvParameters) {
                     case UI_EVT_CLOUD_SPEAKING:
                         st7789v_set_backlight(100);
                         ui_voice_overlay_set_status("Gemini Live đang trả lời...", UI_COLOR_SIRI_PURPLE);
+                        ui_voice_overlay_resume_anim();
                         break;
                     case UI_EVT_DISCOVERY_DEVICE:
                         st7789v_set_backlight(100);
@@ -296,7 +305,7 @@ void ui_display_init(void) {
     ((lv_font_t *)&lv_font_montserrat_14)->fallback = NULL;
 
     // 2. Khởi tạo phần cứng màn hình ST7789V
-    esp_err_t ret = st7789v_driver_init(&s_panel_handle, &s_io_handle);
+    esp_err_t ret = st7789v_driver_init(&s_panel_handle, &s_io_handle, notify_lvgl_flush_ready, &s_disp_drv);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize ST7789V driver!");
         return;
@@ -308,16 +317,16 @@ void ui_display_init(void) {
         ESP_LOGE(TAG, "Failed to initialize XPT2046 driver!");
     }
 
-    // 4. Cấp phát Double Buffer cho LVGL (16 dòng = 10.2KB x 2 = 20.4KB, tiết kiệm tối đa Internal SRAM)
-    size_t buf_size = UI_LCD_H_RES * 16 * sizeof(lv_color_t);
+    // 4. Cấp phát Double Buffer cho LVGL (20 dòng = 12.8KB x 2 = 25.6KB, tối ưu tốc độ quét)
+    size_t buf_size = UI_LCD_H_RES * 20 * sizeof(lv_color_t);
     lv_color_t *buf1 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     lv_color_t *buf2 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 
     if (!buf1 || !buf2) {
-        ESP_LOGE(TAG, "Failed to allocate DMA buffers for LVGL! Falling back to 10 lines.");
+        ESP_LOGE(TAG, "Failed to allocate 20-line DMA buffers for LVGL! Falling back to 14 lines.");
         if (buf1) free(buf1);
         if (buf2) free(buf2);
-        buf_size = UI_LCD_H_RES * 10 * sizeof(lv_color_t);
+        buf_size = UI_LCD_H_RES * 14 * sizeof(lv_color_t);
         buf1 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         buf2 = (lv_color_t *)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     }
@@ -326,14 +335,13 @@ void ui_display_init(void) {
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, buf_size / sizeof(lv_color_t));
 
     // Đăng ký Display Driver với LVGL
-    static lv_disp_drv_t disp_drv;
-    lv_disp_drv_init(&disp_drv);
-    disp_drv.hor_res = UI_LCD_H_RES;
-    disp_drv.ver_res = UI_LCD_V_RES;
-    disp_drv.flush_cb = lvgl_flush_cb;
-    disp_drv.draw_buf = &disp_buf;
-    disp_drv.user_data = s_panel_handle;
-    lv_disp_drv_register(&disp_drv);
+    lv_disp_drv_init(&s_disp_drv);
+    s_disp_drv.hor_res = UI_LCD_H_RES;
+    s_disp_drv.ver_res = UI_LCD_V_RES;
+    s_disp_drv.flush_cb = lvgl_flush_cb;
+    s_disp_drv.draw_buf = &disp_buf;
+    s_disp_drv.user_data = s_panel_handle;
+    lv_disp_drv_register(&s_disp_drv);
 
     // Đăng ký Touch Input Driver với LVGL
     static lv_indev_drv_t indev_drv;
@@ -426,6 +434,16 @@ void ui_display_set_abort_callback(ui_display_abort_cb_t cb) {
 void ui_display_trigger_abort(void) {
     if (s_abort_cb) {
         s_abort_cb();
+    }
+}
+
+void ui_display_set_finish_callback(ui_display_finish_cb_t cb) {
+    s_finish_cb = cb;
+}
+
+void ui_display_trigger_finish(void) {
+    if (s_finish_cb) {
+        s_finish_cb();
     }
 }
 
