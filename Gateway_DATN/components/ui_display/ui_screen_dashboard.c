@@ -812,26 +812,31 @@ lv_obj_t* ui_screen_dashboard_init(void) {
 
     // Header Right: Mesh Nodes Count & Circular Add Button (+)
     s_lbl_header_mesh = lv_label_create(header);
-    lv_obj_align(s_lbl_header_mesh, LV_ALIGN_RIGHT_MID, -38, 0);
+    lv_obj_align(s_lbl_header_mesh, LV_ALIGN_RIGHT_MID, -44, 0);
     lv_obj_set_style_text_color(s_lbl_header_mesh, UI_COLOR_TEXT_MUTED, 0);
     lv_obj_set_style_text_font(s_lbl_header_mesh, &ui_font_vn_14, 0);
     lv_label_set_text(s_lbl_header_mesh, "Mạng: 0 nút");
 
     // Nút tròn '+' Thêm thiết bị ở góc trên bên phải thanh Header
+    // Nâng kích thước từ 24x24 lên 32x32 px và mở rộng vùng cảm ứng (hitbox) ra toàn bộ góc phải
     lv_obj_t *btn_hdr_add = lv_btn_create(header);
-    lv_obj_set_size(btn_hdr_add, 24, 24);
-    lv_obj_align(btn_hdr_add, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_set_size(btn_hdr_add, 32, 32);
+    lv_obj_align(btn_hdr_add, LV_ALIGN_RIGHT_MID, -4, 0);
     lv_obj_set_style_radius(btn_hdr_add, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(btn_hdr_add, lv_color_hex(0xE5E5EA), 0);
+    lv_obj_set_style_bg_color(btn_hdr_add, lv_color_hex(0xD1D5DB), LV_STATE_PRESSED); // Phản hồi thị giác khi chạm
     lv_obj_set_style_border_color(btn_hdr_add, UI_COLOR_CARD_BORDER, 0);
     lv_obj_set_style_border_width(btn_hdr_add, 1, 0);
     lv_obj_set_style_pad_all(btn_hdr_add, 0, 0);
     lv_obj_set_style_shadow_width(btn_hdr_add, 0, 0);
+
+    // Mở rộng vùng chạm (Extended Click Area) thêm 8px -> Hitbox đạt 48x48px (phủ trọn góc màn hình)
+    lv_obj_set_ext_click_area(btn_hdr_add, 8);
     lv_obj_add_event_cb(btn_hdr_add, btn_add_dev_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *icon_hdr_plus = lv_label_create(btn_hdr_add);
     lv_obj_center(icon_hdr_plus);
-    lv_obj_set_style_text_font(icon_hdr_plus, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(icon_hdr_plus, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(icon_hdr_plus, UI_COLOR_ACCENT_BLUE, 0);
     lv_label_set_text(icon_hdr_plus, LV_SYMBOL_PLUS);
 
@@ -921,10 +926,12 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_align(s_icon_relay_btn, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_radius(s_icon_relay_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_icon_relay_btn, lv_color_hex(0xF2F2F7), 0);
+    lv_obj_set_style_bg_color(s_icon_relay_btn, lv_color_hex(0xD1D5DB), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_icon_relay_btn, 0, 0);
     lv_obj_set_style_pad_all(s_icon_relay_btn, 0, 0);
     lv_obj_clear_flag(s_icon_relay_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_icon_relay_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_icon_relay_btn, 6);
     lv_obj_add_event_cb(s_icon_relay_btn, icon_relay_event_cb, LV_EVENT_CLICKED, NULL);
 
     s_icon_relay = lv_label_create(s_icon_relay_btn);
@@ -964,10 +971,12 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_align(s_icon_dimmer_btn, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_set_style_radius(s_icon_dimmer_btn, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xF2F2F7), 0);
+    lv_obj_set_style_bg_color(s_icon_dimmer_btn, lv_color_hex(0xD1D5DB), LV_STATE_PRESSED);
     lv_obj_set_style_border_width(s_icon_dimmer_btn, 0, 0);
     lv_obj_set_style_pad_all(s_icon_dimmer_btn, 0, 0);
     lv_obj_clear_flag(s_icon_dimmer_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_icon_dimmer_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(s_icon_dimmer_btn, 6);
     lv_obj_add_event_cb(s_icon_dimmer_btn, icon_dimmer_event_cb, LV_EVENT_CLICKED, NULL);
 
     s_bulb_head = lv_obj_create(s_icon_dimmer_btn);
@@ -977,6 +986,8 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_bg_color(s_bulb_head, lv_color_hex(0xD1D5DB), 0);
     lv_obj_set_style_border_width(s_bulb_head, 0, 0);
     lv_obj_clear_flag(s_bulb_head, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_bulb_head, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_bulb_head, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     s_bulb_base = lv_obj_create(s_icon_dimmer_btn);
     lv_obj_set_size(s_bulb_base, 8, 5);
@@ -985,6 +996,8 @@ lv_obj_t* ui_screen_dashboard_init(void) {
     lv_obj_set_style_bg_color(s_bulb_base, lv_color_hex(0x9CA3AF), 0);
     lv_obj_set_style_border_width(s_bulb_base, 0, 0);
     lv_obj_clear_flag(s_bulb_base, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(s_bulb_base, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_bulb_base, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     s_lbl_dimmer_val = lv_label_create(s_card_dimmer);
     lv_obj_align(s_lbl_dimmer_val, LV_ALIGN_TOP_RIGHT, 0, 12);

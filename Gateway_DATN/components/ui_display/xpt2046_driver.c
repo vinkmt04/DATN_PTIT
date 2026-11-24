@@ -9,13 +9,19 @@ static const char *TAG = "xpt2046_driver";
 
 static spi_device_handle_t s_spi_touch = NULL;
 
-// Thông số hiệu chuẩn chuẩn xác đo trực tiếp từ 4 góc màn hình thực tế của người dùng:
-// Trái-Trên: X~3600, Y~3500  | Phải-Trên: X~480, Y~3300
-// Trái-Dưới: X~3400, Y~600   | Phải-Dưới: X~510, Y~640
-#define XPT2046_CALIB_X_MIN   480   // Bên Phải màn hình (X = 320)
-#define XPT2046_CALIB_X_MAX   3600  // Bên Trái màn hình (X = 0)
-#define XPT2046_CALIB_Y_MIN   600   // Ở Dưới đáy màn hình (Y = 240)
-#define XPT2046_CALIB_Y_MAX   3500  // Ở Trên đỉnh màn hình (Y = 0)
+// Thông số hiệu chuẩn 4 góc đo trực tiếp từ phần cứng thực tế của người dùng:
+// Trái-Trên (TL: X=0,   Y=0  ): Raw_X ~ 3600, Raw_Y ~ 3500
+// Phải-Trên (TR: X=320, Y=0  ): Raw_X ~ 480,  Raw_Y ~ 3300
+// Trái-Dưới (BL: X=0,   Y=240): Raw_X ~ 3400, Raw_Y ~ 600
+// Phải-Dưới (BR: X=320, Y=240): Raw_X ~ 510,  Raw_Y ~ 640
+#define CALIB_TL_X   3600
+#define CALIB_TL_Y   3500
+#define CALIB_TR_X   480
+#define CALIB_TR_Y   3300
+#define CALIB_BL_X   3400
+#define CALIB_BL_Y   600
+#define CALIB_BR_X   510
+#define CALIB_BR_Y   640
 
 #define CMD_READ_X      0x90 // Lệnh đọc kênh X (12-bit)
 #define CMD_READ_Y      0xD0 // Lệnh đọc kênh Y (12-bit)
@@ -141,14 +147,25 @@ bool xpt2046_read(int16_t *x, int16_t *y) {
     ESP_LOGI(TAG, "Touch Raw ADC -> X: %u, Y: %u", raw_x, raw_y);
 #endif
 
-    // Ánh xạ toạ độ chuẩn hoá từ dữ liệu hiệu chuẩn 4 góc thực tế của người dùng:
-    // Trục X: raw_x chạy từ X_MAX (~3600 bên trái = 0) xuống X_MIN (~480 bên phải = 320)
-    int32_t calc_x = ((int32_t)(XPT2046_CALIB_X_MAX - raw_x) * UI_LCD_H_RES) / (XPT2046_CALIB_X_MAX - XPT2046_CALIB_X_MIN);
+    // Ánh xạ toạ độ Bilinear 4 góc (Bilinear Interpolation):
+    // Khắc phục triệt để độ lệch nghiêng của tấm kính điện trở (đặc biệt ở góc trên bên phải
+    // nơi Y_max chỉ đạt ~3300 thay vì 3500, tránh làm thụt toạ độ Y xuống 17px khiến lệch nút '+')
 
-    // Trục Y: raw_y chạy từ Y_MAX (~3500 đỉnh trên = 0) xuống Y_MIN (~600 đáy dưới = 240)
-    int32_t calc_y = ((int32_t)(XPT2046_CALIB_Y_MAX - raw_y) * UI_LCD_V_RES) / (XPT2046_CALIB_Y_MAX - XPT2046_CALIB_Y_MIN);
+    // 1. Tính toán biên trên (y_top) và biên dưới (y_bot) tại cột raw_x
+    int32_t y_top = CALIB_TR_Y + ((int32_t)(raw_x - CALIB_TR_X) * (CALIB_TL_Y - CALIB_TR_Y)) / (CALIB_TL_X - CALIB_TR_X);
+    int32_t y_bot = CALIB_BR_Y - ((int32_t)(raw_x - CALIB_BR_X) * (CALIB_BR_Y - CALIB_BL_Y)) / (CALIB_BL_X - CALIB_BR_X);
+    int32_t y_span = y_top - y_bot;
+    if (y_span <= 0) y_span = 1;
+    int32_t calc_y = ((int32_t)(y_top - raw_y) * UI_LCD_V_RES) / y_span;
 
-    // Giới hạn biên màn hình
+    // 2. Tính toán biên trái (x_left) và biên phải (x_right) tại hàng raw_y
+    int32_t x_left = CALIB_BL_X + ((int32_t)(raw_y - CALIB_BL_Y) * (CALIB_TL_X - CALIB_BL_X)) / (CALIB_TL_Y - CALIB_BL_Y);
+    int32_t x_right = CALIB_BR_X - ((int32_t)(raw_y - CALIB_BR_Y) * (CALIB_BR_X - CALIB_TR_X)) / (CALIB_TR_Y - CALIB_BR_Y);
+    int32_t x_span = x_left - x_right;
+    if (x_span <= 0) x_span = 1;
+    int32_t calc_x = ((int32_t)(x_left - raw_x) * UI_LCD_H_RES) / x_span;
+
+    // 3. Giới hạn biên màn hình LCD
     if (calc_x < 0) calc_x = 0;
     if (calc_x >= UI_LCD_H_RES) calc_x = UI_LCD_H_RES - 1;
     if (calc_y < 0) calc_y = 0;
