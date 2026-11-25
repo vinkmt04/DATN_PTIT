@@ -171,6 +171,7 @@ void ui_voice_overlay_init(void) {
 void ui_voice_overlay_show(void) {
     if (!s_overlay_container) return;
     lv_obj_clear_flag(s_overlay_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_overlay_container);
     if (s_btn_finish) {
         lv_obj_clear_flag(s_btn_finish, LV_OBJ_FLAG_HIDDEN);
     }

@@ -21,6 +21,7 @@ static const char *TAG = "iot_cloud";
 
 static esp_mqtt_client_handle_t s_mqtt_client = NULL;
 static volatile bool s_is_connected = false;
+static volatile bool s_mqtt_started = false;
 
 static void on_gateway_state_changed(const gateway_device_state_t *new_state) {
     if (!s_is_connected || !s_mqtt_client) return;
@@ -236,15 +237,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
 static void on_wifi_ip_event(void *arg, esp_event_base_t base, int32_t event_id, void *event_data) {
     if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ESP_LOGI(TAG, "Wi-Fi acquired IP -> Starting ThingsBoard MQTT client...");
-        if (s_mqtt_client) {
-            esp_mqtt_client_start(s_mqtt_client);
+        if (s_mqtt_client && !s_mqtt_started) {
+            ESP_LOGI(TAG, "Wi-Fi acquired IP -> Starting ThingsBoard MQTT client...");
+            if (esp_mqtt_client_start(s_mqtt_client) == ESP_OK) {
+                s_mqtt_started = true;
+            }
         }
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Wi-Fi disconnected -> Pausing ThingsBoard MQTT client...");
         s_is_connected = false;
-        if (s_mqtt_client) {
+        if (s_mqtt_client && s_mqtt_started) {
+            ESP_LOGW(TAG, "Wi-Fi disconnected -> Pausing ThingsBoard MQTT client...");
             esp_mqtt_client_stop(s_mqtt_client);
+            s_mqtt_started = false;
         }
     }
 }
@@ -270,8 +274,12 @@ void iot_cloud_init(void) {
     esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, on_wifi_ip_event, NULL, NULL);
 
     if (sys_core_is_wifi_connected()) {
-        ESP_LOGI(TAG, "Wi-Fi already connected -> Starting ThingsBoard MQTT immediately");
-        esp_mqtt_client_start(s_mqtt_client);
+        if (s_mqtt_client && !s_mqtt_started) {
+            ESP_LOGI(TAG, "Wi-Fi already connected -> Starting ThingsBoard MQTT immediately");
+            if (esp_mqtt_client_start(s_mqtt_client) == ESP_OK) {
+                s_mqtt_started = true;
+            }
+        }
     } else {
         ESP_LOGI(TAG, "Wi-Fi not connected yet. ThingsBoard MQTT will start automatically when IP is assigned.");
     }

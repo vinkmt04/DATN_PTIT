@@ -148,16 +148,17 @@ bool ei_command_classify(const int16_t *audio_buffer, size_t num_samples,
     int16_t robust_peak = frame_peaks[NUM_FRAMES - 2]; // index 18
 
     const int16_t TARGET_PEAK = 24500;
+    const float max_gain = (robust_peak < 220) ? 6.0f : 14.0f;
     if (robust_peak > 150) {
         s_command_gain = (float)TARGET_PEAK / (float)robust_peak;
-        if (s_command_gain > 14.0f) s_command_gain = 14.0f; // Giới hạn khuếch đại tối đa x14.0 (+23 dB) giống dataset_recorder
+        if (s_command_gain > max_gain) s_command_gain = max_gain;
         if (s_command_gain < 1.0f) s_command_gain = 1.0f;
     } else {
         s_command_gain = 4.0f; // Mức cơ sở khi im lặng / sàn ồn
     }
 
-    ESP_LOGI(TAG, "[COMMAND AUTO-GAIN] RobustPeak(95%%): %d, MaxPeak: %d, Gain: x%.2f -> Boosted: %d (Target ~24500, Max x14.0)", 
-             robust_peak, frame_peaks[NUM_FRAMES - 1], s_command_gain, (int)(robust_peak * s_command_gain));
+    ESP_LOGI(TAG, "[COMMAND AUTO-GAIN] RobustPeak(95%%): %d, MaxPeak: %d, Gain: x%.2f -> Boosted: %d (Target ~24500, Max x%.1f)", 
+             robust_peak, frame_peaks[NUM_FRAMES - 1], s_command_gain, (int)(robust_peak * s_command_gain), max_gain);
 
     s_raw_audio_ptr = audio_buffer;
     s_raw_audio_len = num_samples;

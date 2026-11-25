@@ -135,7 +135,7 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         if (target_gain < 1.0f) target_gain = 1.0f;
         // Fast attack khi bắt đầu có giọng nói để nhanh chóng đạt mức khuếch đại chuẩn (tránh làm tụt boosted peak)
         if (target_gain > s_smooth_gain) {
-            s_smooth_gain = 0.4f * s_smooth_gain + 0.6f * target_gain;
+            s_smooth_gain = 0.25f * s_smooth_gain + 0.75f * target_gain;
         } else {
             s_smooth_gain = 0.7f * s_smooth_gain + 0.3f * target_gain;
         }
@@ -274,13 +274,13 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
     // - Trường hợp B: Điểm từ 75% -> 91% (vùng nhạy cảm dễ trùng tông Siri): BẮT BUỘC similar <= 4% và unknown <= 10%
     // Nếu đạt 75% - 90% nhưng similar > 4% (nghi vấn "Hey Siri"), KHÔNG kích hoạt ở Nhánh 1,
     // mà để nó rơi xuống Nhánh 2 (Dual-Slice Accumulator) chờ lát cắt 250ms tiếp theo xác nhận!
-    bool is_clean_ultra_peak = (hey_cherry_score >= 0.92f) &&
-                               (similar_score < 0.06f) &&
+    bool is_clean_ultra_peak = (hey_cherry_score >= 0.90f) &&
+                               (similar_score < 0.08f) &&
                                (hey_cherry_score > unknown_score);
 
-    bool is_clean_standard_peak = (hey_cherry_score >= EI_WAKEWORD_PEAK_THRESHOLD && hey_cherry_score < 0.92f) &&
-                                  (similar_score <= 0.04f) &&
-                                  (unknown_score <= 0.10f) &&
+    bool is_clean_standard_peak = (hey_cherry_score >= EI_WAKEWORD_PEAK_THRESHOLD && hey_cherry_score < 0.90f) &&
+                                  (similar_score <= 0.08f) &&
+                                  (unknown_score <= 0.15f) &&
                                   ((hey_cherry_score - similar_score) >= 0.50f) &&
                                   (hey_cherry_score > unknown_score);
 
@@ -302,9 +302,8 @@ bool ei_wakeword_process_slice(const int16_t *audio_chunk, size_t chunk_samples,
         float avg_score = (s_prev_hey_cherry_score + hey_cherry_score) * 0.5f;
         bool is_dual_trigger = (avg_score >= EI_WAKEWORD_AVERAGE_THRESHOLD) &&
                                ((hey_cherry_score - similar_score) >= EI_WAKEWORD_DUAL_MARGIN) &&
-                               (similar_score < EI_WAKEWORD_SIMILAR_MAX) &&
-                               (similar_score <= 0.08f) &&
-                               (s_prev_similar_score <= 0.12f) &&
+                               (similar_score <= 0.12f) &&
+                               (s_prev_similar_score <= 0.15f) &&
                                (hey_cherry_score > unknown_score);
 
         if (is_dual_trigger) {

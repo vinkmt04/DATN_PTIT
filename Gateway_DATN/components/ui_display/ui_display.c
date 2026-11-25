@@ -29,6 +29,7 @@ static QueueHandle_t s_ui_event_queue = NULL;
 static lv_obj_t *s_scr_splash = NULL;
 static lv_obj_t *s_scr_idle = NULL;
 static lv_obj_t *s_scr_dash = NULL;
+static lv_timer_t *s_toast_hide_timer = NULL;
 
 static volatile bool s_in_splash = true;
 static volatile bool s_is_idle = false;
@@ -140,7 +141,15 @@ static void lv_tick_task(void *arg) {
     lv_tick_inc(5); // 5ms tick
 }
 
+static void cancel_toast_hide_timer(void) {
+    if (s_toast_hide_timer != NULL) {
+        lv_timer_del(s_toast_hide_timer);
+        s_toast_hide_timer = NULL;
+    }
+}
+
 static void auto_hide_toast_cb(lv_timer_t *tmr) {
+    s_toast_hide_timer = NULL;
     ui_voice_overlay_hide();
     lv_timer_del(tmr);
 }
@@ -180,10 +189,12 @@ static void ui_display_task(void *pvParameters) {
                         ui_screen_idle_update_sensors(msg.data.state.temperature, msg.data.state.humidity, msg.data.state.sensor_valid);
                         break;
                     case UI_EVT_VOICE_SHOW:
+                        cancel_toast_hide_timer();
                         st7789v_set_backlight(100);
                         ui_voice_overlay_show();
                         break;
                     case UI_EVT_VOICE_HIDE:
+                        cancel_toast_hide_timer();
                         ui_voice_overlay_hide();
                         s_last_interaction_us = esp_timer_get_time();
                         break;
@@ -191,6 +202,7 @@ static void ui_display_task(void *pvParameters) {
                         ui_voice_overlay_set_rms(msg.data.rms);
                         break;
                     case UI_EVT_COMMAND_DONE: {
+                        cancel_toast_hide_timer();
                         st7789v_set_backlight(100);
                         if (s_is_idle) {
                             s_is_idle = false;
@@ -199,11 +211,12 @@ static void ui_display_task(void *pvParameters) {
                         char toast_buf[64];
                         snprintf(toast_buf, sizeof(toast_buf), "Đã thực hiện • %lums (Cục bộ)", (unsigned long)msg.data.cmd.latency);
                         ui_voice_overlay_set_status(toast_buf, UI_COLOR_ACCENT_GREEN);
-                        lv_timer_create(auto_hide_toast_cb, 2000, NULL);
+                        s_toast_hide_timer = lv_timer_create(auto_hide_toast_cb, 2000, NULL);
                         s_last_interaction_us = esp_timer_get_time();
                         break;
                     }
                     case UI_EVT_CLOUD_SPEAKING:
+                        cancel_toast_hide_timer();
                         st7789v_set_backlight(100);
                         ui_voice_overlay_set_status("Gemini Live đang trả lời...", UI_COLOR_SIRI_PURPLE);
                         ui_voice_overlay_resume_anim();

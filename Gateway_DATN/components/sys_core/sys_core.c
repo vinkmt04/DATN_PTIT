@@ -44,6 +44,7 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static int s_retry_num = 0;
 static bool s_is_connected = false;
+static volatile bool s_wifi_connecting = false;
 static bool s_is_provisioned = false;
 static TimerHandle_t s_reconnect_timer = NULL;
 static sys_core_is_busy_cb_t s_voice_busy_cb = NULL;
@@ -61,8 +62,10 @@ void sys_core_set_voice_busy_check(sys_core_is_busy_cb_t cb) {
 
 static void wifi_reconnect_timer_cb(TimerHandle_t xTimer) {
     (void)xTimer;
-    if (s_is_connected) {
-        if (s_reconnect_timer) xTimerStop(s_reconnect_timer, 0);
+    if (s_is_connected || s_wifi_connecting) {
+        if (s_is_connected && s_reconnect_timer) {
+            xTimerStop(s_reconnect_timer, 0);
+        }
         return;
     }
 
@@ -77,12 +80,16 @@ static void wifi_reconnect_timer_cb(TimerHandle_t xTimer) {
 
     s_retry_num++;
     uint32_t next_ms = calculate_backoff_ms(s_retry_num);
-    ESP_LOGI(TAG, ">>> [WIFI_RECONNECT] Thử kết nối lại Wi-Fi lần %d (chu kỳ kế: %lums) <<<",
-             s_retry_num, (unsigned long)next_ms);
-    esp_wifi_connect();
-
-    if (s_reconnect_timer) {
-        xTimerChangePeriod(s_reconnect_timer, pdMS_TO_TICKS(next_ms), 0);
+    ESP_LOGI(TAG, ">>> [WIFI_RECONNECT] Thử kết nối lại Wi-Fi lần %d <<<", s_retry_num);
+    s_wifi_connecting = true;
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        s_wifi_connecting = false;
+        ESP_LOGW(TAG, "[WIFI_RECONNECT] esp_wifi_connect() trả lỗi 0x%x -> Hẹn lại sau %lums",
+                 (int)err, (unsigned long)next_ms);
+        if (s_reconnect_timer) {
+            xTimerChangePeriod(s_reconnect_timer, pdMS_TO_TICKS(next_ms), 0);
+        }
     }
 }
 
@@ -128,11 +135,16 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_set_max_tx_power(68); // 17 dBm: giảm ~40% xung dòng đỉnh 3.3V, hạn chế gợn nguồn vào mic INMP441
-        esp_wifi_connect();
+        s_wifi_connecting = true;
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            s_wifi_connecting = false;
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         esp_wifi_set_ps(WIFI_PS_NONE);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_is_connected = false;
+        s_wifi_connecting = false;
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         uint32_t initial_delay = calculate_backoff_ms(s_retry_num);
         ESP_LOGW(TAG, "Wi-Fi disconnected (reason: %d). Sẽ tự động kết nối lại nhanh sau %lums...",
@@ -149,6 +161,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, ">>> [WIFI CONNECTED] Đã nhận địa chỉ IP: " IPSTR " <<<", IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         s_is_connected = true;
+        s_wifi_connecting = false;
         // Tắt hoàn toàn Modem Sleep của Wi-Fi để đảm bảo độ trễ thấp nhất và không bao giờ rớt gói tin WebSocket audio
         esp_wifi_set_ps(WIFI_PS_NONE);
         if (s_reconnect_timer) {
