@@ -59,13 +59,16 @@ static void anim_timer_cb(lv_timer_t *timer) {
 void ui_voice_overlay_init(void) {
     if (s_overlay_container) return;
 
-    // Lớp phủ trên cùng (Toàn màn hình 320x240) với nền đen đặc phẳng hoàn toàn không khung viền rườm rà
+    // Lớp phủ trên cùng (Toàn màn hình 320x240) vuông góc 100%, phủ kín 4 góc không khung viền
     s_overlay_container = lv_obj_create(lv_layer_top());
     lv_obj_set_size(s_overlay_container, UI_LCD_H_RES, UI_LCD_V_RES);
     lv_obj_align(s_overlay_container, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_overlay_container, UI_COLOR_STANDBY_BG, 0); // 0x0B0E14 Nền đen sâu
     lv_obj_set_style_bg_opa(s_overlay_container, LV_OPA_COVER, 0);         // 100% Opaque -> Render tức thì
+    lv_obj_set_style_radius(s_overlay_container, 0, 0);                    // Vuông góc 4 cạnh (bỏ bo góc mặc định của LVGL card theme)
     lv_obj_set_style_border_width(s_overlay_container, 0, 0);              // Bỏ khung viền bao quanh
+    lv_obj_set_style_outline_width(s_overlay_container, 0, 0);
+    lv_obj_set_style_shadow_width(s_overlay_container, 0, 0);
     lv_obj_set_style_pad_all(s_overlay_container, 0, 0);
     lv_obj_clear_flag(s_overlay_container, LV_OBJ_FLAG_SCROLLABLE);
 

@@ -17,8 +17,11 @@ void ai_cloud_prewarm_session(void);
 // Đóng phiên WebSocket ngầm ngay lập tức (dùng khi nhận diện lệnh nội bộ thành công hoặc kết thúc lượt nói)
 void ai_cloud_stop_session(void);
 
-// Bắt đầu một phiên ghi âm người dùng (chuyển sang RECORDING, sẵn sàng stream âm thanh)
+// Bắt đầu một phiên ghi âm người dùng (chuyển sang BUFFERING, gom âm thanh chờ quyết định Model 2)
 bool ai_cloud_start_turn(void);
+
+// Chốt chuyển từ BUFFERING sang RECORDING để truyền thực sự lên Google Live API
+void ai_cloud_commit_turn(void);
 
 // Gửi một chunk âm thanh PCM vào TX RingBuffer (Hoàn toàn bất đồng bộ, không bao giờ làm đơ luồng mic)
 void ai_cloud_send_audio_chunk(const uint8_t *data, size_t size);

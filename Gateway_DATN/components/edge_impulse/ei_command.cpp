@@ -100,36 +100,64 @@ bool ei_command_classify(const int16_t *audio_buffer, size_t num_samples,
                          float *out_confidence, const char **out_label) {
     if (audio_buffer == nullptr || num_samples == 0) return false;
 
-    // Chuẩn hóa đỉnh âm thanh (Peak Normalization) khớp 100% với dữ liệu huấn luyện dataset_recorder_main.c (Target Peak = 24500, Max Gain = 14.0x)
-    // Áp dụng lọc 3-point median để loại bỏ 100% gai nhiễu điện tử click/pop đơn lẻ, phản ánh đúng đỉnh giọng nói
-    int16_t max_peak = 0;
-    if (num_samples >= 3) {
-        for (size_t i = 1; i < num_samples - 1; i++) {
-            int16_t v0 = abs(audio_buffer[i - 1]);
-            int16_t v1 = abs(audio_buffer[i]);
-            int16_t v2 = abs(audio_buffer[i + 1]);
-            int16_t med = (v0 < v1) ? ((v1 < v2) ? v1 : ((v0 < v2) ? v2 : v0))
-                                    : ((v0 < v2) ? v0 : ((v1 < v2) ? v2 : v1));
-            if (med > max_peak) max_peak = med;
+    // Chuẩn hóa đỉnh âm thanh đa khung (Multi-Frame Robust Peak Normalization)
+    // Chia 19,200 samples thành 20 frames (mỗi frame 960 samples = 60ms)
+    // Lấy 3-point median peak của từng frame, sắp xếp tăng dần và chọn frame_peaks[18] (đỉnh cao thứ 2, ~95th percentile)
+    // Loại bỏ 100% tiếng va chạm, tiếng click pop đột biến và không bị phụ thuộc vào 1 đỉnh giả
+    const size_t NUM_FRAMES = 20;
+    const size_t FRAME_SIZE = 960; // 20 * 960 = 19200 = EI_COMMAND_WINDOW_SAMPLES
+    int16_t frame_peaks[NUM_FRAMES] = {0};
+
+    for (size_t f = 0; f < NUM_FRAMES; f++) {
+        size_t start_idx = f * FRAME_SIZE;
+        size_t end_idx = start_idx + FRAME_SIZE;
+        if (end_idx > num_samples) end_idx = num_samples;
+        if (start_idx >= end_idx) break;
+
+        int16_t f_peak = 0;
+        if (end_idx - start_idx >= 3) {
+            for (size_t i = start_idx + 1; i < end_idx - 1; i++) {
+                int16_t v0 = abs(audio_buffer[i - 1]);
+                int16_t v1 = abs(audio_buffer[i]);
+                int16_t v2 = abs(audio_buffer[i + 1]);
+                int16_t med = (v0 < v1) ? ((v1 < v2) ? v1 : ((v0 < v2) ? v2 : v0))
+                                        : ((v0 < v2) ? v0 : ((v1 < v2) ? v2 : v1));
+                if (med > f_peak) f_peak = med;
+            }
+        } else {
+            for (size_t i = start_idx; i < end_idx; i++) {
+                int16_t abs_v = abs(audio_buffer[i]);
+                if (abs_v > f_peak) f_peak = abs_v;
+            }
         }
-    } else {
-        for (size_t i = 0; i < num_samples; i++) {
-            int16_t abs_v = abs(audio_buffer[i]);
-            if (abs_v > max_peak) max_peak = abs_v;
-        }
+        frame_peaks[f] = f_peak;
     }
 
+    // Sắp xếp đơn giản frame_peaks (insertion sort 20 phần tử)
+    for (size_t i = 1; i < NUM_FRAMES; i++) {
+        int16_t key = frame_peaks[i];
+        int j = (int)i - 1;
+        while (j >= 0 && frame_peaks[j] > key) {
+            frame_peaks[j + 1] = frame_peaks[j];
+            j--;
+        }
+        frame_peaks[j + 1] = key;
+    }
+
+    // Chọn robust_peak = frame_peaks[18] (vị trí 19/20, loại bỏ outlier cao nhất)
+    int16_t robust_peak = frame_peaks[NUM_FRAMES - 2]; // index 18
+
     const int16_t TARGET_PEAK = 24500;
-    if (max_peak > 150) {
-        s_command_gain = (float)TARGET_PEAK / (float)max_peak;
+    if (robust_peak > 150) {
+        s_command_gain = (float)TARGET_PEAK / (float)robust_peak;
         if (s_command_gain > 14.0f) s_command_gain = 14.0f; // Giới hạn khuếch đại tối đa x14.0 (+23 dB) giống dataset_recorder
         if (s_command_gain < 1.0f) s_command_gain = 1.0f;
     } else {
         s_command_gain = 4.0f; // Mức cơ sở khi im lặng / sàn ồn
     }
 
-    ESP_LOGI(TAG, "[COMMAND AUTO-GAIN] RawPeak: %d, Gain: x%.2f -> BoostedPeak: %d (Target ~24500, Max x14.0)", 
-             max_peak, s_command_gain, (int)(max_peak * s_command_gain));
+    ESP_LOGI(TAG, "[COMMAND AUTO-GAIN] RobustPeak(95%%): %d, MaxPeak: %d, Gain: x%.2f -> Boosted: %d (Target ~24500, Max x14.0)", 
+             robust_peak, frame_peaks[NUM_FRAMES - 1], s_command_gain, (int)(robust_peak * s_command_gain));
 
     s_raw_audio_ptr = audio_buffer;
     s_raw_audio_len = num_samples;

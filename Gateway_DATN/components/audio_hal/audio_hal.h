@@ -61,6 +61,9 @@ void audio_hal_apply_dc_filter(int16_t *buffer, size_t num_samples);
 // Reset trạng thái bộ lọc DC (Biquad Filter state w1, w2) để tránh sốc biên độ khi ngắt/chuyển trạng thái
 void audio_hal_reset_dc_filter(void);
 
+// Kiểm tra raw WebRTC VAD Mode 3 cho một chunk âm thanh 16kHz (chia khung 30ms = 480 mẫu)
+bool audio_vad_raw_webrtc_chunk(const int16_t *buffer, size_t num_samples);
+
 // VAD Phần Cứng Espressif (WebRTC GMM Mode 3 Very Aggressive) kết hợp cổng năng lượng âm thanh
 // Trả về true nếu phát hiện giọng nói người thật sự, đồng thời gán RMS qua out_rms (nếu out_rms != NULL)
 bool audio_vad_is_speech_chunk(int16_t *buffer, size_t num_samples, int *out_rms);

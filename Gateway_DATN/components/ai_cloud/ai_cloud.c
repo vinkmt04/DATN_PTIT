@@ -1,7 +1,6 @@
 #include "ai_cloud.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
-#include "cJSON.h"
 #include "mbedtls/base64.h"
 #include "esp_heap_caps.h"
 #include "esp_crt_bundle.h"
@@ -49,6 +48,7 @@ static unsigned char *s_rx_pcm_buf = NULL;
 
 typedef enum {
     AI_STATE_IDLE = 0,
+    AI_STATE_BUFFERING,
     AI_STATE_RECORDING,
     AI_STATE_WAITING_AI,
     AI_STATE_EXECUTING_TOOL,
@@ -61,14 +61,20 @@ typedef enum {
 #define CLOUD_EVT_CANCEL           (1 << 1) // Hủy do khớp lệnh cục bộ Model 2 hoặc No-speech
 #define CLOUD_EVT_TIMEOUT          (1 << 2) // Hết hạn Response Timeout từ software timer
 #define CLOUD_EVT_KEEP_ALIVE_EXP   (1 << 3) // Hết hạn 15s Keep-Alive pool
-#define CLOUD_EVT_START_TURN       (1 << 4) // Bắt đầu lượt thu âm mới
+#define CLOUD_EVT_START_TURN       (1 << 4) // Bắt đầu lượt thu âm mới (BUFFERING)
 #define CLOUD_EVT_END_TURN         (1 << 5) // Dứt câu nói, xả hết audio để gửi activityEnd
 #define CLOUD_EVT_WS_CLEANUP       (1 << 6) // Đóng sạch WebSocket bị lỗi/lệch khung mà không cắt ngang Jitter Buffer loa
+#define CLOUD_EVT_WS_CONNECTED     (1 << 7) // WebSocket kết nối -> gửi Setup Frame từ cloud_tx_task
+#define CLOUD_EVT_SEND_TOOL_RESP   (1 << 8) // Tool response sẵn sàng -> gửi từ cloud_tx_task
+#define CLOUD_EVT_COMMIT_TURN      (1 << 9) // Chuyển từ BUFFERING sang RECORDING (bắt đầu stream cloud)
 
 static volatile ai_gateway_state_t s_current_state = AI_STATE_IDLE;
 static TimerHandle_t s_session_timer = NULL;
 static TimerHandle_t s_keep_alive_timer = NULL;
 static SemaphoreHandle_t ws_mutex = NULL;
+static SemaphoreHandle_t s_tx_rb_mutex = NULL;
+static SemaphoreHandle_t s_tool_resp_mutex = NULL;
+static char s_pending_tool_resp[1024] = {0};
 
 static esp_websocket_client_handle_t ws_client = NULL;
 static volatile bool s_ws_task_active = false;
@@ -84,7 +90,6 @@ static volatile bool s_turn_ending = false;
 static volatile bool s_cmd_dispatched_in_turn = false;
 static volatile bool s_mute_response_audio = false;
 static volatile bool s_ws_rx_reset_req = false;
-static volatile uint32_t s_turn_generation = 0;
 static int64_t s_tool_resp_sent_ms = 0;
 
 // RingBuffer TX: Chứa âm thanh mic từ ai_edge truyền sang (256KB trong PSRAM ~ 8 giây âm thanh)
@@ -136,6 +141,11 @@ static void recover_from_ws_failure(const char *reason, bool force_close_socket)
         if (force_close_socket && s_tx_task_handle) {
             xTaskNotify(s_tx_task_handle, CLOUD_EVT_WS_CLEANUP, eSetBits);
         }
+    } else if (s_current_state == AI_STATE_BUFFERING) {
+        ESP_LOGW(TAG, ">>> [WS RECOVERY] Kết nối Keep-Alive cũ vừa đóng (%s) khi đang BUFFERING -> Giữ nguyên lượt thu âm hiện tại! <<<", reason);
+        if (force_close_socket && s_tx_task_handle) {
+            xTaskNotify(s_tx_task_handle, CLOUD_EVT_WS_CLEANUP, eSetBits);
+        }
     } else if (s_current_state != AI_STATE_IDLE) {
         ESP_LOGE(TAG, ">>> [WS RECOVERY] %s giữa lượt (state=%d) -> Abort lượt nói! <<<", reason, (int)s_current_state);
         if (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH || s_current_state == AI_STATE_EXECUTING_TOOL) {
@@ -158,6 +168,29 @@ static void session_timer_cb(TimerHandle_t xTimer) {
     if (s_tx_task_handle) {
         xTaskNotify(s_tx_task_handle, CLOUD_EVT_TIMEOUT, eSetBits);
     }
+}
+
+static const char *find_json_key_val(const char *obj_start, const char *obj_end, const char *quoted_key) {
+    if (!obj_start || !obj_end || !quoted_key || obj_start >= obj_end) return NULL;
+    size_t key_len = strlen(quoted_key);
+    const char *cur = obj_start;
+    while (cur < obj_end) {
+        const char *found = strstr(cur, quoted_key);
+        if (!found || found + key_len > obj_end) return NULL;
+        const char *p = found + key_len;
+        while (p < obj_end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+            p++;
+        }
+        if (p < obj_end && *p == ':') {
+            p++;
+            while (p < obj_end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+                p++;
+            }
+            return (p < obj_end) ? p : NULL;
+        }
+        cur = found + key_len;
+    }
+    return NULL;
 }
 
 static void parse_server_message(const char *json_string) {
@@ -183,8 +216,8 @@ static void parse_server_message(const char *json_string) {
         return;
     }
 
-    // 2. Bắt lỗi từ máy chủ Google API
-    if (strstr(json_string, "\"error\"")) {
+    // 2. Bắt lỗi từ máy chủ Google API (Chỉ kích hoạt nếu không phải trường error nằm trong serverContent hoặc toolCall)
+    if (!strstr(json_string, "\"serverContent\"") && !strstr(json_string, "\"toolCall\"") && strstr(json_string, "\"error\"")) {
         ESP_LOGE(TAG, "Gemini API Server Error: %s", json_string);
         ai_cloud_abort();
         return;
@@ -304,18 +337,17 @@ static void parse_server_message(const char *json_string) {
             }
             if (!obj_end) break;
 
-            // Kiểm tra xem trong {...} này có chứa "name": không
-            const char *name_key = strstr(obj_search, "\"name\":");
-            if (!name_key || name_key > obj_end) {
+            // Kiểm tra xem trong {...} này có chứa "name" : ... không
+            const char *name_val = find_json_key_val(obj_search, obj_end, "\"name\"");
+            if (!name_val) {
                 obj_search = obj_end + 1;
                 continue;
             }
 
             // 1. Trích xuất fn_name
             char fn_name[64] = {0};
-            const char *n_start = strchr(name_key + 7, '\"');
-            if (n_start && n_start < obj_end) {
-                n_start++;
+            if (*name_val == '\"') {
+                const char *n_start = name_val + 1;
                 const char *n_end = strchr(n_start, '\"');
                 if (n_end && n_end <= obj_end) {
                     size_t n_len = n_end - n_start;
@@ -327,44 +359,38 @@ static void parse_server_message(const char *json_string) {
 
             // 2. Trích xuất call_id
             char call_id[64] = {0};
-            const char *id_key = strstr(obj_search, "\"id\":");
-            if (id_key && id_key < obj_end) {
-                const char *id_start = strchr(id_key + 5, '\"');
-                if (id_start && id_start < obj_end) {
-                    id_start++;
-                    const char *id_end = strchr(id_start, '\"');
-                    if (id_end && id_end <= obj_end) {
-                        size_t id_len = id_end - id_start;
-                        if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
-                        memcpy(call_id, id_start, id_len);
-                        call_id[id_len] = '\0';
-                    }
+            const char *id_val = find_json_key_val(obj_search, obj_end, "\"id\"");
+            if (id_val && *id_val == '\"') {
+                const char *id_start = id_val + 1;
+                const char *id_end = strchr(id_start, '\"');
+                if (id_end && id_end <= obj_end) {
+                    size_t id_len = id_end - id_start;
+                    if (id_len >= sizeof(call_id)) id_len = sizeof(call_id) - 1;
+                    memcpy(call_id, id_start, id_len);
+                    call_id[id_len] = '\0';
                 }
             }
 
             // 3. Trích xuất action
             char action[32] = {0};
-            const char *act_key = strstr(obj_search, "\"action\":");
-            if (act_key && act_key < obj_end) {
-                const char *a_start = strchr(act_key + 9, '\"');
-                if (a_start && a_start < obj_end) {
-                    a_start++;
-                    const char *a_end = strchr(a_start, '\"');
-                    if (a_end && a_end <= obj_end) {
-                        size_t a_len = a_end - a_start;
-                        if (a_len >= sizeof(action)) a_len = sizeof(action) - 1;
-                        memcpy(action, a_start, a_len);
-                        action[a_len] = '\0';
-                    }
+            const char *act_val = find_json_key_val(obj_search, obj_end, "\"action\"");
+            if (act_val && *act_val == '\"') {
+                const char *a_start = act_val + 1;
+                const char *a_end = strchr(a_start, '\"');
+                if (a_end && a_end <= obj_end) {
+                    size_t a_len = a_end - a_start;
+                    if (a_len >= sizeof(action)) a_len = sizeof(action) - 1;
+                    memcpy(action, a_start, a_len);
+                    action[a_len] = '\0';
                 }
             }
 
             // 4. Trích xuất brightness
             int brightness = -1;
-            const char *b_key = strstr(obj_search, "\"brightness\":");
-            if (b_key && b_key < obj_end) {
-                const char *bp = b_key + 13;
-                while (bp < obj_end && (*bp < '0' || *bp > '9') && *bp != '\"') bp++;
+            const char *b_val = find_json_key_val(obj_search, obj_end, "\"brightness\"");
+            if (b_val) {
+                const char *bp = b_val;
+                if (*bp == '\"') bp++;
                 if (bp < obj_end && *bp >= '0' && *bp <= '9') {
                     sscanf(bp, "%d", &brightness);
                 }
@@ -447,23 +473,25 @@ static void parse_server_message(const char *json_string) {
         }
 
         // Gửi toolResponse phản hồi cho Google Live API để hoàn tất giao thức
-        if (call_count > 0 && ws_client && s_is_ws_connected) {
-            char tool_resp_buf[768];
-            snprintf(tool_resp_buf, sizeof(tool_resp_buf),
-                "{\"toolResponse\":{\"functionResponses\":[%s]}}",
-                func_responses_json
-            );
-            if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(300)) == pdTRUE) {
-                esp_websocket_client_send_text(ws_client, tool_resp_buf, strlen(tool_resp_buf), pdMS_TO_TICKS(4000));
+        // Kiến trúc Single-Writer TX: Copy vào s_pending_tool_resp và kích hoạt CLOUD_EVT_SEND_TOOL_RESP cho cloud_tx_task
+        if (call_count > 0) {
+            if (s_tool_resp_mutex && xSemaphoreTake(s_tool_resp_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                snprintf(s_pending_tool_resp, sizeof(s_pending_tool_resp),
+                    "{\"toolResponse\":{\"functionResponses\":[%s]}}",
+                    func_responses_json
+                );
                 s_tool_resp_sent_ms = esp_timer_get_time() / 1000;
-                ESP_LOGI(TAG, ">>> Sent toolResponse (%d functions) to Gemini Live <<<", call_count);
-                xSemaphoreGive(ws_mutex);
+                xSemaphoreGive(s_tool_resp_mutex);
+                if (s_tx_task_handle) {
+                    xTaskNotify(s_tx_task_handle, CLOUD_EVT_SEND_TOOL_RESP, eSetBits);
+                }
             }
         }
 
         // [LOCAL-SYNC SILENT EXIT / ERROR ALERT]
         if (has_tool_error) {
             s_mute_response_audio = false; // Bật loa để Gemini nói to câu cảnh báo lỗi thiết bị cho người dùng nghe!
+            expecting_first_chunk = true;  // Đảm bảo luôn mở jitter buffer mới cho audio báo lỗi
             ESP_LOGW(TAG, ">>> [TOOL ERROR] Thiết bị ngoại tuyến hoặc chưa kết nối -> Bật loa để AI nói lỗi! <<<");
         } else {
             // Điều khiển thiết bị thành công -> Giữ loa 100% im lặng, chờ turnComplete kết thúc lượt
@@ -503,10 +531,15 @@ static void parse_server_message(const char *json_string) {
                 s_current_state = AI_STATE_SPEAKING;
             }
             if (s_session_timer) {
-                xTimerStop(s_session_timer, 0);
+                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
+                xTimerReset(s_session_timer, 0);
             }
         } else if (s_current_state == AI_STATE_SPEAKING) {
-            // Đang phát luồng âm thanh bình thường
+            // Đang phát luồng âm thanh bình thường: Reset chunk watchdog timer 5s
+            if (s_session_timer) {
+                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
+                xTimerReset(s_session_timer, 0);
+            }
         } else if (s_current_state == AI_STATE_RECORDING) {
             ESP_LOGI(TAG, ">>> [SERVER VAD] Gemini phát hiện dứt câu sớm & bắt đầu trả lời! Dừng thu âm.");
             if (!s_mute_response_audio) {
@@ -514,7 +547,8 @@ static void parse_server_message(const char *json_string) {
             }
             expecting_first_chunk = true;
             if (s_session_timer) {
-                xTimerStop(s_session_timer, 0);
+                xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(CHUNK_TIMEOUT_MS), 0);
+                xTimerReset(s_session_timer, 0);
             }
         } else {
             ESP_LOGD(TAG, "Dropping lingering audio chunk in state %d", s_current_state);
@@ -670,27 +704,27 @@ static void send_setup_frame(void) {
         );
 
         int dev_idx = 1;
-#if GATEWAY_ENABLE_DIMMER
-        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
-            "%d. Đèn Dimming: %s, độ sáng %u%% (mức nhớ: %u%%). ",
-            dev_idx++, st.dimmer_on ? "BẬT" : "TẮT", st.dimmer_brightness,
-            st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80
-        );
-#endif
+        if (st.dimmer_registered) {
+            p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+                "%d. Đèn Dimming: %s, độ sáng %u%% (mức nhớ: %u%%). ",
+                dev_idx++, st.dimmer_on ? "BẬT" : "TẮT", st.dimmer_brightness,
+                st.dimmer_last_brightness > 0 ? st.dimmer_last_brightness : 80
+            );
+        }
 
-#if GATEWAY_ENABLE_RELAY
-        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
-            "%d. Công tắc Relay 1 kênh: %s. ",
-            dev_idx++, st.relay_on ? "BẬT" : "TẮT"
-        );
-#endif
+        if (st.relay_registered) {
+            p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+                "%d. Công tắc Relay 1 kênh: %s. ",
+                dev_idx++, st.relay_on ? "BẬT" : "TẮT"
+            );
+        }
 
-#if GATEWAY_ENABLE_DHT11
-        p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
-            "%d. Cảm biến DHT11: Nhiệt độ %.1f độ C, Độ ẩm %.1f%%. ",
-            dev_idx++, st.sensor_valid ? st.temperature : 28.0f, st.sensor_valid ? st.humidity : 65.0f
-        );
-#endif
+        if (st.sensor_registered) {
+            p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
+                "%d. Cảm biến DHT11: Nhiệt độ %.1f độ C, Độ ẩm %.1f%%. ",
+                dev_idx++, st.sensor_valid ? st.temperature : 28.0f, st.sensor_valid ? st.humidity : 65.0f
+            );
+        }
 
         if (dev_idx == 1) {
             p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
@@ -699,94 +733,71 @@ static void send_setup_frame(void) {
         }
 
         p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
-            "THIẾT BỊ KHÔNG CÓ: "
-#if !GATEWAY_ENABLE_DIMMER
-            "Đèn chiếu sáng; "
-#endif
-#if !GATEWAY_ENABLE_RELAY
-            "Công tắc Relay; "
-#endif
-#if !GATEWAY_ENABLE_DHT11
-            "Cảm biến nhiệt ẩm DHT11; "
-#endif
-            "Quạt, tivi, điều hòa, bình nóng lạnh, máy bơm. "
+            "THIẾT BỊ KHÔNG CÓ: %s%s%sQuạt, tivi, điều hòa, bình nóng lạnh, máy bơm. ",
+            !st.dimmer_registered ? "Đèn chiếu sáng; " : "",
+            !st.relay_registered ? "Công tắc Relay; " : "",
+            !st.sensor_registered ? "Cảm biến nhiệt ẩm DHT11; " : ""
         );
 
         p_len += snprintf(prompt_buf + p_len, 4096 - p_len,
             "QUY TẮC BẮT BUỘC: "
             "1. Luôn dùng TIẾNG VIỆT tự nhiên, thân thiện. "
             "2. XỬ LÝ TẠP ÂM/TỪ LẠ (ƯU TIÊN CAO NHẤT): Nếu nghe tiếng ồn, tiếng thở, từ vô nghĩa, tiếng lạ (như '¿Qué?', 'what', 'hả') hoặc nghe không rõ: BẮT BUỘC chỉ trả lời duy nhất: 'Tôi chưa nghe rõ, bạn vui lòng nói lại nhé.'. TUYỆT ĐỐI KHÔNG trả lời 'Nhà hiện không có thiết bị này.' khi gặp tạp âm/từ vô nghĩa. "
-            "3. THIẾT BỊ KHÔNG TỒN TẠI: Câu 'Nhà hiện tại không có thiết bị này.' CHỈ ĐƯỢC DÙNG khi người dùng gọi ĐÍCH DANH tên thiết bị không có trong nhà (ví dụ: 'bật quạt', 'tắt tivi', 'bật bình nóng lạnh', 'bật máy bơm'"
-#if !GATEWAY_ENABLE_RELAY
-            ", 'bật công tắc'"
-#endif
-#if !GATEWAY_ENABLE_DIMMER
-            ", 'bật đèn'"
-#endif
-            "). "
-#if GATEWAY_ENABLE_DIMMER
-            "4. Hàm control_dimmer CHỈ gọi khi người dùng nói 'đèn' hoặc 'ánh sáng'. Tuyệt đối không gọi cho 'công tắc', 'quạt'. "
-#endif
-#if GATEWAY_ENABLE_RELAY
-            "5. Hàm control_relay CHỈ gọi khi người dùng nói 'công tắc'. Tuyệt đối không gọi cho 'đèn', 'quạt'. "
-#endif
+            "3. THIẾT BỊ KHÔNG TỒN TẠI: Câu 'Nhà hiện tại không có thiết bị này.' CHỈ ĐƯỢC DÙNG khi người dùng gọi ĐÍCH DANH tên thiết bị không có trong nhà (ví dụ: 'bật quạt', 'tắt tivi', 'bật bình nóng lạnh', 'bật máy bơm'%s%s). "
+            "%s%s"
             "6. Tuyệt đối không tự suy diễn câu lệnh của thiết bị này sang thiết bị khác, không gọi hàm lần thứ 2 trong cùng lượt. "
             "7. Sau khi gọi hàm điều khiển: Phản hồi cực ngắn (dưới 4 từ, ví dụ: 'Đã bật đèn.', 'Đã bật công tắc.') và kết thúc lượt ngay. Nếu toolResponse trả về thông báo lỗi (như thiết bị ngoại tuyến hoặc chưa kết nối), BẮT BUỘC phải nói rõ câu báo lỗi bằng tiếng Việt cho người dùng nghe. "
-#if GATEWAY_ENABLE_DHT11
-            "8. Khi hỏi nhiệt độ, độ ẩm phòng (DHT11) hoặc trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
-#else
-            "8. Khi người dùng trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
-#endif
-            "9. Tuyệt đối không xuất thẻ XML, HTML hay SSML như <audio>."
+            "%s"
+            "9. Tuyệt đối không xuất thẻ XML, HTML hay SSML như <audio>.",
+            !st.relay_registered ? ", 'bật công tắc'" : "",
+            !st.dimmer_registered ? ", 'bật đèn'" : "",
+            st.dimmer_registered ? "4. Hàm control_dimmer CHỈ gọi khi người dùng nói 'đèn' hoặc 'ánh sáng'. Tuyệt đối không gọi cho 'công tắc', 'quạt'. " : "",
+            st.relay_registered ? "5. Hàm control_relay CHỈ gọi khi người dùng nói 'công tắc'. Tuyệt đối không gọi cho 'đèn', 'quạt'. " : "",
+            st.sensor_registered ? "8. Khi hỏi nhiệt độ, độ ẩm phòng (DHT11) hoặc trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
+                                 : "8. Khi người dùng trò chuyện, hỏi đáp kiến thức: Trả lời tự nhiên qua loa, không gọi hàm. "
         );
 
         if (p_len >= 4096) {
             ESP_LOGE(TAG, "Prompt buffer overflow! p_len=%d >= 4096", p_len);
         }
 
-        // Sinh động trường tools_json: chỉ khai báo tool cho thiết bị có cờ enable = 1 (cấp phát PSRAM)
+        // Sinh động trường tools_json: chỉ khai báo tool cho thiết bị đã đăng ký trong hệ thống (cấp phát PSRAM)
         char *tools_json = (char *)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!tools_json) tools_json = (char *)malloc(2048);
         if (tools_json) {
             tools_json[0] = '\0';
+            if (st.dimmer_registered && st.relay_registered) {
+                snprintf(tools_json, 2048, "%s",
+                    "\"tools\":[{\"functionDeclarations\":["
+                        "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
+                        "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                            "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
+                            "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
+                        "},\"required\":[\"action\"]}},"
+                        "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
+                        "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                            "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
+                        "},\"required\":[\"action\"]}}"
+                    "]}],");
+            } else if (st.dimmer_registered) {
+                snprintf(tools_json, 2048, "%s",
+                    "\"tools\":[{\"functionDeclarations\":["
+                        "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
+                        "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                            "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
+                            "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
+                        "},\"required\":[\"action\"]}}"
+                    "]}],");
+            } else if (st.relay_registered) {
+                snprintf(tools_json, 2048, "%s",
+                    "\"tools\":[{\"functionDeclarations\":["
+                        "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
+                        "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
+                            "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
+                        "},\"required\":[\"action\"]}}"
+                    "]}],");
+            }
         }
-#if GATEWAY_ENABLE_DIMMER && GATEWAY_ENABLE_RELAY
-        if (tools_json) {
-            snprintf(tools_json, 2048, "%s",
-                "\"tools\":[{\"functionDeclarations\":["
-                    "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
-                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
-                        "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
-                    "},\"required\":[\"action\"]}},"
-                    "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
-                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
-                    "},\"required\":[\"action\"]}}"
-                "]}],");
-        }
-#elif GATEWAY_ENABLE_DIMMER
-        if (tools_json) {
-            snprintf(tools_json, 2048, "%s",
-                "\"tools\":[{\"functionDeclarations\":["
-                    "{\"name\":\"control_dimmer\",\"description\":\"CHỈ dùng để điều khiển bóng đèn (bật đèn, tắt đèn, chỉnh độ sáng đèn). TUYỆT ĐỐI KHÔNG gọi hàm này khi người dùng nói công tắc, quạt hoặc thiết bị khác.\","
-                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on', 'turn_off', hoặc 'set_brightness'.\"},"
-                        "\"brightness\":{\"type\":\"INTEGER\",\"description\":\"Độ sáng từ 0 đến 100% khi action là set_brightness hoặc khi bật ở mức cụ thể.\"}"
-                    "},\"required\":[\"action\"]}}"
-                "]}],");
-        }
-#elif GATEWAY_ENABLE_RELAY
-        if (tools_json) {
-            snprintf(tools_json, 2048, "%s",
-                "\"tools\":[{\"functionDeclarations\":["
-                    "{\"name\":\"control_relay\",\"description\":\"CHỈ dùng để điều khiển công tắc Relay (bật hoặc tắt công tắc điện). TUYỆT ĐỐI KHÔNG gọi hàm này cho đèn, quạt hoặc thiết bị khác.\","
-                    "\"parameters\":{\"type\":\"OBJECT\",\"properties\":{"
-                        "\"action\":{\"type\":\"STRING\",\"description\":\"Hành động: 'turn_on' hoặc 'turn_off'.\"}"
-                    "},\"required\":[\"action\"]}}"
-                "]}],");
-        }
-#endif
 
         int setup_len = snprintf(setup_buf, 8192,
             "{\"setup\":{\"model\":\"models/gemini-3.8-live\",\"generationConfig\":{\"responseModalities\":[\"AUDIO\"]},"
@@ -802,11 +813,11 @@ static void send_setup_frame(void) {
         }
 
         if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(4000));
+            esp_websocket_client_send_text(ws_client, setup_buf, strlen(setup_buf), pdMS_TO_TICKS(1500));
             xSemaphoreGive(ws_mutex);
         }
         ESP_LOGI(TAG, "Sent Dynamic Setup message (len: %d bytes, DIMMER=%d, RELAY=%d, DHT11=%d). Waiting for setupComplete...",
-                 setup_len, GATEWAY_ENABLE_DIMMER, GATEWAY_ENABLE_RELAY, GATEWAY_ENABLE_DHT11);
+                 setup_len, st.dimmer_registered, st.relay_registered, st.sensor_registered);
 
         if (tools_json) free(tools_json);
         free(prompt_buf);
@@ -857,10 +868,10 @@ static void enqueue_rx_json_message(void) {
     }
 
     // Đẩy ngay chuỗi JSON hoàn chỉnh sang Consumer (Core 1), không giữ chân websocket_task (Core 0)
-    if (xRingbufferSend(s_rx_json_ringbuf, (void *)s_ws_rx_buf, msg_size, pdMS_TO_TICKS(15)) != pdTRUE) {
-        ESP_LOGE(TAG, "RX JSON RingBuffer full/oversized (%u bytes) -> Phục hồi & đóng phiên!",
+    // Timeout pdMS_TO_TICKS(1500). Nếu đầy, chỉ drop và log cảnh báo chứ TUYỆT ĐỐI KHÔNG tự sát gọi recover_from_ws_failure
+    if (xRingbufferSend(s_rx_json_ringbuf, (void *)s_ws_rx_buf, msg_size, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        ESP_LOGW(TAG, "RX JSON RingBuffer full/timeout (%u bytes) -> Dropped message (no suicide)",
                  (unsigned int)msg_size);
-        recover_from_ws_failure("RX JSON RingBuffer Overflow", true);
     }
 }
 
@@ -879,7 +890,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         ESP_LOGI(TAG, ">>> WEBSOCKET_EVENT_CONNECTED <<<");
         s_is_ws_connected = true;
         s_is_ws_connecting = false;
-        send_setup_frame();
+        // Kiến trúc Single-Writer TX: Gửi CLOUD_EVT_WS_CONNECTED tới cloud_tx_task để cloud_tx_task gửi setup frame
+        if (s_tx_task_handle) {
+            xTaskNotify(s_tx_task_handle, CLOUD_EVT_WS_CONNECTED, eSetBits);
+        }
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
@@ -912,6 +926,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
         break;
 
     case WEBSOCKET_EVENT_DATA:
+        if (s_ws_rx_reset_req) {
+            s_ws_rx_reset_req = false;
+            s_ws_rx_len = 0;
+        }
         if (data->op_code == 0x08) {
             uint16_t close_code = 0;
             char reason_buf[128] = {0};
@@ -1053,21 +1071,44 @@ static void cloud_rx_process_task(void *arg) {
 // Luồng truyền âm thanh độc lập & FSM Worker (Consumer):
 // Tiếp nhận các cờ sự kiện điều khiển (Task Notification Bitmask) và stream âm thanh từ RingBuffer TX.
 static void cloud_tx_task(void *arg) {
-    ESP_LOGI(TAG, "Cloud TX Task Started (Dedicated Asynchronous Streaming & FSM Worker).");
+    ESP_LOGI(TAG, "Cloud TX Task Started (Dedicated Asynchronous Streaming & FSM Worker on Core %d).", xPortGetCoreID());
 
     while (1) {
         // 1. Kiểm tra và nhận tín hiệu điều khiển bất đồng bộ (Task Notification)
+        // Chỉ dùng timeout 0 khi đang thực sự RECORDING; mọi trạng thái khác ngủ 50ms để tránh busy-spin 100% CPU Core 1
         uint32_t notify_bits = 0;
-        BaseType_t got_notify = xTaskNotifyWait(0, 0xFFFFFFFF, &notify_bits, 
-            (s_current_state == AI_STATE_IDLE && !s_turn_ending) ? pdMS_TO_TICKS(50) : 0);
+        BaseType_t got_notify = xTaskNotifyWait(0, 0xFFFFFFFF, &notify_bits,
+            (s_current_state == AI_STATE_RECORDING) ? 0 : pdMS_TO_TICKS(50));
 
         if (got_notify == pdTRUE) {
             // Xử lý WS_CLEANUP (Đóng sạch socket bị lỗi/lệch khung mà không làm gián đoạn audio đang phát ở loa)
             if (notify_bits & CLOUD_EVT_WS_CLEANUP) {
                 ESP_LOGW(TAG, "Worker handling CLOUD_EVT_WS_CLEANUP (Stopping broken WS cleanly without touching playback)...");
                 stop_ws_client_safe();
-                if (!(notify_bits & (CLOUD_EVT_ABORT | CLOUD_EVT_TIMEOUT | CLOUD_EVT_CANCEL | CLOUD_EVT_START_TURN))) {
+                if (!(notify_bits & (CLOUD_EVT_ABORT | CLOUD_EVT_TIMEOUT | CLOUD_EVT_CANCEL | CLOUD_EVT_START_TURN | CLOUD_EVT_COMMIT_TURN))) {
                     continue;
+                }
+            }
+
+            // Xử lý WS_CONNECTED: Single-Writer gửi Setup Frame
+            if (notify_bits & CLOUD_EVT_WS_CONNECTED) {
+                ESP_LOGI(TAG, "Worker handling CLOUD_EVT_WS_CONNECTED (Sending Setup Frame from cloud_tx_task)...");
+                send_setup_frame();
+            }
+
+            // Xử lý SEND_TOOL_RESP: Single-Writer gửi toolResponse
+            if (notify_bits & CLOUD_EVT_SEND_TOOL_RESP) {
+                char resp_copy[1024] = {0};
+                if (s_tool_resp_mutex && xSemaphoreTake(s_tool_resp_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    strncpy(resp_copy, s_pending_tool_resp, sizeof(resp_copy) - 1);
+                    xSemaphoreGive(s_tool_resp_mutex);
+                }
+                if (resp_copy[0] != '\0' && ws_client && s_is_ws_connected) {
+                    if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                        esp_websocket_client_send_text(ws_client, resp_copy, strlen(resp_copy), pdMS_TO_TICKS(1500));
+                        ESP_LOGI(TAG, ">>> [SINGLE-WRITER TX] Sent toolResponse to Gemini Live <<<");
+                        xSemaphoreGive(ws_mutex);
+                    }
                 }
             }
 
@@ -1081,12 +1122,15 @@ static void cloud_tx_task(void *arg) {
                 s_mute_response_audio = false;
                 if (s_session_timer) xTimerStop(s_session_timer, 0);
                 s_rx_flush_requested = true;
-                if (s_tx_audio_ringbuf) {
-                    size_t dummy_sz;
-                    uint8_t *dummy_it;
-                    while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
-                        vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    if (s_tx_audio_ringbuf) {
+                        size_t dummy_sz;
+                        uint8_t *dummy_it;
+                        while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
+                            vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                        }
                     }
+                    xSemaphoreGive(s_tx_rb_mutex);
                 }
                 audio_hal_stop_playback();
                 audio_hal_set_turn_active(false);
@@ -1099,8 +1143,25 @@ static void cloud_tx_task(void *arg) {
                 continue;
             }
 
-            // Xử lý TIMEOUT từ Software Timer (chuyển về xử lý an toàn tại đây với Stack 8KB)
+            // Xử lý TIMEOUT từ Software Timer
             if (notify_bits & CLOUD_EVT_TIMEOUT) {
+                if (s_current_state == AI_STATE_SPEAKING) {
+                    ESP_LOGI(TAG, "Chunk timeout during speaking -> Ending turn gracefully (no error sound)...");
+                    s_current_state = AI_STATE_IDLE;
+                    s_turn_ending = false;
+                    s_need_send_activity_start = false;
+                    s_cmd_dispatched_in_turn = false;
+                    s_mute_response_audio = false;
+                    // KHÔNG gọi ai_edge_stop_recording() để loa phát hết Jitter Buffer rồi ai_edge tự về IDLE_WAKEWORD
+                    if (s_session_timer) xTimerStop(s_session_timer, 0);
+                    audio_hal_force_start_playing();
+                    audio_hal_set_turn_active(false);
+                    if (s_is_ws_connected && s_setup_complete && s_keep_alive_timer) {
+                        xTimerStop(s_keep_alive_timer, 0);
+                        xTimerStart(s_keep_alive_timer, 0);
+                    }
+                    continue;
+                }
                 if (s_current_state == AI_STATE_WAITING_AI || s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH) {
                     bool was_tool_success = (s_current_state == AI_STATE_WAITING_POST_TOOL_SPEECH && s_mute_response_audio);
                     ESP_LOGW(TAG, "Response Timeout (waiting AI or post-tool ack). Resetting turn & closing socket...");
@@ -1131,14 +1192,23 @@ static void cloud_tx_task(void *arg) {
                 s_mute_response_audio = false;
                 if (s_session_timer) xTimerStop(s_session_timer, 0);
                 s_rx_flush_requested = true;
-                if (s_tx_audio_ringbuf) {
-                    size_t dummy_sz;
-                    uint8_t *dummy_it;
-                    while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
-                        vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    if (s_tx_audio_ringbuf) {
+                        size_t dummy_sz;
+                        uint8_t *dummy_it;
+                        while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
+                            vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                        }
                     }
+                    xSemaphoreGive(s_tx_rb_mutex);
                 }
-                stop_ws_client_safe();
+                // Giữ kết nối ngầm 15s nếu đã setup thành công
+                if (s_is_ws_connected && s_setup_complete && s_keep_alive_timer) {
+                    xTimerStop(s_keep_alive_timer, 0);
+                    xTimerStart(s_keep_alive_timer, 0);
+                } else {
+                    stop_ws_client_safe();
+                }
                 continue;
             }
 
@@ -1151,98 +1221,111 @@ static void cloud_tx_task(void *arg) {
                 }
             }
 
-            // Xử lý START_TURN
+            // Xử lý START_TURN: Đã được start_turn() chuyển AI_STATE_BUFFERING. TUYỆT ĐỐI KHÔNG xả s_tx_audio_ringbuf ở đây!
             if (notify_bits & CLOUD_EVT_START_TURN) {
+                // Buffer đang tích lũy pre-roll audio, không làm gì ở đây
+            }
+
+            // Xử lý COMMIT_TURN: Chuyển sang RECORDING và bắt đầu truyền dữ liệu
+            if (notify_bits & CLOUD_EVT_COMMIT_TURN) {
                 s_current_state = AI_STATE_RECORDING;
-                s_need_send_activity_start = true;
-                s_cmd_dispatched_in_turn = false;
-                s_turn_generation++;
-                if (s_tx_audio_ringbuf) {
-                    size_t dummy_sz;
-                    uint8_t *dummy_it;
-                    while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
-                        vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
-                    }
-                }
             }
 
             // Xử lý END_TURN
             if (notify_bits & CLOUD_EVT_END_TURN) {
+                if (s_current_state == AI_STATE_BUFFERING) {
+                    s_current_state = AI_STATE_RECORDING;
+                }
                 s_turn_ending = true;
             }
         }
 
         // 2. Khi ở trạng thái rảnh (IDLE) và không có lượt đang dứt:
         if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
-            // Xả sạch triệt để TOÀN BỘ byte tồn dư nào còn sót lại trong RingBuffer TX
-            if (s_tx_audio_ringbuf) {
-                size_t dummy_size = 0;
-                uint8_t *dummy_item = NULL;
-                while ((dummy_item = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_size, 0)) != NULL) {
-                    vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_item);
+            if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                if (s_tx_audio_ringbuf) {
+                    size_t dummy_size = 0;
+                    uint8_t *dummy_item = NULL;
+                    while ((dummy_item = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_size, 0)) != NULL) {
+                        vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_item);
+                    }
                 }
+                xSemaphoreGive(s_tx_rb_mutex);
             }
             continue;
         }
 
-        // 2. Khi đang ghi âm hoặc đang chờ xả hết âm thanh (turn ending):
-        // Nếu WebSocket chưa kết nối hoặc chưa hoàn tất Setup -> ĐỢI, TUYỆT ĐỐI KHÔNG LẤY RA XẢ BỎ AUDIO!
+        // 3. Nếu KHÔNG phải AI_STATE_RECORDING (BUFFERING, WAITING_AI, EXECUTING_TOOL, WAITING_POST_TOOL_SPEECH, SPEAKING) -> continue ngay!
+        if (s_current_state != AI_STATE_RECORDING) {
+            continue;
+        }
+
+        // 4. Khi đang ghi âm (RECORDING) hoặc đang chờ xả hết âm thanh (turn ending):
         if (!s_is_ws_connected || !s_setup_complete) {
-            // Đảm bảo lệnh kết nối đã được phát động
             ai_cloud_prewarm_session();
 
             int wait_ticks = 0;
-            // Chờ đến khi cả WebSocket kết nối VÀ Setup hoàn tất (hoặc tối đa 5 giây khi đang kết nối/chờ setup)
+            bool aborted_or_cancelled = false;
             while ((!s_is_ws_connected || !s_setup_complete) && 
                    wait_ticks < 50 && 
                    (s_current_state == AI_STATE_RECORDING || s_turn_ending)) {
-                // [ACTIVE RETRY]: Nếu chưa kết nối và chưa trong tiến trình connecting (ví dụ vừa thoát Cooldown 300ms)
-                // -> Tự động phát động kết nối lại ngay lập tức!
                 if (!s_is_ws_connected && !s_is_ws_connecting && !s_is_ws_stopping && !s_ws_task_active) {
                     ai_cloud_prewarm_session();
                 }
 
-                // Kiểm tra notification trong lúc chờ (ví dụ nếu có CANCEL/ABORT trong lúc chờ kết nối)
                 uint32_t wait_bits = 0;
                 if (xTaskNotifyWait(0, 0xFFFFFFFF, &wait_bits, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    if (wait_bits & (CLOUD_EVT_ABORT | CLOUD_EVT_CANCEL)) {
-                        s_current_state = AI_STATE_IDLE;
-                        s_turn_ending = false;
+                    if (wait_bits & CLOUD_EVT_ABORT) {
+                        aborted_or_cancelled = true;
+                        if (s_tx_task_handle) {
+                            xTaskNotify(s_tx_task_handle, CLOUD_EVT_ABORT, eSetBits);
+                        }
+                        break;
+                    }
+                    if (wait_bits & CLOUD_EVT_CANCEL) {
+                        aborted_or_cancelled = true;
+                        if (s_tx_task_handle) {
+                            xTaskNotify(s_tx_task_handle, CLOUD_EVT_CANCEL, eSetBits);
+                        }
                         break;
                     }
                     if (wait_bits & CLOUD_EVT_END_TURN) {
                         s_turn_ending = true;
                     }
+                    if (wait_bits & CLOUD_EVT_WS_CONNECTED) {
+                        send_setup_frame();
+                    }
                 }
                 wait_ticks++;
             }
 
-            // NẾU TRONG LÚC CHỜ, LƯỢT NÓI ĐÃ BỊ HỦY HOẶC KẾT THÚC (ví dụ: khớp lệnh cục bộ Model 2 -> State về IDLE):
-            // THOÁT NGAY VỀ ĐẦU VÒNG LẶP TRONG YÊN LẶNG (Silent Graceful Exit), TUYỆT ĐỐI KHÔNG BÁO LỖI!
+            if (aborted_or_cancelled) {
+                continue;
+            }
+
             if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
-                ESP_LOGI(TAG, "Turn cancelled or finished during connection wait (Local match or idle). Exiting cleanly.");
+                ESP_LOGI(TAG, "Turn cancelled or finished during connection wait. Exiting cleanly.");
                 continue;
             }
 
             if (!s_is_ws_connected || !s_setup_complete) {
                 ESP_LOGE(TAG, "WebSocket connection failed or setup timeout! Aborting turn...");
                 ai_cloud_abort();
-                vTaskDelay(pdMS_TO_TICKS(500)); // Ngăn ngừa 100% spin loop nghẽn CPU
+                vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
         }
 
-        // Kiểm tra an toàn trước khi xử lý các bước tiếp theo
         if (s_current_state == AI_STATE_IDLE && !s_turn_ending) {
             continue;
         }
 
-        // 3. Khi WebSocket đã sẵn sàng: Gửi activityStart trước nếu chưa gửi
+        // 5. Gửi activityStart trước nếu chưa gửi
         if (s_need_send_activity_start) {
             if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
                 if (ws_client && s_is_ws_connected && s_setup_complete) {
                     const char *start_msg = "{\"realtimeInput\":{\"activityStart\":{}}}";
-                    int sent = esp_websocket_client_send_text(ws_client, start_msg, strlen(start_msg), pdMS_TO_TICKS(2000));
+                    int sent = esp_websocket_client_send_text(ws_client, start_msg, strlen(start_msg), pdMS_TO_TICKS(1500));
                     if (sent > 0) {
                         ESP_LOGI(TAG, "Sent activityStart");
                         s_need_send_activity_start = false;
@@ -1252,27 +1335,31 @@ static void cloud_tx_task(void *arg) {
             }
         }
 
-        // Bắt buộc activityStart phải được gửi thành công trước khi gửi bất kỳ chunk audio nào
         if (s_need_send_activity_start) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
-        // 4. Lấy từng chunk âm thanh từ RingBuffer để stream lên WebSocket (Chuẩn hóa 1920 bytes = 60ms để frame JSON ~2.7KB vừa khít 2 packet TCP MSS)
-        size_t item_size = 0;
-        uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(s_tx_audio_ringbuf, &item_size, pdMS_TO_TICKS(20), 1920);
-
-        if (item && item_size > 0) {
-            // Đảm bảo số bytes là bội số của 2 (16-bit PCM)
-            if (item_size % 2 != 0) {
-                item_size &= ~1;
+        // 6. Lấy từng chunk âm thanh từ RingBuffer (Zero-Race: s_tx_rb_mutex chỉ giữ microseconds để copy vào bounce buffer)
+        size_t chunk_len = 0;
+        uint8_t chunk_buf[1920];
+        if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            size_t rcv_sz = 0;
+            uint8_t *it = (uint8_t *)xRingbufferReceiveUpTo(s_tx_audio_ringbuf, &rcv_sz, 0, 1920);
+            if (it && rcv_sz > 0) {
+                chunk_len = rcv_sz & ~1;
+                memcpy(chunk_buf, it, chunk_len);
+                vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)it);
             }
+            xSemaphoreGive(s_tx_rb_mutex);
+        }
 
+        if (chunk_len > 0) {
             if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 if (ws_client && s_is_ws_connected && s_setup_complete) {
                     if (s_tx_base64_buf && s_tx_json_buf) {
                         size_t base64_len = 0;
-                        if (mbedtls_base64_encode(s_tx_base64_buf, TX_BASE64_BUF_SIZE - 1, &base64_len, item, item_size) == 0) {
+                        if (mbedtls_base64_encode(s_tx_base64_buf, TX_BASE64_BUF_SIZE - 1, &base64_len, chunk_buf, chunk_len) == 0) {
                             s_tx_base64_buf[base64_len] = '\0';
 
                             int json_len = snprintf(s_tx_json_buf, TX_JSON_BUF_SIZE,
@@ -1280,7 +1367,7 @@ static void cloud_tx_task(void *arg) {
                                      (char *)s_tx_base64_buf);
                             
                             if (json_len > 0 && json_len < TX_JSON_BUF_SIZE) {
-                                int sent = esp_websocket_client_send_text(ws_client, s_tx_json_buf, json_len, pdMS_TO_TICKS(6000));
+                                int sent = esp_websocket_client_send_text(ws_client, s_tx_json_buf, json_len, pdMS_TO_TICKS(1500));
                                 if (sent <= 0) {
                                     ESP_LOGW(TAG, "Audio send_text poll timeout or write fail (sent=%d)", sent);
                                 }
@@ -1291,10 +1378,8 @@ static void cloud_tx_task(void *arg) {
                 xSemaphoreGive(ws_mutex);
             }
 
-            vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)item);
-
-            // Điều tiết tốc độ (Traffic Pacing): 10ms khi s_turn_ending để xả nhanh gửi activityEnd, 50ms khi đang nói bình thường.
-            vTaskDelay(pdMS_TO_TICKS(s_turn_ending ? 10 : 50));
+            // Điều tiết nhịp xả audio: tránh dội bom 25 gói TCP khi vừa commit buffer 1.5s
+            vTaskDelay(pdMS_TO_TICKS(s_turn_ending ? 10 : 25));
         } else {
             // RingBuffer đã rỗng hoàn toàn (toàn bộ âm thanh câu nói đã được gửi lên Google)
             if (s_turn_ending && s_current_state == AI_STATE_RECORDING) {
@@ -1302,11 +1387,13 @@ static void cloud_tx_task(void *arg) {
                 s_current_state = AI_STATE_WAITING_AI;
                 expecting_first_chunk = true;
 
+                bool end_sent = false;
                 if (ws_mutex && xSemaphoreTake(ws_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                     if (ws_client != NULL && s_is_ws_connected) {
                         const char *activity_end_msg = "{\"realtimeInput\":{\"activityEnd\":{}}}";
-                        int sent = esp_websocket_client_send_text(ws_client, activity_end_msg, strlen(activity_end_msg), pdMS_TO_TICKS(4000));
+                        int sent = esp_websocket_client_send_text(ws_client, activity_end_msg, strlen(activity_end_msg), pdMS_TO_TICKS(1500));
                         if (sent > 0) {
+                            end_sent = true;
                             ESP_LOGI(TAG, "Sent activityEnd (turn complete, all audio flushed). Waiting for AI response...");
                             if (s_session_timer) {
                                 xTimerChangePeriod(s_session_timer, pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS), 0);
@@ -1314,11 +1401,22 @@ static void cloud_tx_task(void *arg) {
                             }
                         } else {
                             ESP_LOGE(TAG, "Failed to send activityEnd! Aborting turn...");
-                            ai_cloud_abort();
                         }
+                    } else {
+                        ESP_LOGE(TAG, "WebSocket disconnected before sending activityEnd! Aborting turn...");
                     }
                     xSemaphoreGive(ws_mutex);
+                } else {
+                    ESP_LOGE(TAG, "Failed to take ws_mutex before sending activityEnd! Aborting turn...");
                 }
+
+                if (!end_sent) {
+                    ai_cloud_abort();
+                }
+            }
+            // Nhường CPU khi TX RingBuffer đang tạm rỗng chờ mic để không làm đói cmd_infer_task và IDLE1
+            if (s_current_state == AI_STATE_RECORDING) {
+                vTaskDelay(pdMS_TO_TICKS(15));
             }
         }
     }
@@ -1397,6 +1495,8 @@ void ai_cloud_prewarm_session(void) {
 
 void ai_cloud_init(void) {
     ws_mutex = xSemaphoreCreateMutex();
+    s_tx_rb_mutex = xSemaphoreCreateMutex();
+    s_tool_resp_mutex = xSemaphoreCreateMutex();
 
     s_tx_base64_buf = (unsigned char *)heap_caps_malloc(TX_BASE64_BUF_SIZE, MALLOC_CAP_SPIRAM);
     s_tx_json_buf = (char *)heap_caps_malloc(TX_JSON_BUF_SIZE, MALLOC_CAP_SPIRAM);
@@ -1413,18 +1513,17 @@ void ai_cloud_init(void) {
         s_tx_audio_ringbuf = xRingbufferCreateWithCaps(128 * 1024, RINGBUF_TYPE_BYTEBUF, MALLOC_CAP_SPIRAM);
     }
 
-    // Khởi tạo RX JSON RingBuffer (RINGBUF_TYPE_NOSPLIT) trong PSRAM cho kiến trúc Producer-Consumer
-    // Ưu tiên 512KB để chứa được frame tối đa ~256KB (khớp WS_RX_BUF_SIZE) và nhiều frame liên tiếp, fallback 256KB
-    s_rx_json_ringbuf = xRingbufferCreateWithCaps(512 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+    // Khởi tạo RX JSON RingBuffer (RINGBUF_TYPE_NOSPLIT) trong PSRAM: 768KB, fallback 512KB
+    s_rx_json_ringbuf = xRingbufferCreateWithCaps(768 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     if (!s_rx_json_ringbuf) {
-        ESP_LOGW(TAG, "Failed to create 512KB RX JSON RingBuffer in PSRAM! Fallback to 256KB...");
-        s_rx_json_ringbuf = xRingbufferCreateWithCaps(256 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
+        ESP_LOGW(TAG, "Failed to create 768KB RX JSON RingBuffer in PSRAM! Fallback to 512KB...");
+        s_rx_json_ringbuf = xRingbufferCreateWithCaps(512 * 1024, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
     }
 
-    // Tạo luồng truyền âm thanh mạng độc lập & FSM Worker (Core 0, Priority 5, Stack 12KB trong PSRAM)
-    xTaskCreatePinnedToCoreWithCaps(cloud_tx_task, "cloud_tx_task", 12288, NULL, 5, &s_tx_task_handle, 0, MALLOC_CAP_SPIRAM);
-    // Tạo luồng Consumer parse JSON & decode Base64 PCM (Core 1, Priority 5, Stack 12KB trong PSRAM)
-    xTaskCreatePinnedToCoreWithCaps(cloud_rx_process_task, "cloud_rx_task", 12288, NULL, 5, &s_rx_task_handle, 1, MALLOC_CAP_SPIRAM);
+    // Tạo luồng truyền âm thanh mạng độc lập & FSM Worker (Core 1, Priority 5, Stack 12KB trong PSRAM)
+    xTaskCreatePinnedToCoreWithCaps(cloud_tx_task, "cloud_tx_task", 12288, NULL, 5, &s_tx_task_handle, 1, MALLOC_CAP_SPIRAM);
+    // Tạo luồng Consumer parse JSON & decode Base64 PCM (Core 1, Priority 7, Stack 12KB trong PSRAM)
+    xTaskCreatePinnedToCoreWithCaps(cloud_rx_process_task, "cloud_rx_task", 12288, NULL, 7, &s_rx_task_handle, 1, MALLOC_CAP_SPIRAM);
 
     s_session_timer = xTimerCreate("ai_session_tmr", pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS), pdFALSE, (void *)0, session_timer_cb);
     s_keep_alive_timer = xTimerCreate("ai_ws_keep_alive", pdMS_TO_TICKS(WS_KEEP_ALIVE_TIMEOUT_MS), pdFALSE, (void *)0, ws_keep_alive_timer_cb);
@@ -1438,15 +1537,25 @@ bool ai_cloud_start_turn(void) {
     if (s_session_timer) {
         xTimerStop(s_session_timer, 0);
     }
+    s_rx_flush_requested = true;
 
-    // 2. Không tự xả RingBuffer TX từ Core 1 để tránh race condition đa luồng đọc (Single-Consumer).
-    // Việc xả sạch sẽ do cloud_tx_task xử lý an toàn trên Core 0 khi nhận CLOUD_EVT_START_TURN.
+    // 2. Lấy s_tx_rb_mutex, xả sạch mọi byte tồn dư trong s_tx_audio_ringbuf trước khi nhận pre-roll từ ai_edge
+    if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (s_tx_audio_ringbuf) {
+            size_t dummy_sz;
+            uint8_t *dummy_it;
+            while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
+                vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+            }
+        }
+        xSemaphoreGive(s_tx_rb_mutex);
+    }
 
     // 3. Đảm bảo kết nối đã được kích hoạt
     ai_cloud_prewarm_session();
 
-    // 4. Chuyển sang trạng thái ghi âm NGAY LẬP TỨC (Zero Latency - không chờ đợi!)
-    s_current_state = AI_STATE_RECORDING;
+    // 4. Chuyển sang trạng thái đệm BUFFERING (chờ Model 2 chốt lệnh đơn hay câu hỏi mở)
+    s_current_state = AI_STATE_BUFFERING;
     s_need_send_activity_start = true;
     s_turn_ending = false;
     s_cmd_dispatched_in_turn = false;
@@ -1459,8 +1568,18 @@ bool ai_cloud_start_turn(void) {
     return true;
 }
 
+void ai_cloud_commit_turn(void) {
+    if (s_current_state == AI_STATE_BUFFERING) {
+        ESP_LOGI(TAG, ">>> [BUFFERED-COMMIT] Commit turn: BUFFERING -> RECORDING. Starting live stream to Gemini Live! <<<");
+        s_current_state = AI_STATE_RECORDING;
+        if (s_tx_task_handle) {
+            xTaskNotify(s_tx_task_handle, CLOUD_EVT_COMMIT_TURN, eSetBits);
+        }
+    }
+}
+
 void ai_cloud_send_audio_chunk(const uint8_t *data, size_t size) {
-    if (s_current_state != AI_STATE_RECORDING || !data || size == 0 || s_turn_ending) {
+    if ((s_current_state != AI_STATE_RECORDING && s_current_state != AI_STATE_BUFFERING) || !data || size == 0 || s_turn_ending) {
         return;
     }
 
@@ -1473,10 +1592,14 @@ void ai_cloud_send_audio_chunk(const uint8_t *data, size_t size) {
         size_t to_send = size - offset;
         if (to_send > max_chunk) to_send = max_chunk;
 
-        if (xRingbufferSend(s_tx_audio_ringbuf, (void *)(data + offset), to_send, pdMS_TO_TICKS(50)) != pdTRUE) {
-            ESP_LOGW(TAG, "TX Audio Ringbuffer full! Dropped %u bytes (offset %u/%u)",
-                     (unsigned int)to_send, (unsigned int)offset, (unsigned int)size);
-            break;
+        if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            BaseType_t ok = xRingbufferSend(s_tx_audio_ringbuf, (void *)(data + offset), to_send, 0);
+            xSemaphoreGive(s_tx_rb_mutex);
+            if (ok != pdTRUE) {
+                ESP_LOGW(TAG, "TX Audio Ringbuffer full! Dropped %u bytes (offset %u/%u)",
+                         (unsigned int)to_send, (unsigned int)offset, (unsigned int)size);
+                break;
+            }
         }
         offset += to_send;
     }
@@ -1484,6 +1607,9 @@ void ai_cloud_send_audio_chunk(const uint8_t *data, size_t size) {
 
 void ai_cloud_end_turn(void) {
     ESP_LOGI(TAG, ">>> [CLIENT VAD] Dứt câu nói. Đang xả toàn bộ audio còn lại trong RingBuffer để gửi activityEnd... <<<");
+    if (s_current_state == AI_STATE_BUFFERING) {
+        s_current_state = AI_STATE_RECORDING;
+    }
     s_turn_ending = true;
     if (s_tx_task_handle) {
         xTaskNotify(s_tx_task_handle, CLOUD_EVT_END_TURN, eSetBits);
@@ -1511,7 +1637,31 @@ void ai_cloud_stop_session(void) {
 }
 
 void ai_cloud_cancel_turn(void) {
-    ESP_LOGI(TAG, "Hủy lượt nói (khớp lệnh cục bộ hoặc no-speech) -> Thông báo worker task...");
+    ESP_LOGI(TAG, "Hủy lượt nói (khớp lệnh cục bộ hoặc no-speech)...");
+    if (s_current_state == AI_STATE_BUFFERING) {
+        if (s_tx_rb_mutex && xSemaphoreTake(s_tx_rb_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (s_tx_audio_ringbuf) {
+                size_t dummy_sz;
+                uint8_t *dummy_it;
+                while ((dummy_it = (uint8_t *)xRingbufferReceive(s_tx_audio_ringbuf, &dummy_sz, 0)) != NULL) {
+                    vRingbufferReturnItem(s_tx_audio_ringbuf, (void *)dummy_it);
+                }
+            }
+            xSemaphoreGive(s_tx_rb_mutex);
+        }
+        s_current_state = AI_STATE_IDLE;
+        s_turn_ending = false;
+        s_need_send_activity_start = false;
+        s_cmd_dispatched_in_turn = false;
+        s_mute_response_audio = false;
+        if (s_session_timer) xTimerStop(s_session_timer, 0);
+        if (s_is_ws_connected && s_setup_complete && s_keep_alive_timer) {
+            xTimerStop(s_keep_alive_timer, 0);
+            xTimerStart(s_keep_alive_timer, 0);
+            ESP_LOGI(TAG, ">>> [KEEP-ALIVE POOL] Cancel in BUFFERING: Giữ WebSocket kết nối sống trong 15s sẵn sàng... <<<");
+        }
+        return;
+    }
     if (s_tx_task_handle) {
         xTaskNotify(s_tx_task_handle, CLOUD_EVT_CANCEL, eSetBits);
     }

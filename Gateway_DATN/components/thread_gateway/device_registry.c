@@ -32,6 +32,51 @@
 #define NVS_NS_LEGACY_3 "dev_ip_cache"
 
 typedef struct {
+    char key[16];
+    otIp6Address addr;
+} deferred_nvs_ip_t;
+
+static void nvs_persist_ip(const char *key, const otIp6Address *addr) {
+    if (!key || !addr) return;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, key, addr, sizeof(otIp6Address));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, key, addr, sizeof(otIp6Address));
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void deferred_nvs_save_ip(void *pvParameter1, uint32_t ulParameter2) {
+    (void)ulParameter2;
+    deferred_nvs_ip_t *ctx = (deferred_nvs_ip_t *)pvParameter1;
+    if (!ctx) return;
+    nvs_persist_ip(ctx->key, &ctx->addr);
+    free(ctx);
+}
+
+static void schedule_or_run_nvs_ip_save(const char *key, const otIp6Address *addr, bool on_psram_stack) {
+    if (on_psram_stack) {
+        deferred_nvs_ip_t *ctx = (deferred_nvs_ip_t *)malloc(sizeof(deferred_nvs_ip_t));
+        if (ctx) {
+            strncpy(ctx->key, key, sizeof(ctx->key) - 1);
+            ctx->key[sizeof(ctx->key) - 1] = '\0';
+            ctx->addr = *addr;
+            if (xTimerPendFunctionCall(deferred_nvs_save_ip, ctx, 0, pdMS_TO_TICKS(100)) != pdPASS) {
+                ESP_LOGW(TAG, "xTimerPendFunctionCall failed to defer NVS IP save");
+                free(ctx);
+            }
+        }
+    } else {
+        nvs_persist_ip(key, addr);
+    }
+}
+
+typedef struct {
     thread_dev_type_t type;
     const char       *name;
     const char       *srp_label;
@@ -211,24 +256,58 @@ bool device_registry_is_registered(const char *dev_name)
     return (type != THREAD_DEV_UNKNOWN) ? device_registry_is_type_registered(type) : false;
 }
 
-static void device_registry_set_reg_deferred(void *pvParameter1, uint32_t ulParameter2) {
+static void nvs_persist_reg(thread_dev_type_t type, bool registered) {
+    if (type < 0 || type >= THREAD_DEV_COUNT) return;
+    const thread_dev_desc_t *desc = &s_device_descs[type];
+    nvs_handle_t h;
+
+    // 1. Lưu vào unified namespace
+    if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+        if (registered) {
+            nvs_set_u8(h, desc->nvs_reg_key, 1);
+        } else {
+            nvs_erase_key(h, desc->nvs_reg_key);
+            nvs_erase_key(h, desc->nvs_ip_key);
+        }
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    // 2. Đồng bộ legacy namespaces để đảm bảo tương thích ngược tuyệt đối
+    if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
+        if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
+        else nvs_erase_key(h, desc->nvs_reg_key);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
+        if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
+        else nvs_erase_key(h, desc->nvs_reg_key);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (!registered && nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, desc->nvs_ip_key);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "Device [%s] registration NVS persisted: %d", desc->name, registered);
+}
+
+static void deferred_nvs_save_reg(void *pvParameter1, uint32_t ulParameter2) {
     (void)ulParameter2;
     uint32_t packed = (uint32_t)(uintptr_t)pvParameter1;
     thread_dev_type_t type = (thread_dev_type_t)(packed & 0xFFFF);
     bool registered = (bool)((packed >> 16) & 0x01);
-    device_registry_set_type_registered(type, registered);
+    nvs_persist_reg(type, registered);
 }
 
 void device_registry_set_type_registered(thread_dev_type_t type, bool registered)
 {
     if (type < 0 || type >= THREAD_DEV_COUNT) return;
-    if (esp_ptr_external_ram(&type)) {
-        uint32_t packed = ((uint32_t)type & 0xFFFF) | ((registered ? 1 : 0) << 16);
-        xTimerPendFunctionCall(device_registry_set_reg_deferred, (void *)(uintptr_t)packed, 0, pdMS_TO_TICKS(100));
-        return;
-    }
     device_registry_init();
 
+    // Cập nhật RAM ngay lập tức dưới mutex để UI / module khác đọc được trạng thái tức thì
     if (xSemaphoreTake(s_reg_mutex, portMAX_DELAY) == pdTRUE) {
         s_entries[type].registered = registered;
         s_entries[type].deleted_runtime = !registered;
@@ -236,43 +315,17 @@ void device_registry_set_type_registered(thread_dev_type_t type, bool registered
             s_entries[type].last_seen_ms = 0;
             s_entries[type].has_cached_ip = false;
         }
-
-        const thread_dev_desc_t *desc = &s_device_descs[type];
-
-        // 1. Lưu vào unified namespace
-        nvs_handle_t h;
-        if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
-            if (registered) {
-                nvs_set_u8(h, desc->nvs_reg_key, 1);
-            } else {
-                nvs_erase_key(h, desc->nvs_reg_key);
-                nvs_erase_key(h, desc->nvs_ip_key);
-            }
-            nvs_commit(h);
-            nvs_close(h);
-        }
-
-        // 2. Đồng bộ legacy namespaces để đảm bảo tương thích ngược tuyệt đối
-        if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
-            if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
-            else nvs_erase_key(h, desc->nvs_reg_key);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
-            if (registered) nvs_set_u8(h, desc->nvs_reg_key, 1);
-            else nvs_erase_key(h, desc->nvs_reg_key);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        if (!registered && nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_erase_key(h, desc->nvs_ip_key);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-
-        ESP_LOGI(TAG, "Device [%s] registration set to: %d (NVS persisted)", desc->name, registered);
         xSemaphoreGive(s_reg_mutex);
+    }
+
+    // Chỉ hoãn phần ghi/xóa NVS sang Timer Service task nếu stack caller nằm trong PSRAM
+    if (esp_ptr_external_ram(&type)) {
+        uint32_t packed = ((uint32_t)type & 0xFFFF) | ((registered ? 1 : 0) << 16);
+        if (xTimerPendFunctionCall(deferred_nvs_save_reg, (void *)(uintptr_t)packed, 0, pdMS_TO_TICKS(100)) != pdPASS) {
+            ESP_LOGW(TAG, "xTimerPendFunctionCall failed to defer NVS reg save");
+        }
+    } else {
+        nvs_persist_reg(type, registered);
     }
 }
 
@@ -357,21 +410,12 @@ void device_registry_update_ip(thread_dev_type_t type, const otIp6Address *addr)
         s_entries[type].deleted_runtime = false;
 
         const thread_dev_desc_t *desc = &s_device_descs[type];
+        xSemaphoreGive(s_reg_mutex);
+
         if (ip_changed) {
-            nvs_handle_t h;
-            if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_blob(h, desc->nvs_ip_key, addr, sizeof(otIp6Address));
-                nvs_commit(h);
-                nvs_close(h);
-            }
-            if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
-                nvs_set_blob(h, desc->nvs_ip_key, addr, sizeof(otIp6Address));
-                nvs_commit(h);
-                nvs_close(h);
-            }
+            schedule_or_run_nvs_ip_save(desc->nvs_ip_key, addr, esp_ptr_external_ram(&type));
             ESP_LOGI(TAG, "Device [%s] IP cache updated from live packet", desc->name);
         }
-        xSemaphoreGive(s_reg_mutex);
     }
 }
 
@@ -499,17 +543,7 @@ esp_err_t device_registry_resolve_address_locked(
             s_entries[type].has_cached_ip = true;
 
             if (ip_changed) {
-                nvs_handle_t h;
-                if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
-                    nvs_set_blob(h, desc->nvs_ip_key, out_addr, sizeof(otIp6Address));
-                    nvs_commit(h);
-                    nvs_close(h);
-                }
-                if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
-                    nvs_set_blob(h, desc->nvs_ip_key, out_addr, sizeof(otIp6Address));
-                    nvs_commit(h);
-                    nvs_close(h);
-                }
+                schedule_or_run_nvs_ip_save(desc->nvs_ip_key, out_addr, esp_ptr_external_ram(&type));
             }
             xSemaphoreGive(s_reg_mutex);
         }
@@ -622,6 +656,37 @@ void device_registry_clear_cache(const char *dev_name)
     }
 }
 
+static void nvs_clear_all_namespaces(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "Cleared ALL device registries & caches from NVS");
+}
+
+static void deferred_nvs_clear_all(void *pvParameter1, uint32_t ulParameter2) {
+    (void)pvParameter1;
+    (void)ulParameter2;
+    nvs_clear_all_namespaces();
+}
+
 void device_registry_clear_all(void)
 {
     device_registry_init();
@@ -632,29 +697,15 @@ void device_registry_clear_all(void)
             s_entries[i].last_seen_ms = 0;
             s_entries[i].has_cached_ip = false;
         }
-
-        nvs_handle_t h;
-        if (nvs_open(NVS_NS_UNIFIED, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_erase_all(h);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        if (nvs_open(NVS_NS_LEGACY_1, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_erase_all(h);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        if (nvs_open(NVS_NS_LEGACY_2, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_erase_all(h);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        if (nvs_open(NVS_NS_LEGACY_3, NVS_READWRITE, &h) == ESP_OK) {
-            nvs_erase_all(h);
-            nvs_commit(h);
-            nvs_close(h);
-        }
-        ESP_LOGI(TAG, "Cleared ALL device registries & caches from NVS");
         xSemaphoreGive(s_reg_mutex);
+    }
+
+    int stack_marker = 0;
+    if (esp_ptr_external_ram(&stack_marker)) {
+        if (xTimerPendFunctionCall(deferred_nvs_clear_all, NULL, 0, pdMS_TO_TICKS(100)) != pdPASS) {
+            ESP_LOGW(TAG, "xTimerPendFunctionCall failed to defer NVS clear_all");
+        }
+    } else {
+        nvs_clear_all_namespaces();
     }
 }

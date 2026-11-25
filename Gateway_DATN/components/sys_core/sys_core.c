@@ -12,6 +12,7 @@
 #include <time.h>
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "esp_memory_utils.h"
 #include "driver/gpio.h"
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_softap.h"
@@ -174,11 +175,31 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-void sys_core_reset_wifi(void) {
-    ESP_LOGW(TAG, "Resetting Wi-Fi credentials and restarting to Provisioning mode...");
+static void deferred_wifi_reset(void *pvParameter1, uint32_t ulParameter2) {
+    (void)pvParameter1;
+    (void)ulParameter2;
+    ESP_LOGW(TAG, "Deferred Wi-Fi reset running in Timer Service task (DRAM stack)...");
     wifi_prov_mgr_reset_provisioning();
     nvs_flash_erase();
     esp_restart();
+}
+
+void sys_core_reset_wifi(void) {
+    ESP_LOGW(TAG, "Resetting Wi-Fi credentials and restarting to Provisioning mode...");
+    int dummy = 0;
+    if (esp_ptr_external_ram(&dummy)) {
+        ESP_LOGI(TAG, "Caller stack is in PSRAM, deferring Wi-Fi reset to Timer Service task");
+        if (xTimerPendFunctionCall(deferred_wifi_reset, NULL, 0, pdMS_TO_TICKS(500)) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to pend deferred_wifi_reset!");
+            wifi_prov_mgr_reset_provisioning();
+            nvs_flash_erase();
+            esp_restart();
+        }
+    } else {
+        wifi_prov_mgr_reset_provisioning();
+        nvs_flash_erase();
+        esp_restart();
+    }
 }
 
 static void *cjson_psram_malloc(size_t sz) {
